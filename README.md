@@ -1,5 +1,10 @@
 # vivado-mcp
 
+[![PyPI version](https://img.shields.io/pypi/v/vivado-mcp)](https://pypi.org/project/vivado-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/vivado-mcp)](https://pypi.org/project/vivado-mcp/)
+[![License](https://img.shields.io/github/license/mapleleavessssssss-wq/vivado-mcp)](LICENSE)
+[![CI](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml)
+
 精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **21 个工具** 控制 Xilinx Vivado EDA。
 
 让 AI 助手（如 Claude）能够直接启动 Vivado、执行 Tcl 命令、运行综合/实现/比特流生成等完整 FPGA 开发流程，并**自动诊断 CRITICAL WARNING、验证引脚布局、结构化分析时序报告、诊断 IP 配置问题**。
@@ -26,6 +31,30 @@
 pip install vivado-mcp
 ```
 
+### 2. 配置 Claude Code
+
+将以下内容复制到 `~/.claude.json` 的 `mcpServers` 字段中（[什么是 .claude.json？](https://docs.anthropic.com/en/docs/claude-code/settings)）：
+
+```json
+"vivado": {
+  "command": "python",
+  "args": ["-m", "vivado_mcp"],
+  "env": {
+    "VIVADO_PATH": "D:/Xilinx/Vivado/2024.1/bin/vivado.bat"
+  },
+  "type": "stdio"
+}
+```
+
+> 将 `VIVADO_PATH` 替换为你的 Vivado 实际路径：
+> - **Windows**: `"D:/Xilinx/Vivado/2019.1/bin/vivado.bat"`
+> - **Linux**: `"/opt/Xilinx/Vivado/2024.1/bin/vivado"`
+> - 也可以不设置 `VIVADO_PATH`，将 Vivado `bin` 目录加入系统 `PATH` 或使用默认安装路径（自动检测）。
+
+### 3. 重启 Claude Code
+
+配置完成后重启 Claude Code，即可使用 21 个 Vivado 工具。
+
 <details>
 <summary>从源码安装（适合开发/贡献）</summary>
 
@@ -35,28 +64,6 @@ cd vivado-mcp
 pip install -e ".[dev]"
 ```
 </details>
-
-### 2. 配置 Claude Code
-
-将以下配置复制到 `~/.claude.json` 的 `mcpServers` 字段中：
-
-```json
-"vivado": {
-  "command": "python",
-  "args": ["-m", "vivado_mcp"],
-  "env": {
-    "VIVADO_PATH": "/path/to/Vivado/2024.1/bin/vivado"
-  },
-  "type": "stdio"
-}
-```
-
-> **注意**：将 `VIVADO_PATH` 替换为你的 Vivado 实际路径。
-> - **Windows**: `"D:/Xilinx/Vivado/2019.1/bin/vivado.bat"`
-> - **Linux**: `"/opt/Xilinx/Vivado/2024.1/bin/vivado"`
-> - 也可以不设置 `VIVADO_PATH`，将 Vivado `bin` 目录加入系统 `PATH` 或使用默认安装路径（自动检测）。
-
-配置完成后重启 Claude Code，即可使用 21 个 Vivado 工具。
 
 ## 工具列表
 
@@ -189,9 +196,11 @@ Claude Code ──(stdio)──▶ FastMCP Server
 
 ```bash
 # 安装开发依赖
+git clone https://github.com/mapleleavessssssss-wq/vivado-mcp.git
+cd vivado-mcp
 pip install -e ".[dev]"
 
-# 运行测试
+# 运行测试（不需要 Vivado）
 pytest
 
 # 代码检查
