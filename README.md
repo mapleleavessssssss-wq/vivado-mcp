@@ -20,46 +20,43 @@
 
 ## 快速开始
 
-### 安装
+### 1. 安装
 
 ```bash
-pip install vivado-mcp
+pip install git+https://github.com/mapleleavessssssss-wq/vivado-mcp.git
 ```
 
-或从源码安装：
+<details>
+<summary>从源码安装（适合开发/贡献）</summary>
 
 ```bash
 git clone https://github.com/mapleleavessssssss-wq/vivado-mcp.git
 cd vivado-mcp
 pip install -e ".[dev]"
 ```
+</details>
 
-### 配置
+### 2. 配置 Claude Code
 
-确保 Vivado 可被找到（任选一种方式）：
-
-1. 设置环境变量 `VIVADO_PATH` 指向 `vivado.bat` / `vivado`
-2. 将 Vivado `bin` 目录加入系统 `PATH`
-3. 使用默认安装路径（自动检测）
-
-### 在 Claude Code 中使用
-
-在 MCP 设置中添加：
+将以下配置复制到 `~/.claude.json` 的 `mcpServers` 字段中：
 
 ```json
-{
-  "mcpServers": {
-    "vivado": {
-      "command": "python",
-      "args": ["-m", "vivado_mcp"],
-      "cwd": "/path/to/vivado-mcp/src",
-      "env": {
-        "VIVADO_PATH": "/path/to/Vivado/2024.1/bin/vivado"
-      }
-    }
-  }
+"vivado": {
+  "command": "python",
+  "args": ["-m", "vivado_mcp"],
+  "env": {
+    "VIVADO_PATH": "/path/to/Vivado/2024.1/bin/vivado"
+  },
+  "type": "stdio"
 }
 ```
+
+> **注意**：将 `VIVADO_PATH` 替换为你的 Vivado 实际路径。
+> - **Windows**: `"D:/Xilinx/Vivado/2019.1/bin/vivado.bat"`
+> - **Linux**: `"/opt/Xilinx/Vivado/2024.1/bin/vivado"`
+> - 也可以不设置 `VIVADO_PATH`，将 Vivado `bin` 目录加入系统 `PATH` 或使用默认安装路径（自动检测）。
+
+配置完成后重启 Claude Code，即可使用 21 个 Vivado 工具。
 
 ## 工具列表
 
