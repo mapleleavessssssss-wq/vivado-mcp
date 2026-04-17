@@ -1,17 +1,20 @@
-"""VivadoSession：Vivado 子进程管理与哨兵通信协议。
+"""SubprocessSession：Vivado ``-mode tcl`` 子进程管理与哨兵通信协议。
 
-这是整个项目最核心的模块，负责：
+subprocess 实现（两种会话模式之一）。负责：
 - 启动/停止 Vivado TCL 子进程
 - 通过 catch + sentinel 模式可靠地收发命令
 - asyncio.Lock 串行化并发请求
 - 超时控制与异常处理
+
+另一种实现见 ``gui_session.py`` (GUI + TCP)。公共接口定义在 ``base_session.py``。
 """
 
 import asyncio
+import collections
 import logging
 import time
-from enum import Enum
 
+from vivado_mcp.vivado.base_session import BaseSession, SessionState
 from vivado_mcp.vivado.tcl_utils import (
     TclResult,
     clean_output,
@@ -22,34 +25,30 @@ from vivado_mcp.vivado.tcl_utils import (
 
 logger = logging.getLogger(__name__)
 
-
-class SessionState(str, Enum):
-    """会话状态枚举。"""
-    STARTING = "starting"
-    READY = "ready"
-    BUSY = "busy"
-    STOPPED = "stopped"
-    ERROR = "error"
+# stderr 缓冲区保留的最近行数（避免内存无限增长）
+_STDERR_RING_SIZE = 200
 
 
-class VivadoSession:
-    """Vivado TCL 交互式子进程会话。
+class SubprocessSession(BaseSession):
+    """Vivado TCL 交互式子进程会话（`-mode tcl` 无头批处理）。
 
     通过 asyncio subprocess 管理一个 `vivado -mode tcl` 进程，
     使用 catch + UUID sentinel 协议实现可靠的命令执行与输出采集。
     """
 
     def __init__(self, vivado_path: str, session_id: str = "default"):
-        self.vivado_path = vivado_path
-        self.session_id = session_id
+        super().__init__(vivado_path=vivado_path, session_id=session_id)
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
-        self._state = SessionState.STOPPED
-        self._start_time: float | None = None
+        # B5 修复：持续采集 stderr，失败时附加到 output（否则 Vivado 错误消息全丢）
+        self._stderr_buffer: collections.deque[str] = collections.deque(
+            maxlen=_STDERR_RING_SIZE
+        )
+        self._stderr_task: asyncio.Task | None = None
 
     @property
-    def state(self) -> SessionState:
-        return self._state
+    def mode(self) -> str:
+        return "tcl"
 
     @property
     def is_alive(self) -> bool:
@@ -57,12 +56,6 @@ class VivadoSession:
             self._process is not None
             and self._process.returncode is None
         )
-
-    @property
-    def uptime_seconds(self) -> float:
-        if self._start_time is None:
-            return 0.0
-        return time.time() - self._start_time
 
     async def start(self, timeout: float = 60.0) -> str:
         """启动 Vivado TCL 子进程。
@@ -99,8 +92,37 @@ class VivadoSession:
         banner = await self._read_startup_banner(timeout)
         self._state = SessionState.READY
         self._start_time = time.time()
+
+        # B5 修复：启动 stderr 持续读取任务
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
         logger.info("Vivado 会话 '%s' 启动成功", self.session_id)
         return banner
+
+    async def _drain_stderr(self) -> None:
+        """后台任务：持续读取 Vivado stderr，存入环形缓冲区。
+
+        Vivado 的错误消息（含 ERROR:/CRITICAL WARNING:）部分走 stderr，
+        若不持续读取则 pipe 可能阻塞，且错误信息丢失。
+        """
+        assert self._process and self._process.stderr
+        try:
+            while True:
+                raw = await self._process.stderr.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if line:
+                    self._stderr_buffer.append(line)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug("[%s] stderr drain exception: %s", self.session_id, e)
+
+    def _recent_stderr(self, max_lines: int = 30) -> str:
+        """返回 stderr 缓冲区最近 N 行，用于失败时附加诊断。"""
+        lines = list(self._stderr_buffer)[-max_lines:]
+        return "\n".join(lines)
 
     async def _read_startup_banner(self, timeout: float) -> str:
         """读取 Vivado 启动时的初始输出（横幅）。
@@ -260,6 +282,16 @@ class VivadoSession:
         output = clean_output("\n".join(output_lines))
         is_error = return_code != 0
 
+        # B5 修复：出错时附加 stderr 最近几行，帮助 AI 看到完整错误原因
+        if is_error:
+            stderr_tail = self._recent_stderr(max_lines=30)
+            if stderr_tail and stderr_tail not in output:
+                output = (
+                    f"{output}\n--- stderr (最近 30 行) ---\n{stderr_tail}"
+                    if output
+                    else f"--- stderr (最近 30 行) ---\n{stderr_tail}"
+                )
+
         logger.debug(
             "[%s] 结果: rc=%d, output=%d chars",
             self.session_id, return_code, len(output),
@@ -280,6 +312,15 @@ class VivadoSession:
             return
 
         logger.info("正在关闭 Vivado 会话 '%s'...", self.session_id)
+
+        # 取消 stderr drain 任务
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._stderr_task = None
 
         if self.is_alive and self._process.stdin:
             try:
@@ -306,12 +347,6 @@ class VivadoSession:
         self._process = None
         logger.info("Vivado 会话 '%s' 已关闭。", self.session_id)
 
-    def status_dict(self) -> dict:
-        """返回会话状态信息字典。"""
-        return {
-            "session_id": self.session_id,
-            "state": self._state.value,
-            "vivado_path": self.vivado_path,
-            "is_alive": self.is_alive,
-            "uptime_seconds": round(self.uptime_seconds, 1),
-        }
+
+# 向后兼容别名：0.1.x 代码可能还在引用 VivadoSession
+VivadoSession = SubprocessSession

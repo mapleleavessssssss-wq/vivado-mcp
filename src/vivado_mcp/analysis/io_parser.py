@@ -116,9 +116,14 @@ def _parse_bank(value: str) -> int:
 def parse_report_io(raw_text: str) -> IoReport:
     """解析 Vivado report_io -return_string 输出。
 
+    支持两种表格格式：
+    - **按 Port**: 表头含 "Port Name"（新版 Vivado 或部分情况）
+    - **按 Pin**: 表头含 "Pin Number" + "Signal Name"（Vivado 2019.1 等）
+      这种格式每行是一个物理引脚，只取 "Signal Name" 非空的作为端口。
+
     解析策略：
     1. 查找分隔线以确定列边界
-    2. 查找包含 "Port Name" 的表头行
+    2. 识别表头类型
     3. 在分隔线之间解析数据行
     4. 为每行数据创建 IoPort 实例
 
@@ -143,15 +148,24 @@ def parse_report_io(raw_text: str) -> IoReport:
         # 表格至少需要表头上方、表头下方两条分隔线
         return IoReport()
 
-    # 第二步：找到包含 "Port Name" 的表头行，确定表格区域
+    # 第二步：识别表头格式（Port Name 版 vs Pin Number 版）
     header_sep_idx = -1
     header_line_idx = -1
+    header_style = ""  # "port" 或 "pin"
     for i, idx in enumerate(separator_indices):
-        # 表头行在分隔线之后
         candidate = idx + 1
-        if candidate < len(lines) and "Port Name" in lines[candidate]:
+        if candidate >= len(lines):
+            continue
+        header_text = lines[candidate]
+        if "Port Name" in header_text:
             header_sep_idx = i
             header_line_idx = candidate
+            header_style = "port"
+            break
+        if "Pin Number" in header_text and "Signal Name" in header_text:
+            header_sep_idx = i
+            header_line_idx = candidate
+            header_style = "pin"
             break
 
     if header_line_idx == -1:
@@ -177,6 +191,17 @@ def parse_report_io(raw_text: str) -> IoReport:
 
     # 第六步：解析数据行
     ports: list[IoPort] = []
+
+    # 为 Pin 版找出关键列索引（表头顺序可能变化）
+    pin_col_idx: dict[str, int] = {}
+    if header_style == "pin":
+        header_cells = _extract_cells(lines[header_line_idx])
+        for i, cell in enumerate(header_cells):
+            key = cell.strip()
+            if key in ("Pin Number", "Signal Name", "Pin Name", "Use",
+                       "IO Standard", "IO Bank", "Constraint"):
+                pin_col_idx[key] = i
+
     for i in range(data_start, data_end):
         line = lines[i]
         if not line.strip() or _SEPARATOR_RE.match(line.strip()):
@@ -184,16 +209,35 @@ def parse_report_io(raw_text: str) -> IoReport:
 
         # 按 '|' 分隔提取单元格内容
         cells = _extract_cells(line)
-        if len(cells) < 7:
-            continue
 
-        port_name = cells[0].strip()
-        package_pin = cells[1].strip()
-        site = cells[2].strip()
-        direction = cells[3].strip()
-        io_standard = cells[4].strip()
-        bank = _parse_bank(cells[5])
-        fixed = _parse_bool(cells[6])
+        if header_style == "port":
+            if len(cells) < 7:
+                continue
+            port_name = cells[0].strip()
+            package_pin = cells[1].strip()
+            site = cells[2].strip()
+            direction = cells[3].strip()
+            io_standard = cells[4].strip()
+            bank = _parse_bank(cells[5])
+            fixed = _parse_bool(cells[6])
+        else:  # "pin" 版
+            def _col(name: str, default: str = "") -> str:
+                ci = pin_col_idx.get(name, -1)
+                if 0 <= ci < len(cells):
+                    return cells[ci].strip()
+                return default
+
+            signal = _col("Signal Name")
+            if not signal:
+                # 物理引脚没有用户信号映射到它，跳过
+                continue
+            port_name = signal
+            package_pin = _col("Pin Number")
+            site = _col("Pin Name")
+            direction = _col("Use")  # "INPUT" / "OUTPUT" / "INOUT"（或 "Gigabit" 等特殊）
+            io_standard = _col("IO Standard")
+            bank = _parse_bank(_col("IO Bank"))
+            fixed = _col("Constraint").upper() == "FIXED"
 
         if not port_name:
             continue

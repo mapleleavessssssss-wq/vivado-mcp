@@ -1,7 +1,7 @@
 [project]
 name = "vivado-mcp"
-version = "0.1.0"
-description = "Vivado MCP Server — AI 驱动的 FPGA 开发助手，自动诊断 CRITICAL WARNING 并给出修复建议"
+version = "0.2.0"
+description = "Vivado MCP Server — AI 驱动的 FPGA 开发助手，支持 GUI 可视化 / 子进程无头双模式，自动诊断 CRITICAL WARNING"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -33,6 +33,12 @@ vivado-mcp = "vivado_mcp.__main__:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vivado_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"scripts/vivado_mcp_server.tcl" = "vivado_mcp/scripts/vivado_mcp_server.tcl"
 
 [tool.ruff]
 target-version = "py310"

@@ -136,13 +136,14 @@ def wrap_command(tcl_command: str, sentinel: str) -> str:
         包装后的完整 Tcl 脚本。
     """
     hex_encoded = tcl_command.encode("utf-8").hex()
+    # 关键：VMCP_ERR 行必须在 sentinel 之前输出，否则会被下一条命令读取（B1 修复）
     return (
         f'set __cmd [encoding convertfrom utf-8 '
         f'[binary format H* {hex_encoded}]]\n'
         f'set __rc [catch {{uplevel #0 $__cmd}} __out __opts]\n'
         f'if {{$__rc == 0}} {{ puts $__out }}\n'
-        f'puts "<<<{sentinel}_RC=$__rc>>>"\n'
         f'if {{$__rc != 0}} {{ puts "VMCP_ERR: $__out" }}\n'
+        f'puts "<<<{sentinel}_RC=$__rc>>>"\n'
         f'flush stdout\n'
     )
 

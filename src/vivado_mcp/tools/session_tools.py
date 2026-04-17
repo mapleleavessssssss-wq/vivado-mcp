@@ -10,18 +10,30 @@ from vivado_mcp.server import _get_manager, mcp
 @mcp.tool()
 async def start_session(
     session_id: str = "default",
+    mode: str = "gui",
+    port: int = 9999,
     vivado_path: str = "",
-    timeout: int = 60,
+    timeout: int = 120,
     ctx: Context = None,
 ) -> str:
-    """启动一个新的 Vivado TCL 交互会话。
+    """启动一个新的 Vivado 会话。
 
-    每个 session_id 对应一个独立的 Vivado 进程，支持多实例并行操作。
+    三种模式：
+    - ``"gui"`` (默认) — MCP 自动 spawn ``vivado -mode gui``，你能看到 Vivado 图标
+      并实时观察 Tcl Console / Block Design / 波形等 GUI 内容。首次使用会自动
+      通过 ``-source`` 注入 TCP server，或先运行一次 ``vivado-mcp install`` 持久化。
+    - ``"tcl"`` — ``vivado -mode tcl`` 无头子进程（无 GUI，适合 CI / 批处理）。
+    - ``"attach"`` — 连接到用户已手动打开的 Vivado GUI（需先运行 ``vivado-mcp install``
+      让 init.tcl 自动开启 TCP server）。
+
+    每个 session_id 对应一个独立的 Vivado 实例，支持多会话并行。
 
     Args:
-        session_id: 会话标识符，默认 "default"。不同 session_id 启动独立进程。
-        vivado_path: 可选，自定义 Vivado 可执行文件路径。留空则使用自动检测的路径。
-        timeout: Vivado 启动超时秒数，默认 60。
+        session_id: 会话标识符，默认 "default"。
+        mode: ``"gui"`` / ``"tcl"`` / ``"attach"``，默认 ``"gui"``。
+        port: attach 模式的首选 TCP 端口，默认 9999。
+        vivado_path: 可选，自定义 Vivado 可执行文件路径。留空则自动检测。
+        timeout: 启动超时秒数，GUI 模式建议 120+。默认 120。
     """
     manager = _get_manager(ctx)
 
@@ -31,10 +43,12 @@ async def start_session(
             session_id=session_id,
             vivado_path=path,
             timeout=float(timeout),
+            mode=mode,
+            port=int(port),
         )
         status = session.status_dict()
         return (
-            f"会话 '{session_id}' 已就绪。\n"
+            f"会话 '{session_id}' 已就绪（mode={status['mode']}）。\n"
             f"Vivado: {status['vivado_path']}\n"
             f"状态: {status['state']}\n\n"
             f"--- 启动信息 ---\n{banner}"

@@ -15,12 +15,11 @@ from vivado_mcp.analysis.warning_parser import (
     parse_critical_warnings,
     parse_diag_counts,
 )
-from vivado_mcp.analysis.xdc_parser import parse_xdc_constraints
+from vivado_mcp.analysis.xdc_parser import XdcConstraint, parse_xdc_file
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 from vivado_mcp.tcl_scripts import (
     COUNT_WARNINGS,
     EXTRACT_CRITICAL_WARNINGS,
-    EXTRACT_XDC_PACKAGE_PINS,
 )
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
@@ -94,7 +93,7 @@ async def verify_io_placement_tool(
 ) -> str:
     """验证 IO 引脚分配：比对 XDC 约束与实际布局。
 
-    自动读取项目 XDC 文件中的 PACKAGE_PIN 约束，
+    自动读取项目 XDC 文件中的 PACKAGE_PIN 约束（**支持 -dict 和传统两种语法**），
     与 report_io 的实际分配结果对比，发现 GT 引脚交叉等严重错误。
 
     GT 端口不匹配标记为 CRITICAL，GPIO 端口标记为 WARNING。
@@ -106,26 +105,66 @@ async def verify_io_placement_tool(
     if not session:
         return _NO_SESSION.format(sid=session_id)
 
-    # 第一步：提取 XDC 约束
+    # 第一步：从 Vivado 获取 XDC 文件路径列表，然后 Python 读文件解析
+    # B3 修复：不再走 Tcl 正则（不支持 -dict），改 Python 文件解析支持两种语法
     try:
-        xdc_result = await session.execute(
-            EXTRACT_XDC_PACKAGE_PINS, timeout=30.0
+        list_result = await session.execute(
+            'foreach __f [get_files -of_objects [get_filesets constrs_1] '
+            '-filter {FILE_TYPE == XDC}] { puts "VMCP_XDC_FILE:$__f" }',
+            timeout=15.0,
         )
-        xdc_constraints = parse_xdc_constraints(xdc_result.output)
     except Exception as e:
-        return f"[ERROR] 读取 XDC 约束失败: {e}"
+        return f"[ERROR] 获取 XDC 文件列表失败: {e}"
+
+    if list_result.is_error:
+        return (
+            f"[ERROR] 获取 XDC 文件列表失败（rc={list_result.return_code}）：\n"
+            f"{list_result.output}\n"
+            "提示: 需要先打开项目（run_tcl 'open_project ...'）"
+        )
+
+    xdc_paths = [
+        line[len("VMCP_XDC_FILE:"):].strip()
+        for line in list_result.output.splitlines()
+        if line.startswith("VMCP_XDC_FILE:")
+    ]
+
+    if not xdc_paths:
+        return "项目未添加任何 XDC 约束文件。"
+
+    xdc_constraints: list[XdcConstraint] = []
+    read_errors: list[str] = []
+    for xdc_path in xdc_paths:
+        try:
+            xdc_constraints.extend(parse_xdc_file(xdc_path))
+        except (FileNotFoundError, OSError) as e:
+            read_errors.append(f"  {xdc_path}: {e}")
 
     if not xdc_constraints:
-        return "未找到 PACKAGE_PIN 约束。请确认项目已添加 XDC 约束文件。"
+        msg = (
+            "XDC 文件中未找到任何 PACKAGE_PIN 约束（已支持 -dict 和传统两种语法）。\n"
+            f"已扫描文件: {len(xdc_paths)} 个"
+        )
+        if read_errors:
+            msg += "\n读取失败:\n" + "\n".join(read_errors)
+        return msg
 
     # 第二步：获取 report_io
     try:
         io_result = await session.execute(
             "report_io -return_string", timeout=60.0
         )
-        io_report = parse_report_io(io_result.output)
     except Exception as e:
         return f"[ERROR] 获取 IO 报告失败: {e}"
+
+    if io_result.is_error:
+        return (
+            f"[ERROR] report_io 失败（rc={io_result.return_code}）：\n"
+            f"{io_result.output}\n"
+            "提示: 需要先打开综合或实现后的设计。"
+        )
+
+    io_report = parse_report_io(io_result.output)
 
     if not io_report.ports:
         return "report_io 未返回任何端口信息。请确认实现已完成。"

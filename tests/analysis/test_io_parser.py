@@ -20,6 +20,7 @@ from vivado_mcp.analysis.io_parser import IoPort, IoReport, parse_report_io
 # 测试 fixture 路径
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 SAMPLE_REPORT_IO = FIXTURES_DIR / "sample_report_io.txt"
+SAMPLE_REPORT_IO_2019_1 = FIXTURES_DIR / "sample_report_io_2019_1.txt"
 
 
 @pytest.fixture
@@ -32,6 +33,53 @@ def report_io_text() -> str:
 def parsed_report(report_io_text: str) -> IoReport:
     """解析 fixture 文件得到的 IoReport 实例。"""
     return parse_report_io(report_io_text)
+
+
+# ====================================================================== #
+#  B6 修复：Vivado 2019.1 的 Pin 版格式
+# ====================================================================== #
+
+
+class TestVivado2019_1Format:
+    """Vivado 2019.1 的 report_io 按 Pin 格式（Pin Number | Signal Name | ...）。"""
+
+    def test_parses_counter_design(self):
+        """极简 counter 设计：1 个 clk + 1 个 rst + 8 个 LED = 10 个端口。"""
+        text = SAMPLE_REPORT_IO_2019_1.read_text(encoding="utf-8")
+        result = parse_report_io(text)
+
+        # counter 设计有 10 个端口
+        assert result.total_ports == 10
+        assert result.gpio_ports == 10
+        assert result.gt_ports == 0
+
+        ports = {p.port_name: p for p in result.ports}
+
+        # 验证 clk 映射到 W5（传统语法）
+        assert "clk" in ports
+        assert ports["clk"].package_pin == "W5"
+        assert ports["clk"].direction == "INPUT"
+        assert ports["clk"].io_standard == "LVCMOS33"
+        assert ports["clk"].bank == 34
+        assert ports["clk"].fixed is True
+
+        # 验证 led[0] 映射到 U16（-dict 语法）
+        assert "led[0]" in ports
+        assert ports["led[0]"].package_pin == "U16"
+        assert ports["led[0]"].direction == "OUTPUT"
+
+        # rst_n 映射到 U18
+        assert "rst_n" in ports
+        assert ports["rst_n"].package_pin == "U18"
+
+    def test_skips_unused_physical_pins(self):
+        """只有 Signal Name 非空的物理引脚才算端口，其他（GND、VCC 等）跳过。"""
+        text = SAMPLE_REPORT_IO_2019_1.read_text(encoding="utf-8")
+        result = parse_report_io(text)
+
+        # xc7a35t-cpg236 有 236 个引脚，但只有 10 个被设计使用
+        # 确保 GND / VCC / 未使用的 IO 都没被误当成端口
+        assert result.total_ports < 236
 
 
 # ====================================================================== #

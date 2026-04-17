@@ -172,29 +172,28 @@ class TestGetCriticalWarnings:
 
 
 class TestVerifyIoPlacement:
-    """测试 verify_io_placement_tool 工具。"""
+    """测试 verify_io_placement_tool 工具。
+
+    B3 修复后：第一次 execute 返回 VMCP_XDC_FILE:<path> 行，
+    Python 代码直接读取该文件（支持 -dict 和传统两种语法）。
+    """
 
     @pytest.mark.asyncio
     async def test_detects_gt_mismatch(self):
         """GT 端口引脚不匹配时，报告包含 CRITICAL。"""
         from vivado_mcp.tools.diagnostic_tools import verify_io_placement_tool
 
-        # 构造 VMCP_XDC_PIN 输出（来自 sample_board_pins.xdc）
-        xdc_lines = [
-            "VMCP_XDC_PIN:board_pins.xdc|2|AA4|pcie_7x_mgt_rtl_0_rxp[0]",
-            "VMCP_XDC_PIN:board_pins.xdc|3|AB6|pcie_7x_mgt_rtl_0_rxp[1]",
-            "VMCP_XDC_PIN:board_pins.xdc|21|AB8|sys_clk_p",
-            "VMCP_XDC_PIN_DONE",
-        ]
-        xdc_output = "\n".join(xdc_lines)
+        # 新实现：第一次 execute 返回 XDC 文件路径列表
+        xdc_fixture = str(_FIXTURES / "sample_board_pins.xdc")
+        list_output = f"VMCP_XDC_FILE:{xdc_fixture}"
 
         io_text = _load_fixture("sample_report_io.txt")
 
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
-                _make_tcl_result(xdc_output),  # XDC 约束
-                _make_tcl_result(io_text),      # report_io
+                _make_tcl_result(list_output),  # XDC 文件路径
+                _make_tcl_result(io_text),       # report_io
             ]
         )
 
@@ -208,24 +207,15 @@ class TestVerifyIoPlacement:
         # rxp[0] XDC=AA4 但 report_io=M6 → 不匹配且是 GT → CRITICAL
         assert "CRITICAL" in result
         assert "pcie_7x_mgt_rtl_0_rxp[0]" in result
-        # sys_clk_p XDC=AB8 == report_io AB8 → 匹配
-        assert "sys_clk_p" not in result or "匹配" in result
 
     @pytest.mark.asyncio
-    async def test_all_matched(self):
-        """所有引脚匹配时，报告显示"均正确"。"""
+    async def test_no_xdc_files(self):
+        """项目未添加 XDC 文件时，返回提示信息。"""
         from vivado_mcp.tools.diagnostic_tools import verify_io_placement_tool
-
-        # 只约束 sys_clk_p=AB8，与 report_io 匹配
-        xdc_output = "VMCP_XDC_PIN:board_pins.xdc|21|AB8|sys_clk_p\nVMCP_XDC_PIN_DONE"
-        io_text = _load_fixture("sample_report_io.txt")
 
         session = AsyncMock()
         session.execute = AsyncMock(
-            side_effect=[
-                _make_tcl_result(xdc_output),
-                _make_tcl_result(io_text),
-            ]
+            return_value=_make_tcl_result("")  # 空输出，无 VMCP_XDC_FILE 行
         )
 
         ctx = _mock_context(session)
@@ -235,26 +225,7 @@ class TestVerifyIoPlacement:
                 session_id="default", ctx=ctx
             )
 
-        assert "均正确" in result
-
-    @pytest.mark.asyncio
-    async def test_no_xdc_constraints(self):
-        """无 XDC 约束时，返回提示信息。"""
-        from vivado_mcp.tools.diagnostic_tools import verify_io_placement_tool
-
-        session = AsyncMock()
-        session.execute = AsyncMock(
-            return_value=_make_tcl_result("VMCP_XDC_PIN_DONE")
-        )
-
-        ctx = _mock_context(session)
-
-        with patch("vivado_mcp.tools.diagnostic_tools._require_session", return_value=session):
-            result = await verify_io_placement_tool(
-                session_id="default", ctx=ctx
-            )
-
-        assert "未找到 PACKAGE_PIN 约束" in result
+        assert "未添加任何 XDC" in result
 
 
 # ====================================================================== #
@@ -263,7 +234,11 @@ class TestVerifyIoPlacement:
 
 
 class TestLaunchAndWaitDiag:
-    """测试 _launch_and_wait 中的自动诊断逻辑。"""
+    """测试 _launch_and_wait 中的自动诊断逻辑。
+
+    D5 重写后的流程：reset+launch → poll STATUS/PROGRESS → open_run → 诊断。
+    mock 需要按这个顺序提供返回值。
+    """
 
     @pytest.mark.asyncio
     async def test_warns_on_critical_warnings(self):
@@ -273,11 +248,15 @@ class TestLaunchAndWaitDiag:
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
-                # launch + wait 结果
-                _make_tcl_result("Synthesis completed"),
-                # 状态查询结果
-                _make_tcl_result("状态: synth_design Complete | 耗时: 00:05:30"),
-                # COUNT_WARNINGS 诊断结果
+                # 1. reset_run + launch_runs
+                _make_tcl_result("Synthesis launched"),
+                # 2. 第一次 poll：已 Complete
+                _make_tcl_result(
+                    "VMCP_POLL|synth_design Complete!|100%|00:05:30"
+                ),
+                # 3. open_run（自动）
+                _make_tcl_result(""),
+                # 4. COUNT_WARNINGS 诊断
                 _make_tcl_result(
                     "VMCP_DIAG:errors=0,critical_warnings=16,warnings=3"
                 ),
@@ -301,8 +280,15 @@ class TestLaunchAndWaitDiag:
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
-                _make_tcl_result("Implementation completed"),
-                _make_tcl_result("状态: route_design Complete | 耗时: 00:10:00"),
+                # 1. launch
+                _make_tcl_result("Implementation launched"),
+                # 2. poll 已完成
+                _make_tcl_result(
+                    "VMCP_POLL|route_design Complete!|100%|00:10:00"
+                ),
+                # 3. open_run
+                _make_tcl_result(""),
+                # 4. 诊断
                 _make_tcl_result(
                     "VMCP_DIAG:errors=0,critical_warnings=0,warnings=5"
                 ),

@@ -135,20 +135,28 @@ def resource_session_status(session_id: str) -> str:
 
 @mcp.prompt()
 def fpga_workflow() -> str:
-    """标准 FPGA 开发流程引导：从创建项目到生成比特流。"""
+    """标准 FPGA 开发流程引导：从创建项目到生成比特流。
+
+    **0.2.0 变更**：项目操作全部用 run_tcl/safe_tcl，不再有专用 facade 工具。
+    """
     return (
-        "请按以下标准 FPGA 开发流程操作：\n\n"
-        "1. **启动会话**: `start_session` 启动 Vivado\n"
-        "2. **创建/打开项目**: `create_project` 或 `open_project`\n"
-        "3. **添加源文件**: `add_files` 添加 HDL 和约束文件\n"
-        "4. **综合**: `run_synthesis` 运行综合\n"
-        "5. **查看报告**: `report(type='utilization')` 检查资源使用\n"
-        "6. **实现**: `run_implementation` 运行布局布线\n"
-        "7. **时序检查**: `report(type='timing')` 确认时序收敛\n"
-        "8. **生成比特流**: `generate_bitstream` 生成 .bit 文件\n"
-        "9. **编程设备**: `program_device` 下载到 FPGA\n\n"
-        "每一步完成后，使用 `get_status` 检查运行状态。\n"
-        "如遇到问题，使用 `report(type='drc')` 运行设计规则检查。"
+        "请按以下标准 FPGA 开发流程操作（0.2.0 起所有项目操作走 run_tcl/safe_tcl）：\n\n"
+        "1. **启动会话**: `start_session(mode='gui')` — 默认启动 GUI Vivado 可视化。\n"
+        "   CI 批处理用 `mode='tcl'`；attach 到已有 Vivado 用 `mode='attach'`。\n"
+        "2. **创建项目**: `safe_tcl(\"create_project {0} {1} -part {2}\", \n"
+        "   args=['my_proj', 'C:/proj', 'xc7a35tcpg236-1'])`\n"
+        "3. **添加源文件**: `safe_tcl(\"add_files -fileset [get_filesets sources_1] {0}\", \n"
+        "   args=['C:/src/top.v'])`\n"
+        "4. **设置顶层**: `run_tcl(\"set_property top my_top [current_fileset]\")`\n"
+        "5. **综合**: `run_synthesis` — 完成后自动 open_run，后续 report_* 可直接用\n"
+        "6. **查看资源**: `run_tcl(\"report_utilization -return_string\")`\n"
+        "7. **实现**: `run_implementation`\n"
+        "8. **时序检查**: `get_timing_report` — 结构化中文报告，PASS/FAIL 判定\n"
+        "9. **生成比特流**: `generate_bitstream` — 前置 CRITICAL WARNING 安全检查\n"
+        "10. **编程设备**: `program_device`\n\n"
+        "查询运行状态: `run_tcl(\"get_property STATUS [get_runs synth_1]\")`\n"
+        "设计规则检查: `run_tcl(\"report_drc -return_string\")`\n"
+        "遇到 CRITICAL WARNING: `get_critical_warnings` 提取分类 + 中文修复建议。"
     )
 
 
@@ -286,7 +294,6 @@ def debug_pcie() -> str:
 import vivado_mcp.tools.diagnostic_tools  # noqa: E402, F401
 import vivado_mcp.tools.flow_tools  # noqa: E402, F401
 import vivado_mcp.tools.ip_tools  # noqa: E402, F401
-import vivado_mcp.tools.project_tools  # noqa: E402, F401
 import vivado_mcp.tools.report_tools  # noqa: E402, F401
 import vivado_mcp.tools.session_tools  # noqa: E402, F401
 import vivado_mcp.tools.tcl_tools  # noqa: E402, F401

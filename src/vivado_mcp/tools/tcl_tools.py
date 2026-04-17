@@ -1,12 +1,18 @@
-"""通用 Tcl 执行工具：run_tcl / vivado_help。
+"""通用 Tcl 执行工具：run_tcl / safe_tcl。
 
-run_tcl 是整个系统最核心的工具 —— 可执行任意 Vivado Tcl 命令，
-等价于 200+ 专用工具的功能覆盖。
+**设计哲学**：能用 run_tcl 做的事就不包装成专用工具——
+一个工具的存在应该是因为它提供"Tcl 做不了或做不好"的本地价值（如结构化解析、
+跨命令协议、本地知识库）。绝大多数 Vivado 操作就是一行 Tcl，让 AI 自己拼。
+
+- ``run_tcl`` — 执行任意 Tcl 命令（AI 自己负责引号 / 路径 / 标识符安全性）
+- ``safe_tcl`` — 带参数模板的版本，自动用 Tcl ``list`` 规则转义参数，
+  Windows 路径含空格 / 中文 / ``$`` / ``[]`` / ``{}`` / 反斜杠也能安全执行
 """
 
 from mcp.server.fastmcp import Context
 
 from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
+from vivado_mcp.vivado.tcl_utils import tcl_quote
 
 
 @mcp.tool()
@@ -19,15 +25,19 @@ async def run_tcl(
     """执行任意 Vivado Tcl 命令。支持所有 Vivado Tcl API。
 
     这是最通用的工具，可以执行任何 Vivado Tcl 命令，包括：
-    - 约束命令：create_clock, set_property, ...
-    - IP 管理：create_ip, generate_target, ...
-    - Block Design：create_bd_design, create_bd_cell, ...
-    - 文件操作：add_files, read_verilog, read_xdc, ...
-    - 查询命令：get_ports, get_cells, get_nets, ...
-    - 报告命令：report_utilization, report_timing_summary, ...
+
+    - 项目: ``create_project``, ``open_project``, ``add_files``, ``set_property top``
+    - 约束: ``create_clock``, ``set_property PACKAGE_PIN``
+    - IP: ``create_ip``, ``generate_target``, ``set_property CONFIG.*``
+    - Block Design: ``create_bd_design``, ``create_bd_cell``, ``connect_bd_intf_net``
+    - 查询: ``get_ports``, ``get_cells``, ``get_property STATUS [get_runs]``
+    - 报告: ``report_utilization -return_string``, ``report_timing_summary -return_string``
+    - 仿真: ``launch_simulation``, ``run 100ns``, ``add_wave``
     - 以及任何其他 Vivado Tcl 命令
 
-    支持多行脚本，用换行符分隔即可。
+    支持多行脚本（用换行符分隔）。
+
+    **路径含特殊字符时请用 safe_tcl 而非 run_tcl**，避免 Tcl 解析错误。
 
     Args:
         command: Tcl 命令文本（支持多行）。
@@ -41,107 +51,49 @@ async def run_tcl(
     return await _safe_execute(session, command, float(timeout), "命令执行失败")
 
 
-# Vivado Tcl 命令快速参考（内置，不需要启动 Vivado 即可查看）
-_BUILTIN_HELP = {
-    "create_project": (
-        "create_project <name> <dir> [-part <part>] [-force]\n"
-        "创建新 Vivado 项目。\n"
-        "示例: create_project my_proj ./my_proj -part xc7a35tcpg236-1"
-    ),
-    "open_project": (
-        "open_project <xpr_file>\n"
-        "打开已有项目文件。\n"
-        "示例: open_project ./my_proj/my_proj.xpr"
-    ),
-    "close_project": "close_project\n关闭当前打开的项目。",
-    "add_files": (
-        "add_files [-fileset <fileset>] [-norecurse] <files>\n"
-        "添加源文件到项目。\n"
-        "示例: add_files -fileset sources_1 {./src/top.v ./src/sub.v}"
-    ),
-    "launch_runs": (
-        "launch_runs <run> [-jobs <N>] [-to_step <step>]\n"
-        "启动综合/实现运行。\n"
-        "示例: launch_runs synth_1 -jobs 4"
-    ),
-    "wait_on_run": (
-        "wait_on_run <run> [-timeout <minutes>]\n"
-        "等待运行完成。\n"
-        "示例: wait_on_run synth_1 -timeout 30"
-    ),
-    "create_clock": (
-        "create_clock -period <ns> [-name <name>] [-waveform {rise fall}] <port>\n"
-        "创建时钟约束。\n"
-        "示例: create_clock -period 10.000 -name sys_clk [get_ports clk]"
-    ),
-    "set_property": (
-        "set_property <prop> <value> <object>\n"
-        "设置对象属性。\n"
-        '示例: set_property PACKAGE_PIN W5 [get_ports clk]'
-    ),
-    "report_utilization": (
-        "report_utilization [-return_string] [-file <file>]\n"
-        "生成资源利用率报告。"
-    ),
-    "report_timing_summary": (
-        "report_timing_summary [-return_string] [-file <file>] "
-        "[-max_paths <N>]\n"
-        "生成时序报告摘要。"
-    ),
-    "report_power": (
-        "report_power [-return_string] [-file <file>]\n"
-        "生成功耗报告。"
-    ),
-}
-
-
 @mcp.tool()
-async def vivado_help(
-    tcl_command: str = "",
-    session_id: str = "",
+async def safe_tcl(
+    template: str,
+    args: list[str] = None,
+    session_id: str = "default",
+    timeout: int = 120,
     ctx: Context = None,
 ) -> str:
-    """查询 Vivado Tcl 命令帮助。
+    """执行带参数的 Tcl 命令模板，自动用 Tcl list 规则转义参数。
 
-    提供内置快速参考，如果指定了 session_id 且会话存在，
-    还会调用 Vivado 的 help 命令获取完整文档。
+    适用场景：命令中含文件路径、端口名、字符串值等可能有特殊字符的输入。
+    Tcl 的 ``$``、``[]``、``{}``、反斜杠、空格都会被正确转义，防注入且防解析错。
+
+    用法示例：
+
+    - ``safe_tcl("create_project {0} {1} -part {2}",
+      args=["my_proj", "C:/path with space", "xc7a35tcpg236-1"])``
+    - ``safe_tcl("read_verilog {0}", args=["C:/files/top with $dollar.v"])``
+    - ``safe_tcl("set_property PACKAGE_PIN {0} [get_ports {1}]",
+      args=["W5", "clk"])``
+
+    template 用 Python format 的 ``{0}`` / ``{1}`` 占位符，args 中每个元素会被
+    ``tcl_quote()`` 包装成 ``"..."`` 并转义所有特殊字符。
 
     Args:
-        tcl_command: 要查询的 Tcl 命令名（如 "create_clock"）。留空则显示所有可用的内置参考。
-        session_id: 可选，如果指定且会话存在，会同时查询 Vivado 原生 help。
+        template: Tcl 命令模板，用 {0}/{1}/... 表示参数位置。
+        args: 参数值列表，将被自动转义。
+        session_id: 目标会话 ID，默认 "default"。
+        timeout: 命令执行超时秒数，默认 120。
     """
-    parts: list[str] = []
-
-    if not tcl_command:
-        # 列出所有内置参考
-        parts.append("=== 内置快速参考 ===\n")
-        parts.append("可查询的命令: " + ", ".join(sorted(_BUILTIN_HELP.keys())))
-        parts.append("\n用法: vivado_help(tcl_command=\"create_clock\")")
-        parts.append("\n提示: 使用 run_tcl 可执行任意 Tcl 命令，不限于此列表。")
-        return "\n".join(parts)
-
-    # 内置参考
-    if tcl_command in _BUILTIN_HELP:
-        parts.append(f"=== 内置参考: {tcl_command} ===\n")
-        parts.append(_BUILTIN_HELP[tcl_command])
-
-    # 如果有活跃会话，查询 Vivado 原生 help
-    if session_id:
-        session = _require_session(ctx, session_id)
-        if session:
-            try:
-                result = await session.execute(
-                    f"help {tcl_command}", timeout=10.0
-                )
-                parts.append("\n=== Vivado 原生帮助 ===\n")
-                parts.append(result.output)
-            except Exception as e:
-                parts.append(f"\n[WARN] 查询 Vivado help 失败: {e}")
-
-    if not parts:
+    if args is None:
+        args = []
+    quoted = [tcl_quote(str(a)) for a in args]
+    try:
+        cmd = template.format(*quoted)
+    except (IndexError, KeyError) as e:
         return (
-            f"未找到 '{tcl_command}' 的内置参考。\n"
-            "提示: 指定 session_id 参数可查询 Vivado 原生 help 命令。"
+            f"[ERROR] safe_tcl 模板占位符不匹配: {e}。"
+            f"template={template!r}, args={args!r}"
         )
 
-    return "\n".join(parts)
+    session = _require_session(ctx, session_id)
+    if not session:
+        return _NO_SESSION.format(sid=session_id)
+
+    return await _safe_execute(session, cmd, float(timeout), "safe_tcl 执行失败")

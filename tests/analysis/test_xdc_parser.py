@@ -5,11 +5,16 @@
 - 含方括号的端口名称（如 rxp[0]）
 - VMCP_XDC_PIN_DONE 标记正确忽略
 - 空输入容错
+- **新：B3 修复** parse_xdc_file 支持 -dict 和传统两种语法
 """
+
+from pathlib import Path
 
 import pytest
 
-from vivado_mcp.analysis.xdc_parser import parse_xdc_constraints
+from vivado_mcp.analysis.xdc_parser import parse_xdc_constraints, parse_xdc_file
+
+FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
 # ====================================================================== #
 #  基本解析功能
@@ -138,3 +143,68 @@ class TestDataTypes:
 
         with pytest.raises(AttributeError):
             result[0].pin = "BB5"  # type: ignore[misc]
+
+
+# ====================================================================== #
+#  B3 修复：parse_xdc_file 支持 -dict 和传统两种语法
+# ====================================================================== #
+
+
+class TestParseXdcFile:
+    """直接读取 XDC 文件的新接口测试。"""
+
+    def test_dict_and_traditional_syntax(self):
+        """同时识别 -dict 和传统两种语法。"""
+        fixture = FIXTURES_DIR / "sample_dict_xdc.xdc"
+        result = parse_xdc_file(fixture)
+
+        ports = {c.port: c for c in result}
+
+        # -dict 语法
+        assert "clk" in ports
+        assert ports["clk"].pin == "W5"
+        assert "rst_n" in ports
+        assert ports["rst_n"].pin == "U18"
+
+        # -dict 向量端口（花括号转义）
+        assert "led[0]" in ports
+        assert ports["led[0]"].pin == "U16"
+        assert "led[1]" in ports
+        assert ports["led[1]"].pin == "E19"
+
+        # 传统语法
+        assert "led[2]" in ports
+        assert ports["led[2]"].pin == "U19"
+
+        # 带尾注释的 -dict
+        assert "led[3]" in ports
+        assert ports["led[3]"].pin == "V19"
+
+        # 传统语法 + 空格
+        assert "led[4]" in ports
+        assert ports["led[4]"].pin == "W18"
+
+    def test_ignores_commented_out_constraints(self):
+        """# 注释行的约束不应被解析。"""
+        fixture = FIXTURES_DIR / "sample_dict_xdc.xdc"
+        result = parse_xdc_file(fixture)
+
+        ports = {c.port for c in result}
+        # fixture 里有被注释掉的 fake 和 another_fake
+        assert "fake" not in ports
+        assert "another_fake" not in ports
+
+    def test_file_not_found(self):
+        """不存在的文件应抛 FileNotFoundError。"""
+        with pytest.raises(FileNotFoundError):
+            parse_xdc_file("/nonexistent/path.xdc")
+
+    def test_line_numbers_match_source(self):
+        """line_number 应对应 XDC 文件中的实际行号。"""
+        fixture = FIXTURES_DIR / "sample_dict_xdc.xdc"
+        result = parse_xdc_file(fixture)
+
+        # 验证所有行号 > 0 且 <= 文件总行数
+        file_lines = fixture.read_text(encoding="utf-8").splitlines()
+        for c in result:
+            assert 0 < c.line_number <= len(file_lines)

@@ -1,8 +1,8 @@
-"""报告工具：report / get_io_report / get_timing_report。
+"""报告工具：get_io_report / get_timing_report。
 
-report: 通用报告接口，按 report_type 选择报告类型。
-get_io_report / get_timing_report: 结构化解析后的报告（JSON），
-便于 LLM 精确提取数值，而非解析原始表格文本。
+两个工具都把 Vivado 原始表格文本解析为结构化数据（JSON / 格式化文本），
+便于 LLM 精确提取数值。通用的报告命令（utilization / power / drc 等）
+请直接用 ``run_tcl("report_xxx -return_string")``，无需包装。
 """
 
 import json
@@ -11,70 +11,7 @@ from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
 from vivado_mcp.analysis.timing_parser import format_timing_report, parse_timing_summary
-from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
-
-# 支持的报告类型 → Tcl 命令映射（白名单，已验证安全）
-_REPORT_TYPES = {
-    "utilization": "report_utilization",
-    "timing": "report_timing_summary",
-    "power": "report_power",
-    "drc": "report_drc",
-    "io": "report_io",
-    "clock": "report_clocks",
-    "clock_networks": "report_clock_networks",
-    "methodology": "report_methodology",
-    "cdc": "report_cdc",
-    "congestion": "report_design_analysis -congestion",
-    "route_status": "report_route_status",
-}
-
-
-@mcp.tool()
-async def report(
-    report_type: str,
-    options: str = "",
-    session_id: str = "default",
-    timeout: int = 120,
-    ctx: Context = None,
-) -> str:
-    """获取 Vivado 设计报告。
-
-    支持的 report_type:
-    - utilization: 资源利用率报告
-    - timing: 时序报告摘要
-    - power: 功耗报告
-    - drc: 设计规则检查
-    - io: IO 引脚报告
-    - clock: 时钟报告
-    - clock_networks: 时钟网络报告
-    - methodology: 方法学检查
-    - cdc: 跨时钟域报告
-    - congestion: 拥塞分析
-    - route_status: 布线状态
-
-    Args:
-        report_type: 报告类型（见上方列表）。
-        options: 额外 Tcl 选项（如 "-max_paths 10"）。
-        session_id: 目标会话 ID。
-        timeout: 超时秒数，默认 120。
-    """
-    if report_type not in _REPORT_TYPES:
-        available = ", ".join(sorted(_REPORT_TYPES.keys()))
-        return (
-            f"[ERROR] 未知报告类型 '{report_type}'。\n"
-            f"支持的类型: {available}"
-        )
-
-    session = _require_session(ctx, session_id)
-    if not session:
-        return _NO_SESSION.format(sid=session_id)
-
-    tcl_cmd = _REPORT_TYPES[report_type]
-    tcl = f"{tcl_cmd} -return_string {options}"
-
-    return await _safe_execute(
-        session, tcl, float(timeout), f"生成 {report_type} 报告失败"
-    )
+from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 
 
 @mcp.tool()
@@ -101,6 +38,14 @@ async def get_io_report(
         result = await session.execute(
             "report_io -return_string", timeout=60.0
         )
+        # B2 修复：命令失败时不要把错误文本送进 parser（否则解析出 0 个端口等假结果）
+        if result.is_error:
+            return (
+                f"[ERROR] 获取 IO 报告失败（rc={result.return_code}）：\n"
+                f"{result.output}\n\n"
+                "提示: report_io 需要打开综合或实现后的设计。"
+                "请先运行 run_synthesis 或 run_implementation。"
+            )
         io_report = parse_report_io(result.output)
         return json.dumps(io_report.to_dict(), ensure_ascii=False, indent=2)
     except Exception as e:
@@ -129,6 +74,14 @@ async def get_timing_report(
         result = await session.execute(
             "report_timing_summary -return_string", timeout=120.0
         )
+        # B2 修复：命令失败时直接返回错误，避免 parser 默认值 WNS=0 被误判为 PASS
+        if result.is_error:
+            return (
+                f"[ERROR] 获取时序报告失败（rc={result.return_code}）：\n"
+                f"{result.output}\n\n"
+                "提示: report_timing_summary 需要打开综合或实现后的设计。"
+                "请先运行 run_synthesis 或 run_implementation。"
+            )
         timing_report = parse_timing_summary(result.output)
         return format_timing_report(timing_report)
     except Exception as e:
