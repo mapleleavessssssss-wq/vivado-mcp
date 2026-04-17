@@ -6,7 +6,6 @@ from vivado_mcp.analysis.project_parser import (
     parse_project_info,
 )
 
-
 SAMPLE = """\
 VMCP_PROJ:project_name=basys3_uart
 VMCP_PROJ:project_dir=C:/Users/NJ/Desktop/test

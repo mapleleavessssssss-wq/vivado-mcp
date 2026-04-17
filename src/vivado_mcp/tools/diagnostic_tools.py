@@ -8,7 +8,6 @@ from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
 from vivado_mcp.analysis.io_verifier import format_io_verification, verify_io_placement
-from vivado_mcp.analysis.xdc_linter import format_lint_report, lint_xdc_files
 from vivado_mcp.analysis.warning_parser import (
     WarningReport,
     format_warning_report,
@@ -17,6 +16,7 @@ from vivado_mcp.analysis.warning_parser import (
     parse_diag_counts,
     parse_errors,
 )
+from vivado_mcp.analysis.xdc_linter import format_lint_report, lint_xdc_files
 from vivado_mcp.analysis.xdc_parser import XdcConstraint, parse_xdc_file
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 from vivado_mcp.tcl_scripts import (

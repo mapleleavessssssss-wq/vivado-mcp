@@ -143,7 +143,7 @@ def lint_xdc_file(path: str | Path) -> list[LintIssue]:
         pin_to_ports.setdefault(pin.upper(), []).append((lineno, port))
     for pin, occurrences in pin_to_ports.items():
         if len({p for _, p in occurrences}) > 1:
-            ports_str = ", ".join(f"{p}(行{l})" for l, p in occurrences)
+            ports_str = ", ".join(f"{p}(行{ln})" for ln, p in occurrences)
             issues.append(LintIssue(
                 severity="error",
                 rule="PIN_CONFLICT",
@@ -174,7 +174,7 @@ def lint_xdc_file(path: str | Path) -> list[LintIssue]:
         port_to_pins.setdefault(port, []).append((lineno, pin))
     for port, occurrences in port_to_pins.items():
         if len(occurrences) > 1 and len({p for _, p in occurrences}) > 1:
-            pins_str = ", ".join(f"{p}(行{l})" for l, p in occurrences)
+            pins_str = ", ".join(f"{p}(行{ln})" for ln, p in occurrences)
             issues.append(LintIssue(
                 severity="warning",
                 rule="DUPLICATE_PORT",
@@ -227,7 +227,7 @@ def lint_xdc_files(paths: list[str | Path]) -> LintReport:
             # 只在"跨文件冲突"时报告,避免单文件已经报过的重复
             # 但要判断是否和单文件内冲突重复 —— 按文件数 > 1 判断即可
             loc_str = ", ".join(
-                f"{Path(f).name}:{l}:{p}" for f, l, p in occurrences
+                f"{Path(f).name}:{ln}:{p}" for f, ln, p in occurrences
             )
             report.issues.append(LintIssue(
                 severity="error",

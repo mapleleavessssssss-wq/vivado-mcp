@@ -9,7 +9,6 @@ from vivado_mcp.analysis.util_parser import (
     parse_utilization,
 )
 
-
 SAMPLE = """
 Design Information
 ------------------

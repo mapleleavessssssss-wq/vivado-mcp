@@ -82,9 +82,12 @@ class TimingReport:
 
     summary: TimingSummary
     paths: list[TimingPath] = field(default_factory=list)
-    source_stage: str = "unknown"          # "post-synth" / "post-place" / "post-route" / "unknown"
-    source_detail: str = ""                # 自由文本(如 "impl_1=place_design ERROR, 显示 synth_1 估算")
-    stage_warning: str = ""                # 有风险时填警告文案,否则空字符串
+    # source_stage: "post-synth" / "post-place" / "post-route" / "unknown"
+    source_stage: str = "unknown"
+    # source_detail: 自由文本,如 "impl_1=place_design ERROR, 显示 synth_1 估算"
+    source_detail: str = ""
+    # stage_warning: 有风险时填警告文案,否则空字符串
+    stage_warning: str = ""
 
     def to_dict(self) -> dict:
         """返回可直接 ``json.dumps`` 序列化的字典。"""

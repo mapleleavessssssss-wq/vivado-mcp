@@ -10,13 +10,13 @@ import json
 from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
+from vivado_mcp.analysis.project_parser import format_project_info, parse_project_info
 from vivado_mcp.analysis.timing_parser import (
     derive_stage_warning,
     format_timing_report,
     parse_design_stage,
     parse_timing_summary,
 )
-from vivado_mcp.analysis.project_parser import format_project_info, parse_project_info
 from vivado_mcp.analysis.util_parser import format_utilization_report, parse_utilization
 from vivado_mcp.analysis.warning_parser import parse_pre_bitstream
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
