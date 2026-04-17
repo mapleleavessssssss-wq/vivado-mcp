@@ -8,18 +8,21 @@ from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
 from vivado_mcp.analysis.io_verifier import format_io_verification, verify_io_placement
+from vivado_mcp.analysis.xdc_linter import format_lint_report, lint_xdc_files
 from vivado_mcp.analysis.warning_parser import (
     WarningReport,
     format_warning_report,
     group_warnings,
     parse_critical_warnings,
     parse_diag_counts,
+    parse_errors,
 )
 from vivado_mcp.analysis.xdc_parser import XdcConstraint, parse_xdc_file
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 from vivado_mcp.tcl_scripts import (
     COUNT_WARNINGS,
     EXTRACT_CRITICAL_WARNINGS,
+    EXTRACT_ERRORS,
 )
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
@@ -57,31 +60,47 @@ async def get_critical_warnings(
     except Exception as e:
         return f"[ERROR] 读取警告计数失败: {e}"
 
-    if cw_count == 0:
-        return (
-            f"诊断概览: errors={errors}, critical_warnings=0, warnings={w_count}\n"
-            "未发现 CRITICAL WARNING。"
-        )
-
     if cw_count == -1:
         return "[ERROR] 未找到 runme.log，请确认 run 已执行过。"
 
-    # 第二步：提取 CRITICAL WARNING 详情
-    try:
-        cw_result = await session.execute(
-            EXTRACT_CRITICAL_WARNINGS.format(run_name=run_name), timeout=60.0
+    # 无异常快速返回
+    if errors == 0 and cw_count == 0:
+        return (
+            f"诊断概览: errors=0, critical_warnings=0, warnings={w_count}\n"
+            "未发现 ERROR 或 CRITICAL WARNING。"
         )
-        cw_list = parse_critical_warnings(cw_result.output)
-        groups = group_warnings(cw_list)
-    except Exception as e:
-        return f"[ERROR] 提取 CRITICAL WARNING 详情失败: {e}"
+
+    # 第二步：按需提取详情(ERROR 优先,CW 次之)
+    error_groups = []
+    cw_groups = []
+
+    if errors > 0:
+        try:
+            err_result = await session.execute(
+                EXTRACT_ERRORS.format(run_name=run_name), timeout=60.0
+            )
+            err_list = parse_errors(err_result.output)
+            error_groups = group_warnings(err_list)
+        except Exception as e:
+            return f"[ERROR] 提取 ERROR 详情失败: {e}"
+
+    if cw_count > 0:
+        try:
+            cw_result = await session.execute(
+                EXTRACT_CRITICAL_WARNINGS.format(run_name=run_name), timeout=60.0
+            )
+            cw_list = parse_critical_warnings(cw_result.output)
+            cw_groups = group_warnings(cw_list)
+        except Exception as e:
+            return f"[ERROR] 提取 CRITICAL WARNING 详情失败: {e}"
 
     # 第三步：格式化报告
     report = WarningReport(
         errors=errors,
         critical_warnings=cw_count,
         warnings=w_count,
-        groups=groups,
+        groups=cw_groups,
+        error_groups=error_groups,
     )
     return format_warning_report(report)
 
@@ -172,3 +191,58 @@ async def verify_io_placement_tool(
     # 第三步：对比验证
     verification = verify_io_placement(xdc_constraints, io_report)
     return format_io_verification(verification)
+
+
+@mcp.tool()
+async def xdc_lint(
+    xdc_paths: list[str] | None = None,
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """对 XDC 约束文件做静态检查(pure Python,不依赖 Vivado 综合)。
+
+    综合前就能捕到这些常见错误,省掉 30+ 秒的跑综合等待:
+    - PIN_CONFLICT:同一物理引脚被多个 port 占用
+    - MISSING_IOSTANDARD:有 PACKAGE_PIN 却没配 IOSTANDARD(NSTD-1 / BIVC-1 隐患)
+    - DUPLICATE_PORT:同 port 被多次约束不同引脚(后者覆盖)
+    - CLOCK_NO_PERIOD:create_clock 缺 -period
+    - PIN_CONFLICT_CROSS_FILE:多个 XDC 文件间的引脚冲突
+
+    Args:
+        xdc_paths: 要检查的 XDC 文件路径列表。若不传,则从当前 session 的项目里
+            自动抓取所有 constrs_1 下的 XDC 文件。
+        session_id: 目标会话 ID(仅在不传 xdc_paths 时使用)。
+    """
+    # 路径来源:显式传入 > 从 session 拉取
+    if xdc_paths is None or len(xdc_paths) == 0:
+        session = _require_session(ctx, session_id)
+        if not session:
+            return (
+                "[ERROR] 未传 xdc_paths 且 session 不存在。"
+                "请传 xdc_paths=['xxx.xdc',...] 或先 start_session + 打开项目。"
+            )
+        try:
+            list_result = await session.execute(
+                'foreach __f [get_files -of_objects [get_filesets constrs_1] '
+                '-filter {FILE_TYPE == XDC}] { puts "VMCP_XDC_FILE:$__f" }',
+                timeout=15.0,
+            )
+            if list_result.is_error:
+                return (
+                    f"[ERROR] 无法从项目拉 XDC 文件(rc={list_result.return_code}):\n"
+                    f"{list_result.output}\n"
+                    "提示:先 open_project 或直接传 xdc_paths 参数。"
+                )
+            xdc_paths = [
+                line[len("VMCP_XDC_FILE:"):].strip()
+                for line in list_result.output.splitlines()
+                if line.startswith("VMCP_XDC_FILE:")
+            ]
+        except Exception as e:
+            return f"[ERROR] 拉 XDC 列表失败: {e}"
+
+    if not xdc_paths:
+        return "项目未添加任何 XDC 约束文件,没什么可检查的。"
+
+    report = lint_xdc_files(list(xdc_paths))
+    return format_lint_report(report)

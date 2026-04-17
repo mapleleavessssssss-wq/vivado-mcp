@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0] — 2026-04-17
+
+### 新增工具(4 个,15 → 19)
+
+- **`check_bitstream_readiness`** —— 烧板前一键 READY/WARN/BLOCK 综合判定。一次性检查 impl 状态、CW 计数、时序收敛,避免烧板后才发现问题。
+- **`get_utilization_report`** —— 结构化资源占用报告(LUT/FF/BRAM/DSP/IO)。> 90% 自动标 `[CRITICAL]`,70-90% 标 `[WARN]`,xc7a35t 这种小芯片做设计时最常需要看。
+- **`get_project_info`** —— 一次拿齐项目摸底信息:项目名、part、顶层模块、源文件列表、XDC 约束、IP 实例、synth/impl 状态。AI 接手陌生项目的起点。
+- **`xdc_lint`** —— 纯 Python 静态 XDC 检查,**不需要 Vivado 进程**。即时捕捉 PIN_CONFLICT、MISSING_IOSTANDARD(NSTD-1/BIVC-1 隐患)、DUPLICATE_PORT、CLOCK_NO_PERIOD、PIN_CONFLICT_CROSS_FILE 五类常见错误,省掉 30 秒以上的跑综合等待。
+
+### 修复
+
+- **B10 [P1] `get_critical_warnings` 严重级别盲区** —— 实现阶段出现 ERROR 时,工具只显示 `errors=3` 数字,不列出具体 ERROR 内容,用户拿到 `critical_warnings=0` 容易误判"没事"。现在 `errors>0` 自动触发 `EXTRACT_ERRORS` Tcl 脚本,报告顶部出现 `!! 发现 N 条 ERROR !!` 并展示分类 + 中文修复建议。`_KNOWN_CATEGORIES` 补充 `DRC BIVC-1`/`Vivado_Tcl 4-23`/`Common 17-39`/`Synth 8-27`/`Synth 8-439`/`Place 30-58`/`Route 35-162` 七类 ERROR/CW ID。
+- **B11 [P1] `get_timing_report` 无状态感知** —— impl_1 place_design 失败时,current_design 回落到 synth_1,工具返回 `PASS WNS=+5.813 ns` 但其实是综合估算,用户误以为"时序 OK 可烧板"。新增 `QUERY_DESIGN_STAGE` Tcl 脚本查询 synth_1/impl_1 状态,报告头部明示 `数据来源: post-synth (综合后估算,非最终结果)` / `post-route`,impl 失败时额外插入 `[!] 注意: impl_1 失败...不要据此判断能否烧板` 醒目警告。
+- **B12 [P2] `_RE_WARNING_ID` 正则匹配不到字母数字 ID** —— 老正则 `\w+[\s\-]\d+[\-\d]*` 只匹配纯数字 ID,`[DRC BIVC-1]`/`[DRC NSTD-1]`/`[DRC UCIO-1]` 等字母数字混合 ID 全部归类为 UNKNOWN。扩宽为 `\w+[\s\-][\w\-]+` 后可识别常见 DRC 系列。
+
+### 测试
+
+- **216 → 251**,新增 35 个单元测试:xdc_linter(9)、util_parser(9)、project_parser(5)、timing_parser Bug 2(10)、diagnostic_tools Bug 1(2)。
+
 ## [0.2.0] — 2026-04-17
 
 ### BREAKING CHANGES

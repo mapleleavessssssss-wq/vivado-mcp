@@ -47,12 +47,17 @@ class WarningGroup:
 
 @dataclass
 class WarningReport:
-    """整合诊断计数与分组后的完整报告。"""
+    """整合诊断计数与分组后的完整报告。
+
+    - ``groups``      —— CRITICAL WARNING 按 warning_id 分组
+    - ``error_groups`` —— ERROR 按 warning_id 分组（严重级别 > CW）
+    """
 
     errors: int
     critical_warnings: int
     warnings: int
     groups: list[WarningGroup] = field(default_factory=list)
+    error_groups: list[WarningGroup] = field(default_factory=list)
 
 
 # ====================================================================== #
@@ -97,7 +102,37 @@ _KNOWN_CATEGORIES: dict[str, tuple[str, str]] = {
     ),
     "DRC BIVC-1": (
         "IO_STANDARD_MISMATCH",
-        "Bank内IOSTANDARD不一致。检查同Bank引脚的电平标准。",
+        "Bank 内 IOSTANDARD 不一致(同一 Bank 的端口用了不同电压,如 LVCMOS18 和 LVCMOS33)。\n"
+        "  常见原因: 某端口漏写 IOSTANDARD,Vivado 默认 LVCMOS18 与同 Bank 其他端口冲突。\n"
+        "  修复: 在 XDC 给所有端口显式指定 IOSTANDARD,同 Bank 保持电平一致。",
+    ),
+    "Vivado_Tcl 4-23": (
+        "DRC_FAILED",
+        "DRC(设计规则检查)失败,布局/布线阶段被阻止。\n"
+        "  修复: 查看同一日志里前面的 [DRC xxx-N] 条目定位根因,常见是 BIVC-1/NSTD-1/UCIO-1。",
+    ),
+    "Common 17-39": (
+        "STAGE_ABORT",
+        "前置阶段失败导致后续阶段未能启动(例如 place_design 失败后 route_design 被中止)。\n"
+        "  修复: 查看日志里更早的 ERROR 条目定位真正原因。",
+    ),
+    "Synth 8-27": (
+        "SYNTH_SYNTAX_ERROR",
+        "综合时发现 HDL 语法错误。修复: 查看错误前后的文件名和行号。",
+    ),
+    "Synth 8-439": (
+        "PORT_MISSING",
+        "实例化模块端口缺失或不匹配。检查模块声明和实例化端口列表是否一致。",
+    ),
+    "Place 30-58": (
+        "PLACE_FAILED",
+        "布局失败。常见原因: 资源超限、引脚冲突、时钟网络不合法。\n"
+        "  修复: 先跑 report_utilization 看资源,再看是否有更早的 DRC ERROR。",
+    ),
+    "Route 35-162": (
+        "ROUTE_FAILED",
+        "布线失败(可能是拥塞或资源冲突)。\n"
+        "  修复: 报 report_route_status,考虑降低时钟频率或增加布线优先级。",
     ),
     "Vivado 12-1790": (
         "MISSING_PIN_CONSTRAINT",
@@ -132,8 +167,14 @@ _RE_DIAG = re.compile(
 # 匹配 VMCP_CW 行：行号|消息
 _RE_CW_LINE = re.compile(r"VMCP_CW:(\d+)\|(.+)")
 
-# 从消息中提取 warning ID，如 [Vivado 12-1411]、[DRC RTSTAT-1]、[Timing 38-282]
-_RE_WARNING_ID = re.compile(r"\[(\w+[\s\-]\d+[\-\d]*)\]")
+# 匹配 VMCP_ERR 行：行号|消息（ERROR 详情提取,严重级别 > CW）
+_RE_ERR_LINE = re.compile(r"VMCP_ERR:(\d+)\|(.+)")
+
+# 从消息中提取 warning ID，支持:
+#   - 纯数字 ID:    [Vivado 12-1411] / [Timing 38-282]
+#   - 字母数字 ID:  [DRC BIVC-1] / [DRC NSTD-1] / [DRC UCIO-1]
+#   - 下划线 ID:    [Vivado_Tcl 4-23] / [Common 17-39]
+_RE_WARNING_ID = re.compile(r"\[(\w+[\s\-][\w\-]+)\]")
 
 # 从消息末尾提取源文件引用，如 [board_pins.xdc:15]
 _RE_SOURCE_FILE = re.compile(r"\[(\S+?\.\w+):(\d+)\]")
@@ -168,18 +209,15 @@ def parse_diag_counts(raw: str) -> tuple[int, int, int]:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
-def parse_critical_warnings(raw: str) -> list[CriticalWarning]:
-    """解析 EXTRACT_CRITICAL_WARNINGS 脚本输出。
+def _parse_log_entries(raw: str, line_re: re.Pattern) -> list[CriticalWarning]:
+    """通用解析器:匹配 ``<prefix>:行号|消息`` 格式,抽取 warning_id/port/pin/source_file。
 
-    逐行匹配 ``VMCP_CW:行号|消息`` 格式，从消息中提取：
-    - warning_id: ``[Vivado 12-1411]`` 中的 ID
-    - source_file: 消息末尾 ``[xxx.xdc:N]`` 中的文件名
-    - port: ``port xxx`` 中的端口名
-    - pin: ``package_pin xxx`` 中的引脚名
+    同时服务 CRITICAL WARNING(``VMCP_CW:``)和 ERROR(``VMCP_ERR:``)两类日志条目,
+    数据结构复用 ``CriticalWarning``(字段语义通用,仅严重级别不同)。
     """
     results: list[CriticalWarning] = []
     for line in raw.splitlines():
-        m = _RE_CW_LINE.match(line.strip())
+        m = line_re.match(line.strip())
         if m is None:
             continue
 
@@ -214,6 +252,16 @@ def parse_critical_warnings(raw: str) -> list[CriticalWarning]:
             )
         )
     return results
+
+
+def parse_critical_warnings(raw: str) -> list[CriticalWarning]:
+    """解析 EXTRACT_CRITICAL_WARNINGS 脚本输出的 ``VMCP_CW:`` 行。"""
+    return _parse_log_entries(raw, _RE_CW_LINE)
+
+
+def parse_errors(raw: str) -> list[CriticalWarning]:
+    """解析 EXTRACT_ERRORS 脚本输出的 ``VMCP_ERR:`` 行(结构与 CW 同构)。"""
+    return _parse_log_entries(raw, _RE_ERR_LINE)
 
 
 def group_warnings(warnings: list[CriticalWarning]) -> list[WarningGroup]:
@@ -266,37 +314,57 @@ def group_warnings(warnings: list[CriticalWarning]) -> list[WarningGroup]:
     return groups
 
 
+def _format_group_block(g: WarningGroup, severity: str) -> list[str]:
+    """格式化单个分组区块(ERROR 或 CRITICAL WARNING 通用)。"""
+    block = [f"--- [{severity}][{g.warning_id}] {g.category} ({g.count} 条) ---"]
+    block.append(f"  首次出现: 第 {g.first_line} 行")
+    block.append(f"  示例消息: {g.message_template}")
+    if g.affected_ports:
+        port_str = ", ".join(g.affected_ports[:10])
+        if len(g.affected_ports) > 10:
+            port_str += f" ... 共 {len(g.affected_ports)} 个"
+        block.append(f"  受影响端口: {port_str}")
+    if g.source_files:
+        block.append(f"  约束文件: {', '.join(g.source_files)}")
+    block.append(f"  建议: {g.suggestion}")
+    block.append("")
+    return block
+
+
 def format_warning_report(report: WarningReport) -> str:
     """将 WarningReport 格式化为人类可读的中文文本。
 
-    如果存在 CRITICAL WARNING，首行为醒目提示：
-    ``!! 发现 N 条 CRITICAL WARNING !!``
+    级别顺序: ERROR(最严重) → CRITICAL WARNING → 概览。如果存在 ERROR,
+    首行提示 ``!! 发现 N 条 ERROR !!``;否则若有 CW,首行 ``!! 发现 N 条 CRITICAL WARNING !!``。
     """
     lines: list[str] = []
 
-    # 概览行
+    # 概览行(始终展示)
     lines.append(
         f"诊断概览: errors={report.errors}, "
         f"critical_warnings={report.critical_warnings}, "
         f"warnings={report.warnings}"
     )
 
-    if report.critical_warnings > 0:
-        lines.insert(0, f"!! 发现 {report.critical_warnings} 条 CRITICAL WARNING !!")
+    # ERROR 详情区块(严重级别最高,优先展示)
+    if report.errors > 0 and report.error_groups:
         lines.append("")
+        lines.append("=== ERROR 详情 ===")
+        for g in report.error_groups:
+            lines.extend(_format_group_block(g, "ERROR"))
 
+    # CRITICAL WARNING 详情区块
+    if report.critical_warnings > 0 and report.groups:
+        lines.append("")
+        lines.append("=== CRITICAL WARNING 详情 ===")
         for g in report.groups:
-            lines.append(f"--- [{g.warning_id}] {g.category} ({g.count} 条) ---")
-            lines.append(f"  首次出现: 第 {g.first_line} 行")
-            if g.affected_ports:
-                port_str = ", ".join(g.affected_ports[:10])
-                if len(g.affected_ports) > 10:
-                    port_str += f" ... 共 {len(g.affected_ports)} 个"
-                lines.append(f"  受影响端口: {port_str}")
-            if g.source_files:
-                lines.append(f"  约束文件: {', '.join(g.source_files)}")
-            lines.append(f"  建议: {g.suggestion}")
-            lines.append("")
+            lines.extend(_format_group_block(g, "CRITICAL WARNING"))
+
+    # 顶部醒目提示:ERROR 优先于 CW
+    if report.errors > 0:
+        lines.insert(0, f"!! 发现 {report.errors} 条 ERROR !!")
+    elif report.critical_warnings > 0:
+        lines.insert(0, f"!! 发现 {report.critical_warnings} 条 CRITICAL WARNING !!")
 
     return "\n".join(lines)
 

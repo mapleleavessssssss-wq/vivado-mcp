@@ -18,7 +18,9 @@ import pytest
 from vivado_mcp.analysis.timing_parser import (
     TimingReport,
     TimingSummary,
+    derive_stage_warning,
     format_timing_report,
+    parse_design_stage,
     parse_timing_summary,
 )
 
@@ -272,3 +274,91 @@ class TestFormatTimingReport:
         assert "reg_a/C" in text
         assert "reg_b/D" in text
         assert "sys_clk" in text
+
+
+# ====================================================================== #
+#  Bug 2 修复测试:设计阶段感知
+# ====================================================================== #
+
+
+class TestParseDesignStage:
+    def test_parses_post_route(self):
+        raw = ("VMCP_STAGE:stage=post-route|synth_status=synth_design Complete!"
+               "|impl_status=route_design Complete!")
+        stage, synth, impl = parse_design_stage(raw)
+        assert stage == "post-route"
+        assert "synth_design Complete" in synth
+        assert "route_design Complete" in impl
+
+    def test_parses_post_synth_with_impl_error(self):
+        raw = ("VMCP_STAGE:stage=post-synth|synth_status=synth_design Complete!"
+               "|impl_status=place_design ERROR")
+        stage, synth, impl = parse_design_stage(raw)
+        assert stage == "post-synth"
+        assert "ERROR" in impl
+
+    def test_unknown_on_empty(self):
+        stage, synth, impl = parse_design_stage("")
+        assert stage == "unknown"
+        assert synth == ""
+        assert impl == ""
+
+
+class TestDeriveStageWarning:
+    def test_post_route_no_warning(self):
+        detail, warn = derive_stage_warning(
+            "post-route", "synth_design Complete!", "route_design Complete!"
+        )
+        assert warn == ""
+        assert "route_design Complete" in detail
+
+    def test_impl_error_triggers_strong_warning(self):
+        """Bug 2 核心场景:impl 失败但还有 synth 估算时序。"""
+        detail, warn = derive_stage_warning(
+            "post-synth", "synth_design Complete!", "place_design ERROR"
+        )
+        assert "不要据此判断能否烧板" in warn
+        assert "impl_1 失败" in warn
+        assert "ERROR" in detail
+
+    def test_post_synth_has_estimate_warning(self):
+        detail, warn = derive_stage_warning(
+            "post-synth", "synth_design Complete!", "Not started"
+        )
+        assert "综合估算" in warn
+        assert "不要作为最终判据" in warn
+
+
+class TestFormatWithStage:
+    def test_format_shows_post_route(self):
+        summary = TimingSummary(
+            wns=0.5, tns=0.0, whs=0.1, ths=0.0,
+            failing_endpoints=0, total_endpoints=100, timing_met=True,
+        )
+        report = TimingReport(
+            summary=summary, paths=[],
+            source_stage="post-route",
+            source_detail="impl_1 状态=route_design Complete!",
+            stage_warning="",
+        )
+        text = format_timing_report(report)
+        assert "数据来源: post-route" in text
+        assert "PASS" in text
+
+    def test_format_shows_warning_when_impl_failed(self):
+        """Bug 2 的核心保障:impl 失败时必须有醒目警告。"""
+        summary = TimingSummary(
+            wns=5.8, tns=0.0, whs=0.1, ths=0.0,
+            failing_endpoints=0, total_endpoints=128, timing_met=True,
+        )
+        report = TimingReport(
+            summary=summary, paths=[],
+            source_stage="post-synth",
+            source_detail="impl_1=place_design ERROR",
+            stage_warning="注意: impl_1 失败,下面的时序是综合估算,不等同于布线后的最终结果。",
+        )
+        text = format_timing_report(report)
+        assert "数据来源: post-synth" in text
+        # 关键:用户必须看到警告
+        assert "[!]" in text
+        assert "impl_1 失败" in text

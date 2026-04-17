@@ -52,9 +52,13 @@ vivado_*.backup.log
 webtalk*.jou
 webtalk*.log
 usage_statistics_webtalk.*
+# Vivado GUI TCP server 运行时 PID/Port 快照
+vivado_pid*.str
 
 # Claude Code
 .claude/
+# 本地 MCP 客户端注册,不同机器的入口可能不一样,各自生成
+.mcp.json
 
 # 内部文档
 .spec-workflow/

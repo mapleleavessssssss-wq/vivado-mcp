@@ -62,6 +62,31 @@ if {{[file exists $__log]}} {{
 """
 
 # --------------------------------------------------------------------------- #
+#  提取 ERROR 详情：逐行扫描 runme.log，只输出 ERROR: 前缀行
+#  格式：VMCP_ERR:行号|原始文本
+#  用途：补齐 get_critical_warnings 的严重级别盲区（ERROR > CW）
+# --------------------------------------------------------------------------- #
+
+EXTRACT_ERRORS = """\
+set __run_dir [get_property DIRECTORY [get_runs {run_name}]]
+set __log "$__run_dir/runme.log"
+if {{[file exists $__log]}} {{
+    set __fp [open $__log r]
+    set __ln 0
+    while {{[gets $__fp __line] >= 0}} {{
+        incr __ln
+        if {{[string match "ERROR:*" $__line]}} {{
+            puts "VMCP_ERR:$__ln|$__line"
+        }}
+    }}
+    close $__fp
+    puts "VMCP_ERR_DONE"
+}} else {{
+    puts "VMCP_ERR_ERROR:runme.log not found at $__log"
+}}
+"""
+
+# --------------------------------------------------------------------------- #
 #  提取 XDC 中的 PACKAGE_PIN 约束
 #  自动读取项目 constrs_1 中所有 XDC 文件，过滤 PACKAGE_PIN 行
 #  格式：VMCP_XDC_PIN:文件路径|行号|引脚|端口
@@ -111,6 +136,104 @@ if {{$__ip eq ""}} {{
     puts "VMCP_IP_PARAM_DONE"
 }}
 """
+
+# --------------------------------------------------------------------------- #
+#  查询当前设计的阶段来源(post-synth / post-place / post-route)
+#  用途:get_timing_report 报告头部元信息,区分估算时序 vs 最终时序
+#  格式:VMCP_STAGE:stage=<stage>|synth_status=<s>|impl_status=<i>
+# --------------------------------------------------------------------------- #
+
+# 注意: 下面两个脚本没有 Python 占位符,直接用单花括号 `{` `}`(不走 .format())。
+# 其他脚本(如 EXTRACT_ERRORS)因为要通过 .format(run_name=...) 传参,所以必须用双花括号转义。
+QUERY_DESIGN_STAGE = """\
+set __synth_status ""
+set __impl_status ""
+set __stage "unknown"
+# 查询 synth_1 / impl_1 状态(优先考虑 current_project 里的 active run)
+if {[llength [get_runs -quiet synth_1]] > 0} {
+    set __synth_status [get_property STATUS [get_runs synth_1]]
+}
+if {[llength [get_runs -quiet impl_1]] > 0} {
+    set __impl_status [get_property STATUS [get_runs impl_1]]
+}
+# 判断 current_design 处于哪个阶段
+# Vivado STATUS 典型值:
+#   "Not started"
+#   "synth_design Complete!"
+#   "place_design Complete!" / "place_design ERROR"
+#   "route_design Complete!" / "route_design ERROR"
+#   "write_bitstream Complete!"
+if {[string match "*route_design Complete*" $__impl_status] ||
+     [string match "*write_bitstream*" $__impl_status]} {
+    set __stage "post-route"
+} elseif {[string match "*place_design Complete*" $__impl_status]} {
+    set __stage "post-place"
+} elseif {[string match "*synth_design Complete*" $__synth_status]} {
+    set __stage "post-synth"
+}
+puts "VMCP_STAGE:stage=$__stage|synth_status=$__synth_status|impl_status=$__impl_status"
+"""
+
+# --------------------------------------------------------------------------- #
+#  一次性查询项目综合信息
+#  输出多行 VMCP_PROJ:key=value,Python 侧解析
+# --------------------------------------------------------------------------- #
+
+QUERY_PROJECT_INFO = """\
+# 项目基本信息
+if {[catch {current_project} __proj]} {
+    puts "VMCP_PROJ:error=no_project_open"
+} else {
+    set __name [get_property NAME [current_project]]
+    set __dir  [get_property DIRECTORY [current_project]]
+    set __part [get_property PART [current_project]]
+    puts "VMCP_PROJ:project_name=$__name"
+    puts "VMCP_PROJ:project_dir=$__dir"
+    puts "VMCP_PROJ:part=$__part"
+
+    # 顶层
+    set __top [get_property TOP [current_fileset]]
+    puts "VMCP_PROJ:top=$__top"
+
+    # 源文件列表(sources_1)
+    set __srcs [get_files -quiet -of_objects [get_filesets sources_1]]
+    puts "VMCP_PROJ:source_count=[llength $__srcs]"
+    foreach __f $__srcs {
+        set __ft [get_property FILE_TYPE $__f]
+        puts "VMCP_PROJ_FILE:source|$__ft|$__f"
+    }
+
+    # XDC 约束文件
+    set __xdcs [get_files -quiet -of_objects [get_filesets constrs_1] \
+                -filter {FILE_TYPE == XDC}]
+    puts "VMCP_PROJ:xdc_count=[llength $__xdcs]"
+    foreach __f $__xdcs {
+        puts "VMCP_PROJ_FILE:xdc|XDC|$__f"
+    }
+
+    # IP 列表
+    set __ips [get_ips -quiet]
+    puts "VMCP_PROJ:ip_count=[llength $__ips]"
+    foreach __ip $__ips {
+        set __vlnv [get_property VLNV $__ip]
+        puts "VMCP_PROJ_IP:$__ip|$__vlnv"
+    }
+
+    # Run 状态
+    if {[llength [get_runs -quiet synth_1]] > 0} {
+        puts "VMCP_PROJ:synth_status=[get_property STATUS [get_runs synth_1]]"
+    } else {
+        puts "VMCP_PROJ:synth_status=No run"
+    }
+    if {[llength [get_runs -quiet impl_1]] > 0} {
+        puts "VMCP_PROJ:impl_status=[get_property STATUS [get_runs impl_1]]"
+    } else {
+        puts "VMCP_PROJ:impl_status=No run"
+    }
+    puts "VMCP_PROJ_DONE"
+}
+"""
+
 
 CHECK_PRE_BITSTREAM = """\
 set __impl [get_runs {impl_run}]

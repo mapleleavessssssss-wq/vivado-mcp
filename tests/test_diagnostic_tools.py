@@ -116,8 +116,85 @@ class TestGetCriticalWarnings:
                 run_name="synth_1", session_id="default", ctx=ctx
             )
 
-        assert "未发现 CRITICAL WARNING" in result
+        assert "未发现 ERROR 或 CRITICAL WARNING" in result
         assert "critical_warnings=0" in result
+
+    @pytest.mark.asyncio
+    async def test_extracts_error_details_when_errors_present(self):
+        """errors>0 时必须提取 ERROR 详情(Bug 1 修复)。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        # 模拟 DRC BIVC-1 场景:place_design 失败,3 条 ERROR
+        err_log = (
+            "VMCP_ERR:120|ERROR: [DRC BIVC-1] Bank IO standard Vcc: "
+            "Conflicting Vcc voltages in bank 14. [basys3.xdc:15]\n"
+            "VMCP_ERR:125|ERROR: [Vivado_Tcl 4-23] Error(s) found during DRC. "
+            "Placer not run.\n"
+            "VMCP_ERR:130|ERROR: [Common 17-39] 'place_design' failed due to "
+            "earlier errors.\n"
+            "VMCP_ERR_DONE"
+        )
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result("VMCP_DIAG:errors=3,critical_warnings=0,warnings=0"),
+                _make_tcl_result(err_log),
+            ]
+        )
+
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.diagnostic_tools._require_session", return_value=session):
+            result = await get_critical_warnings(
+                run_name="impl_1", session_id="default", ctx=ctx
+            )
+
+        assert "!! 发现 3 条 ERROR !!" in result
+        assert "DRC BIVC-1" in result
+        assert "IO_STANDARD_MISMATCH" in result
+        assert "Vivado_Tcl 4-23" in result
+        assert "DRC_FAILED" in result
+        assert "errors=3" in result
+
+    @pytest.mark.asyncio
+    async def test_extracts_both_error_and_cw(self):
+        """同时有 ERROR 和 CW 时两者都要展示,ERROR 先于 CW。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        err_log = (
+            "VMCP_ERR:100|ERROR: [DRC BIVC-1] Bank voltage conflict in bank 14.\n"
+            "VMCP_ERR_DONE"
+        )
+        cw_log = (
+            "VMCP_CW:50|CRITICAL WARNING: [DRC NSTD-1] port uart_rxd has no IOSTANDARD.\n"
+            "VMCP_CW_DONE"
+        )
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result("VMCP_DIAG:errors=1,critical_warnings=1,warnings=2"),
+                _make_tcl_result(err_log),
+                _make_tcl_result(cw_log),
+            ]
+        )
+
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.diagnostic_tools._require_session", return_value=session):
+            result = await get_critical_warnings(
+                run_name="impl_1", session_id="default", ctx=ctx
+            )
+
+        # ERROR 优先于 CW
+        assert "!! 发现 1 条 ERROR !!" in result
+        assert "=== ERROR 详情 ===" in result
+        assert "=== CRITICAL WARNING 详情 ===" in result
+        # ERROR 区块必须在 CW 区块之前
+        assert result.index("=== ERROR 详情 ===") < result.index("=== CRITICAL WARNING 详情 ===")
+        assert "DRC BIVC-1" in result
+        assert "DRC NSTD-1" in result
 
     @pytest.mark.asyncio
     async def test_returns_error_when_no_session(self):

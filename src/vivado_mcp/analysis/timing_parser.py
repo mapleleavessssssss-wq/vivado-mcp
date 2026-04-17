@@ -15,6 +15,11 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
+# 匹配 VMCP_STAGE:stage=X|synth_status=Y|impl_status=Z
+_STAGE_RE = re.compile(
+    r"VMCP_STAGE:stage=([^|]*)\|synth_status=([^|]*)\|impl_status=(.*)"
+)
+
 # ====================================================================== #
 #  正则模式
 # ====================================================================== #
@@ -68,16 +73,27 @@ class TimingPath:
 
 @dataclass
 class TimingReport:
-    """完整时序报告：摘要 + 路径列表。"""
+    """完整时序报告：摘要 + 路径列表 + 设计来源元信息。
+
+    ``source_stage`` / ``stage_warning`` 用于解决 Bug 2:告知用户当前时序数据
+    的设计阶段(post-synth 估算 vs post-route 最终)。避免 impl 失败时
+    用户把 synth 估算误判为"时序通过可以烧板"。
+    """
 
     summary: TimingSummary
     paths: list[TimingPath] = field(default_factory=list)
+    source_stage: str = "unknown"          # "post-synth" / "post-place" / "post-route" / "unknown"
+    source_detail: str = ""                # 自由文本(如 "impl_1=place_design ERROR, 显示 synth_1 估算")
+    stage_warning: str = ""                # 有风险时填警告文案,否则空字符串
 
     def to_dict(self) -> dict:
         """返回可直接 ``json.dumps`` 序列化的字典。"""
         return {
             "summary": asdict(self.summary),
             "paths": [asdict(p) for p in self.paths],
+            "source_stage": self.source_stage,
+            "source_detail": self.source_detail,
+            "stage_warning": self.stage_warning,
         }
 
 
@@ -266,6 +282,55 @@ def _is_continuation(line: str) -> bool:
 # ====================================================================== #
 
 
+def parse_design_stage(raw: str) -> tuple[str, str, str]:
+    """解析 QUERY_DESIGN_STAGE 脚本输出。
+
+    返回 ``(stage, synth_status, impl_status)`` 三元组。
+    若未匹配,返回 ``("unknown", "", "")``。
+    """
+    m = _STAGE_RE.search(raw)
+    if m is None:
+        return ("unknown", "", "")
+    return (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
+
+
+def derive_stage_warning(stage: str, synth_status: str, impl_status: str) -> tuple[str, str]:
+    """根据设计阶段和 run 状态,生成用户友好的 (source_detail, stage_warning) 文案。
+
+    规则:
+    - post-route:最终数据,不加警告
+    - post-place:布线前,提示数据可能不准
+    - post-synth:估算,强警告不要当最终结果
+    - impl_1 是 ERROR 状态:特别说明失败原因,强警告
+    """
+    has_impl_error = "ERROR" in impl_status.upper()
+
+    if has_impl_error and stage in ("post-synth", "post-place"):
+        detail = f"impl_1 状态={impl_status},未完成布线;当前显示的是前置阶段的估算时序"
+        warning = (
+            "注意: impl_1 失败,下面的时序是综合/布局后的估算,不等同于布线后的最终结果。"
+            "不要据此判断能否烧板,先修复 impl_1 错误。"
+        )
+        return (detail, warning)
+
+    if stage == "post-route":
+        return (f"impl_1 状态={impl_status}", "")
+
+    if stage == "post-place":
+        return (
+            f"impl_1 状态={impl_status}",
+            "注意: 尚未布线,时序数据是布局后估算,可能与 post-route 结果有差异。",
+        )
+
+    if stage == "post-synth":
+        return (
+            f"synth_1 状态={synth_status},impl_1 状态={impl_status or 'Not started'}",
+            "注意: 仅有综合估算时序,未经布局布线。不要作为最终判据。",
+        )
+
+    return ("", "")
+
+
 def parse_timing_summary(raw_text: str) -> TimingReport:
     """解析 ``report_timing_summary -return_string`` 的完整输出。
 
@@ -286,6 +351,8 @@ def format_timing_report(report: TimingReport) -> str:
     """将 TimingReport 格式化为人类可读的摘要文本。
 
     重点高亮违例信息，方便 LLM 和用户快速判断时序状态。
+    在报告开头明示数据来源阶段(post-synth/post-route),避免用户把估算时序
+    误判为最终时序。
     """
     s = report.summary
     lines: list[str] = []
@@ -293,6 +360,19 @@ def format_timing_report(report: TimingReport) -> str:
     # 总体状态
     status = "PASS (时序满足)" if s.timing_met else "FAIL (时序违例)"
     lines.append(f"=== 时序分析摘要 === 状态: {status}")
+
+    # Bug 2 修复:数据来源元信息(在 PASS/FAIL 旁边,用户不会漏看)
+    if report.source_stage and report.source_stage != "unknown":
+        stage_label = {
+            "post-synth": "post-synth (综合后估算,非最终结果)",
+            "post-place": "post-place (布局后估算,尚未布线)",
+            "post-route": "post-route (布线后最终结果)",
+        }.get(report.source_stage, report.source_stage)
+        lines.append(f"数据来源: {stage_label}")
+        if report.source_detail:
+            lines.append(f"  详情: {report.source_detail}")
+    if report.stage_warning:
+        lines.append(f"[!] {report.stage_warning}")
     lines.append("")
 
     # Setup 指标
