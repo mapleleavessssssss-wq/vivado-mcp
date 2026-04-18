@@ -56,7 +56,13 @@ usage_statistics_webtalk.*
 vivado_pid*.str
 
 # Claude Code
-.claude/
+# 项目共享配置 (.claude/settings.json、.claude/*.md) 会 commit 进来供协作者自动拿到
+# 忽略的只是个人数据
+.claude/settings.local.json
+.claude/history/
+.claude/sessions/
+.claude/projects/
+.claude/tool-results/
 # 本地 MCP 客户端注册,不同机器的入口可能不一样,各自生成
 .mcp.json
 
