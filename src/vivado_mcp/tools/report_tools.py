@@ -10,6 +10,7 @@ import json
 from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
+from vivado_mcp.analysis.ip_status_parser import format_ip_status_report, parse_ip_status
 from vivado_mcp.analysis.project_parser import format_project_info, parse_project_info
 from vivado_mcp.analysis.run_progress_parser import format_run_progress, parse_run_progress
 from vivado_mcp.analysis.suggestion_engine import format_suggestion, suggest_next
@@ -20,10 +21,11 @@ from vivado_mcp.analysis.timing_parser import (
     parse_timing_summary,
 )
 from vivado_mcp.analysis.util_parser import format_utilization_report, parse_utilization
-from vivado_mcp.analysis.warning_parser import parse_pre_bitstream
+from vivado_mcp.analysis.warning_parser import parse_diag_counts, parse_pre_bitstream
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 from vivado_mcp.tcl_scripts import (
     CHECK_PRE_BITSTREAM,
+    COUNT_WARNINGS,
     QUERY_DESIGN_STAGE,
     QUERY_PROJECT_INFO,
     QUERY_RUN_PROGRESS,
@@ -400,3 +402,163 @@ async def get_next_suggestion(
         return format_suggestion(info, sug)
     except Exception as e:
         return f"[ERROR] 生成下一步建议失败: {e}"
+
+
+@mcp.tool()
+async def get_ip_status(
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """检查项目中所有 IP 的版本状态(哪个需要升级、哪个已锁定)。
+
+    老项目打开后 Vivado 常提示"N 个 IP 需要升级"。这个工具一次性列出:
+    - 需要升级的 IP(Vivado 更新了更好的版本)
+    - 已锁定的 IP(IS_LOCKED 属性为 TRUE,改动需先解锁)
+    - 已最新的 IP
+
+    附带升级建议(单个升级 / 全部升级 / 升级后验证)。
+
+    Args:
+        session_id: 目标会话 ID。
+    """
+    session = _require_session(ctx, session_id)
+    if not session:
+        return _NO_SESSION.format(sid=session_id)
+
+    try:
+        result = await session.execute(
+            "report_ip_status -return_string", timeout=60.0
+        )
+        if result.is_error:
+            return (
+                f"[ERROR] 获取 IP 状态失败（rc={result.return_code}）：\n"
+                f"{result.output}\n\n"
+                "提示: report_ip_status 需要项目已打开且含 IP 实例。"
+            )
+        rep = parse_ip_status(result.output)
+        return format_ip_status_report(rep)
+    except Exception as e:
+        return f"[ERROR] 获取 IP 状态失败: {e}"
+
+
+@mcp.tool()
+async def get_pre_commit_summary(
+    impl_run: str = "impl_1",
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """生成一段可以贴进 git commit body 的工程摘要(时序/资源/CW)。
+
+    典型用途:做完 RTL 改动、跑完 impl 之后,想把关键数字写进 commit body,
+    避免 "改了 UART 模块" 这种无信息量的 commit。本工具一次性采样:
+    - 项目 + part + 顶层
+    - 时序摘要(WNS / WHS / 失败端点数)
+    - 资源占用(LUT / FF / BRAM / DSP / IOB 百分比)
+    - CW / ERROR 计数(若有 impl_run)
+    - 综合生成 READY/WARN/FAIL 门禁标签
+
+    输出为 markdown 片段,直接粘贴到 commit 描述。
+
+    Args:
+        impl_run: 用来查 runme.log 计数的 run(默认 impl_1)。
+        session_id: 目标会话 ID。
+    """
+    try:
+        impl_run = validate_identifier(impl_run, "impl_run")
+    except ValueError as e:
+        return f"[ERROR] {e}"
+
+    session = _require_session(ctx, session_id)
+    if not session:
+        return _NO_SESSION.format(sid=session_id)
+
+    # 1. 项目信息
+    info = None
+    try:
+        proj = await session.execute(QUERY_PROJECT_INFO, timeout=30.0)
+        if not proj.is_error:
+            info = parse_project_info(proj.output)
+    except Exception:
+        pass
+
+    # 2. 时序
+    timing = None
+    try:
+        tr = await session.execute(
+            "report_timing_summary -return_string", timeout=60.0
+        )
+        if not tr.is_error:
+            timing = parse_timing_summary(tr.output)
+    except Exception:
+        pass
+
+    # 3. 资源
+    util = None
+    try:
+        ur = await session.execute(
+            "report_utilization -return_string", timeout=60.0
+        )
+        if not ur.is_error:
+            util = parse_utilization(ur.output)
+    except Exception:
+        pass
+
+    # 4. CW 计数
+    errs, cws, warns = -1, -1, -1
+    try:
+        cr = await session.execute(
+            COUNT_WARNINGS.format(run_name=impl_run), timeout=15.0
+        )
+        if not cr.is_error:
+            errs, cws, warns = parse_diag_counts(cr.output)
+    except Exception:
+        pass
+
+    # 门禁判定
+    verdict = "READY"
+    problems: list[str] = []
+    if timing is not None:
+        if timing.summary.timing_met is False:
+            problems.append("时序违例")
+    if errs > 0:
+        problems.append(f"{errs} 条 ERROR")
+    if cws > 5:
+        problems.append(f"{cws} 条 CW")
+
+    if problems:
+        verdict = "BLOCK" if (timing and timing.summary.timing_met is False) or errs > 0 else "WARN"
+
+    # 格式化为 markdown
+    out: list[str] = [f"## 工程摘要 [{verdict}]"]
+    if info:
+        out.append(f"- 项目: `{info.project_name}` / part `{info.part}` / top `{info.top}`")
+        out.append(
+            f"- 综合: {info.synth_status or '(未运行)'}"
+            f" | 实现: {info.impl_status or '(未运行)'}"
+        )
+    if timing:
+        s = timing.summary
+        met = "✅" if s.timing_met else "❌"
+        out.append(
+            f"- 时序 {met}: WNS `{s.wns:+.3f} ns`, WHS `{s.whs:+.3f} ns`, "
+            f"失败端点 `{s.failing_endpoints}/{s.total_endpoints}`"
+        )
+    if util and util.resources:
+        # 挑最关心的 5 种
+        core = {r.name: r for r in util.resources}
+        nice = []
+        for name in ("Slice LUTs", "Slice Registers", "Block RAM Tile", "DSPs", "Bonded IOB"):
+            for full_name, row in core.items():
+                if name.lower() in full_name.lower():
+                    nice.append(f"`{full_name}` {row.used}/{row.available} ({row.percent:.1f}%)")
+                    break
+        if nice:
+            out.append("- 资源: " + "; ".join(nice))
+    if errs >= 0 or cws >= 0:
+        out.append(f"- 诊断: ERROR `{errs}`, CRITICAL WARNING `{cws}`, WARNING `{warns}`")
+    if problems:
+        out.append(f"- ⚠️ 阻塞/风险: {' / '.join(problems)}")
+
+    out.append("")
+    out.append("_Generated by vivado-mcp get_pre_commit_summary._")
+    return "\n".join(out)

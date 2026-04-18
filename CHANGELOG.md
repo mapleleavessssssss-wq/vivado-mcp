@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.4] — 2026-04-18
+
+### 新增工具(批 3+4:生态联动,22 → 25)
+
+- **`verilog_compile_check`** —— 用 iverilog 或 verilator 做语法 + 连接性检查,比 Vivado 综合快 50 倍(毫秒级 vs 30-60s)。自动探测工具链优先 iverilog,装了才跑,未装返回 SKIP + 安装指引。支持 Windows 路径。同时在 `.claude/settings.json` 追加可选 `iverilog-check` hook,保存 .v/.sv 时自动后台跑。
+- **`get_ip_status`** —— 检查项目 IP 版本(`report_ip_status -return_string` 解析)。区分"需要升级" / "已锁定" / "已最新",附批量升级建议。老项目(Vivado 版本迁移后)的必备摸底工具。
+- **`get_pre_commit_summary`** —— 生成可粘贴进 git commit body 的 markdown 摘要:项目元信息 / 时序 WNS+WHS / 关键资源占用 / CW+ERROR 计数 / READY/WARN/BLOCK 门禁标签。结束这种"改了 UART 模块"式的无信息量 commit。
+
+### Hooks
+
+- **`iverilog-check`** —— 新增 PostToolUse hook(.v/.sv 保存时),iverilog/verilator 装了才触发,有 error 时阻断并给 Claude 看结构化诊断。
+
+### 测试
+
+- **303 → 326**(+23):新增 verilog_compile_check(15,覆盖 parser+detect+timeout+Windows 路径)、ip_status_parser(8)。
+
 ## [0.3.3] — 2026-04-18
 
 ### 新增工具(批 2:XDC 自修,21 → 22)

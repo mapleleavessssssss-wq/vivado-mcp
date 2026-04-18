@@ -8,6 +8,7 @@ from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
 from vivado_mcp.analysis.io_verifier import format_io_verification, verify_io_placement
+from vivado_mcp.analysis.verilog_compile_check import compile_check, format_compile_report
 from vivado_mcp.analysis.warning_parser import (
     WarningReport,
     format_warning_report,
@@ -323,3 +324,37 @@ async def xdc_auto_fix(
     if not dry_run and plan.patches:
         plan = apply_fixes(plan)
     return format_fix_report(plan)
+
+
+@mcp.tool()
+async def verilog_compile_check(
+    files: list[str],
+    tool: str = "auto",
+    timeout: float = 30.0,
+) -> str:
+    """用 iverilog / verilator 做 Verilog 语法 + 连接性检查(比 Vivado 综合快 50 倍)。
+
+    典型用途:写完或改完 RTL 想在几秒内确认"能不能过综合",不用等 30-60s Vivado。
+    需要机器上装 iverilog 或 verilator:
+        Windows: scoop install iverilog / choco install verilator
+        Linux:   apt install iverilog / apt install verilator
+        macOS:   brew install icarus-verilog / brew install verilator
+
+    检查模式:
+    - iverilog -t null:只做 parse + elaboration,不产物
+    - verilator --lint-only -Wall:静态检查,风格警告也给(更严格)
+
+    未装任何工具时返回 SKIP 并附安装指引,不报错。
+
+    Args:
+        files: Verilog / SystemVerilog 文件路径列表(.v / .sv)。
+        tool: "auto"(默认,优先 iverilog) / "iverilog" / "verilator"。
+        timeout: 子进程超时秒数,默认 30。
+    """
+    if not files:
+        return "[ERROR] 至少需要一个文件路径"
+    if tool not in ("auto", "iverilog", "verilator"):
+        return f"[ERROR] 未知 tool '{tool}',应为 auto / iverilog / verilator"
+
+    report = compile_check(files, tool=tool, timeout=timeout)
+    return format_compile_report(report)
