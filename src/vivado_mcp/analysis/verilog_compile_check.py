@@ -165,6 +165,17 @@ def _scoop_fallback(name: str) -> str | None:
     return None
 
 
+def _scoop_apps_bin(name: str) -> str | None:
+    """scoop 里真实 exe 的 bin 目录(不是 shims)。
+
+    用途:补到 subprocess env["PATH"],让 iverilog.exe 启动时能找到同目录
+    的 mingw/cygwin DLL。仅返回存在的目录。
+    """
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    cand = os.path.join(home, "scoop", "apps", name, "current", "bin")
+    return cand if os.path.isdir(cand) else None
+
+
 def _detect_tool(preference: str = "auto") -> tuple[str, str]:
     """返回 (tool_name, install_hint)。tool_name='' 表示没找到。"""
     pref = preference.lower()
@@ -222,6 +233,19 @@ def compile_check(
         # verilator --lint-only:静态检查,不编译
         cmd = [exe_path, "--lint-only", "-Wall"] + file_strs
 
+    # 准备 env:父进程 PATH snapshot 过旧时,iverilog.exe 启动会找不到
+    # 依赖 DLL(0xC0000135 STATUS_DLL_NOT_FOUND)。把 exe 所在目录补到 PATH
+    # 开头,保证 Windows DLL loader 能定位 mingw/cygwin 运行时 DLL。
+    env = os.environ.copy()
+    exe_dir = os.path.dirname(exe_path)
+    if exe_dir and os.path.isdir(exe_dir):
+        env["PATH"] = exe_dir + os.pathsep + env.get("PATH", "")
+        # scoop 的真 bin 目录:apps/<name>/current/bin(shim 不是真 bin)
+        # 通过 shim 间接调时,真 exe 目录也要进 PATH,否则 DLL 搜索失败
+        scoop_bin = _scoop_apps_bin(tool_name)
+        if scoop_bin and scoop_bin != exe_dir:
+            env["PATH"] = scoop_bin + os.pathsep + env["PATH"]
+
     try:
         r = subprocess.run(
             cmd,
@@ -230,6 +254,7 @@ def compile_check(
             timeout=timeout,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
     except subprocess.TimeoutExpired:
         report.return_code = -1
@@ -274,6 +299,16 @@ def format_compile_report(report: CompileReport) -> str:
         return (
             f"=== Verilog 编译检查 ({report.tool_used}): 运行异常 ===\n"
             f"{report.raw_stderr}"
+        )
+
+    # returncode 非 0 但没解析到任何 issue:要么 DLL 加载失败(Windows 0xC0000135)
+    # 要么输出格式外的错误。不当 WARN,而是"运行异常"展示原始 stderr。
+    if report.return_code != 0 and not report.issues:
+        return (
+            f"=== Verilog 编译检查 ({report.tool_used}): 运行异常 ===\n"
+            f"返回码: {report.return_code}"
+            f" (Windows 0xC0000135 = DLL 加载失败,通常是 PATH 缺 mingw/cygwin 运行时)\n"
+            f"原始输出:\n{report.raw_stderr or '(空)'}"
         )
 
     header = f"=== Verilog 编译检查 ({report.tool_used}): "
