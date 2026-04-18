@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.1] — 2026-04-18
+
+### 修复
+
+- **B13 [P0] `stop_session` 没真正杀 Vivado GUI 进程** —— 实机发现的严重 bug:原 `GuiSession.stop` 用 `asyncio.subprocess.Process.terminate()`,但 `vivado.bat` 在 Windows 上会起一条 `cmd.exe → vivado.exe` 的进程链;`terminate()` 只杀 cmd.exe 外壳,vivado.exe 成为孤儿进程,继续占 800MB+ 内存,Vivado 自己写的 `vivado_pid<PID>.str` 也不被清理(要等用户手动杀进程+删文件)。新策略:先发 Tcl `exit` 让 Vivado 优雅退出(自动清 pid),超时则 `taskkill /F /T /PID` 递归杀进程树(Windows)或 SIGKILL(Unix),最后兜底扫 `vivado_pid*.str` 强删。
+
 ## [0.3.0] — 2026-04-17
 
 ### 新增工具(4 个,15 → 19)

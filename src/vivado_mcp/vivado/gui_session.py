@@ -325,10 +325,46 @@ class GuiSession(BaseSession):
         )
 
     async def stop(self, timeout: float = 10.0) -> None:
-        """关闭 TCP 连接 + 终止 spawn 的 GUI 进程（attach 模式不终止外部进程）。"""
+        """关闭 TCP 连接 + 终止 spawn 的 GUI 进程（attach 模式不终止外部进程）。
+
+        B13 修复:原 ``_proc.terminate()`` 只杀 ``vivado.bat`` 的 cmd.exe 外壳,
+        Windows 没有进程组概念,子进程 vivado.exe 会变成孤儿继续占 800MB+ 内存,
+        且 Vivado 自己写的 ``vivado_pid<PID>.str`` 文件不被清理。
+
+        新策略:
+        1. 先通过 TCP 发 Tcl ``exit`` 让 Vivado 优雅退出(会自动清 pid 文件)
+        2. 若超时,Windows 用 ``taskkill /F /T`` 递归杀进程树,Unix 用 SIGKILL
+        3. 兜底扫工作目录 ``vivado_pid*.str`` 强删
+        """
+        import glob as glob_mod
+        import os
+        import subprocess
+        import sys
+
         logger.info("正在关闭 GUI 会话 '%s'...", self.session_id)
 
-        # 关 socket
+        # 步骤 1:尝试优雅退出 —— 发 Tcl `exit`,Vivado 自己清 pid/journal
+        # attach 模式下是用户开的 Vivado,不主动 exit
+        if (
+            not self._attach_only
+            and self._writer is not None
+            and self._state in (SessionState.READY, SessionState.BUSY)
+        ):
+            try:
+                # 不走 execute()(它对 SessionState 有校验),直接裸发
+                payload = b"exit"
+                header = len(payload).to_bytes(4, "big")
+                self._writer.write(header + payload)
+                await self._writer.drain()
+                # 等 socket 被对端关闭(Vivado 退出时自动关连接)
+                await asyncio.wait_for(
+                    self._reader.read(4) if self._reader else asyncio.sleep(0),
+                    timeout=5.0,
+                )
+            except Exception as e:
+                logger.debug("优雅 exit 失败(将走强杀): %s", e)
+
+        # 步骤 2:关 socket
         if self._writer is not None:
             try:
                 self._writer.close()
@@ -338,27 +374,46 @@ class GuiSession(BaseSession):
             self._writer = None
             self._reader = None
 
-        # 如果是我们自己 spawn 的 GUI，优雅关闭
-        # attach 模式下进程是用户管理的，不动它
+        # 步骤 3:确保进程真退出。Windows 用 taskkill /T 递归杀树
         if self._proc is not None and not self._attach_only:
             if self._proc.returncode is None:
+                # 先给 Vivado 一点时间自己退(响应 Tcl exit)
                 try:
-                    self._proc.terminate()
-                    await asyncio.wait_for(self._proc.wait(), timeout=timeout)
+                    await asyncio.wait_for(self._proc.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        "Vivado GUI 进程未在 %ss 内退出，强制 kill。", timeout
-                    )
-                    self._proc.kill()
-                    await self._proc.wait()
-                except Exception as e:
-                    logger.debug("停止 GUI 进程异常: %s", e)
+                    # 没退,强杀
+                    try:
+                        if sys.platform == "win32":
+                            # 关键:/T 递归杀进程树,捕获 cmd.exe 下的 vivado.exe
+                            subprocess.run(
+                                ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
+                                capture_output=True,
+                                timeout=timeout,
+                            )
+                        else:
+                            # Unix: kill 进程组
+                            self._proc.kill()
+                        await asyncio.wait_for(self._proc.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Vivado 进程 PID=%s 未在 %ss 内退出,可能成为孤儿进程",
+                            self._proc.pid, timeout,
+                        )
+                    except Exception as e:
+                        logger.warning("强杀 Vivado 进程异常: %s", e)
             self._proc = None
 
-        # 清理临时脚本
+        # 步骤 4:兜底清理 vivado_pid*.str(Vivado 强杀时不会自己删)
+        for pid_file in glob_mod.glob("vivado_pid*.str"):
+            try:
+                os.remove(pid_file)
+                logger.debug("已清理 %s", pid_file)
+            except OSError as e:
+                logger.debug("清理 %s 失败: %s", pid_file, e)
+
+        # 步骤 5:清理临时脚本
         if self._tmp_script:
             try:
-                import os
                 os.unlink(self._tmp_script)
             except OSError:
                 pass
