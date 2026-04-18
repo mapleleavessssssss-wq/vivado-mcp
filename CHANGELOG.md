@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.3] — 2026-04-18
+
+### 新增工具(批 2:XDC 自修,21 → 22)
+
+- **`xdc_auto_fix`** —— 从 xdc_lint 的诊断升级为 quick-fix:自动往 XDC 文件里补 IOSTANDARD 语句(消除 NSTD-1/BIVC-1 隐患)和 create_clock -period 参数(仅已知板卡)。
+  - **只修**:`MISSING_IOSTANDARD`(插入 IOSTANDARD 语句)、`CLOCK_NO_PERIOD`(板卡已知时补 period)
+  - **坚决不碰**:`PIN_CONFLICT` / `DUPLICATE_PORT` / `PIN_CONFLICT_CROSS_FILE`(冲突必须人改)
+  - **板卡 profile**:basys3 / nexys-a7 / arty-a7 / zybo / kc705 内置 IOSTANDARD + 时钟频率。未知板只修 IOSTANDARD,CLOCK 跳过。
+  - **dry_run=True 默认**:只预览补丁,确认后再 dry_run=False 写回。修改行加 `# auto-fixed by xdc_auto_fix <date>` 注释,回溯容易。
+  - **行号保护**:同一文件多条 insert 时按行号降序应用,避免行号偏移。
+
+### 测试
+
+- **303 → 317**,新增 14 个单元测试:xdc_auto_fixer(14)。覆盖 MISSING_IOSTANDARD / CLOCK_NO_PERIOD / 不可修问题跳过 / 未知板 / dry_run vs apply / 多文件 / 多 insert 不偏移。
+
 ## [0.3.2] — 2026-04-18
 
 ### 新增工具(批 1:长任务可视 + 新手引导,19 → 21)

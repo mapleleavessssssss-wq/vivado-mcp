@@ -1,6 +1,6 @@
 [project]
 name = "vivado-mcp"
-version = "0.3.2"
+version = "0.3.3"
 description = "Vivado MCP Server — AI 驱动的 FPGA 开发助手，支持 GUI 可视化 / 子进程无头双模式，自动诊断 CRITICAL WARNING"
 readme = "README.md"
 requires-python = ">=3.10"

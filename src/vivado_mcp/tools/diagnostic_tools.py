@@ -16,6 +16,12 @@ from vivado_mcp.analysis.warning_parser import (
     parse_diag_counts,
     parse_errors,
 )
+from vivado_mcp.analysis.xdc_auto_fixer import (
+    BOARD_PROFILES,
+    apply_fixes,
+    format_fix_report,
+    plan_fixes,
+)
 from vivado_mcp.analysis.xdc_linter import format_lint_report, lint_xdc_files
 from vivado_mcp.analysis.xdc_parser import XdcConstraint, parse_xdc_file
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
@@ -246,3 +252,74 @@ async def xdc_lint(
 
     report = lint_xdc_files(list(xdc_paths))
     return format_lint_report(report)
+
+
+@mcp.tool()
+async def xdc_auto_fix(
+    xdc_paths: list[str] | None = None,
+    board: str = "",
+    dry_run: bool = True,
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """自动修复 XDC 文件中能安全自修的问题(MISSING_IOSTANDARD / CLOCK_NO_PERIOD)。
+
+    默认 dry_run=True 只预览补丁,确认无误后调用 dry_run=False 实际写回。
+
+    **只修**这两类问题(其他需要人工判断):
+    - MISSING_IOSTANDARD —— 在 PACKAGE_PIN 行之后插入 IOSTANDARD 语句
+    - CLOCK_NO_PERIOD    —— 仅当 board 已知时补 -period;未知板跳过
+
+    **绝对不碰**:
+    - PIN_CONFLICT / DUPLICATE_PORT / PIN_CONFLICT_CROSS_FILE(冲突问题必须人改)
+
+    Args:
+        xdc_paths: XDC 文件路径列表。不传则从当前 session 的项目里抓。
+        board: 板卡名,影响默认 IOSTANDARD 和时钟周期。支持:
+            basys3 / nexys-a7 / arty-a7 / zybo / kc705。留空用 LVCMOS33 兜底。
+        dry_run: True(默认)只输出补丁预览不改文件;False 实际写回。
+        session_id: 目标会话 ID(仅在不传 xdc_paths 时使用)。
+    """
+    # 校验 board
+    if board and board.lower() not in BOARD_PROFILES:
+        known = ", ".join(sorted(BOARD_PROFILES.keys()))
+        return (
+            f"[ERROR] 未知板卡 '{board}'。支持的 board: {known}\n"
+            "或留空 board 参数(只修 IOSTANDARD,CLOCK 跳过)。"
+        )
+
+    # 路径来源:同 xdc_lint
+    if xdc_paths is None or len(xdc_paths) == 0:
+        session = _require_session(ctx, session_id)
+        if not session:
+            return (
+                "[ERROR] 未传 xdc_paths 且 session 不存在。"
+                "请传 xdc_paths=['xxx.xdc',...] 或先 start_session + 打开项目。"
+            )
+        try:
+            list_result = await session.execute(
+                'foreach __f [get_files -of_objects [get_filesets constrs_1] '
+                '-filter {FILE_TYPE == XDC}] { puts "VMCP_XDC_FILE:$__f" }',
+                timeout=15.0,
+            )
+            if list_result.is_error:
+                return (
+                    f"[ERROR] 无法从项目拉 XDC 文件(rc={list_result.return_code}):\n"
+                    f"{list_result.output}\n"
+                    "提示:先 open_project 或直接传 xdc_paths 参数。"
+                )
+            xdc_paths = [
+                line[len("VMCP_XDC_FILE:"):].strip()
+                for line in list_result.output.splitlines()
+                if line.startswith("VMCP_XDC_FILE:")
+            ]
+        except Exception as e:
+            return f"[ERROR] 拉 XDC 列表失败: {e}"
+
+    if not xdc_paths:
+        return "项目未添加任何 XDC 约束文件,没什么可修的。"
+
+    plan = plan_fixes(list(xdc_paths), board=board)
+    if not dry_run and plan.patches:
+        plan = apply_fixes(plan)
+    return format_fix_report(plan)
