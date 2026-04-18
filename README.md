@@ -154,6 +154,21 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI，跑得更快
 > 通用报告（utilization / power / drc / clock / methodology / cdc 等）请直接用
 > `run_tcl("report_utilization -return_string")`，无需包装。
 
+## 智能 Hook(Claude Code 独有)
+
+仓库的 `.claude/settings.json` 预置了 **4 个 Claude Code hook**,让 AI 不只会"被动应答",还能**主动守门**:
+
+| Hook | 触发事件 | 作用 |
+|---|---|---|
+| `bitstream-guard` | AI 调 `generate_bitstream` 前 | 拦截并提醒先跑 `check_bitstream_readiness`,避免时序违例时烧出废比特流 |
+| `xdc-lint` | 保存任意 `.xdc` 文件后 | 纯 Python 静态检查:PIN_CONFLICT / 漏 IOSTANDARD / create_clock 缺 -period 等,无需等综合 |
+| `verilog-lint` | 保存任意 `.v` / `.sv` 文件后 | 零依赖预检:module 名匹配文件名 / endmodule 存在 / 括号配对 |
+| `session-guard` | Claude 停下时 | 扫 `vivado_pid*.str` 文件,提醒清理未关闭的 Vivado session |
+
+首次打开本仓库时 Claude Code 会弹框:*"检测到项目配置了 hook,是否信任?"* — 选 **Yes** 即启用。
+
+要禁用单个或全部:在 `.claude/settings.local.json`(个人本地文件,不进 git)写入 `{"hooks": {}}` 覆盖即可。
+
 ## 使用示例
 
 ### 基本流程

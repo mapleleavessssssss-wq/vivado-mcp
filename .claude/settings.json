@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": "项目共享 Claude Code 配置。hooks 在 clone 后首次打开会提示信任,选 Yes 即启用。个人本地配置请放 settings.local.json(已 gitignored)。",
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "vivado"
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__vivado__generate_bitstream",
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "bitstream-guard",
+            "command": "python -c \"\nimport json, sys\nsys.stderr.reconfigure(encoding='utf-8')\ntry: data = json.load(sys.stdin)\nexcept Exception: sys.exit(0)\nif data.get('tool_name','') != 'mcp__vivado__generate_bitstream': sys.exit(0)\nsys.stderr.write('[bitstream-guard] 烧板前建议先调用 mcp__vivado__check_bitstream_readiness 确认 READY,避免时序违例/未布线状态下生成无效比特流。'+chr(10))\nsys.exit(2)\n\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "xdc-lint",
+            "command": "python -c \"\nimport json, sys\nsys.stderr.reconfigure(encoding='utf-8')\ntry: data = json.load(sys.stdin)\nexcept Exception: sys.exit(0)\nfp = data.get('tool_input', {}).get('file_path') or data.get('tool_response', {}).get('filePath') or ''\nif not fp.lower().endswith('.xdc'): sys.exit(0)\nfrom vivado_mcp.analysis.xdc_linter import lint_xdc_files, format_lint_report\nr = lint_xdc_files([fp])\nif r.issues:\n    sys.stderr.write('[xdc-lint hook] ' + format_lint_report(r) + chr(10))\n    sys.exit(2)\n\""
+          },
+          {
+            "type": "command",
+            "statusMessage": "verilog-lint",
+            "command": "python -c \"\nimport json, sys\nsys.stderr.reconfigure(encoding='utf-8')\ntry: data = json.load(sys.stdin)\nexcept Exception: sys.exit(0)\nfp = data.get('tool_input', {}).get('file_path') or data.get('tool_response', {}).get('filePath') or ''\nif not fp.lower().endswith(('.v','.sv')): sys.exit(0)\nfrom vivado_mcp.analysis.verilog_quick_check import quick_check_verilog, format_report\nr = quick_check_verilog(fp)\ntext = format_report(r)\nif text:\n    sys.stderr.write('[verilog-lint hook] ' + text + chr(10))\n    sys.exit(2)\n\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "session-guard",
+            "command": "python -c \"\nimport sys, glob\nsys.stderr.reconfigure(encoding='utf-8')\npids = glob.glob('vivado_pid*.str')\nif pids:\n    sys.stderr.write('[session-guard] 发现未清理的 Vivado session 痕迹: ' + ', '.join(pids) + '。建议用 mcp__vivado__stop_session 清理,或手动删除 .str 文件。'+chr(10))\n    sys.exit(2)\n\""
+          }
+        ]
+      }
+    ]
+  }
+}
