@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.2] — 2026-04-18
+
+### 新增工具(批 1:长任务可视 + 新手引导,19 → 21)
+
+- **`get_run_progress`** —— 查 run 的实时进度。综合/实现常跑 10-30 分钟,以前只能看到 `status=Running` 黑盒等待。现在返回:Vivado 原生 STATUS + PROGRESS 百分比、runme.log 里的 Phase 序列(最近 5 条 + 当前箭头)、日志尾部 30 行、log mtime 距现在多久(判断进程是否卡住)。log 超过 2 分钟没更新会自动提示"可能卡住"。
+- **`get_next_suggestion`** —— 纯 Python 决策引擎,根据 QUERY_PROJECT_INFO 输出推断下一步。11 档决策:没项目 → 开/建项目 / 没源文件 → add_files / 没顶层 → set_property TOP / 没 XDC / 可综合 → xdc_lint + run_synthesis / 综合失败 → get_critical_warnings / 综合完成 → run_implementation / 实现失败 / 布线完成 → check_bitstream_readiness + generate_bitstream / bitstream 已生成 → program_device。每档附具体可执行的工具/Tcl 命令。
+
+### 测试
+
+- **289 → 315**,新增 26 个单元测试:run_progress_parser(11)、suggestion_engine(15)。
+
 ## [0.3.1] — 2026-04-18
 
 ### 修复

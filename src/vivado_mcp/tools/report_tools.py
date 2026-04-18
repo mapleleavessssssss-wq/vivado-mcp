@@ -11,6 +11,8 @@ from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
 from vivado_mcp.analysis.project_parser import format_project_info, parse_project_info
+from vivado_mcp.analysis.run_progress_parser import format_run_progress, parse_run_progress
+from vivado_mcp.analysis.suggestion_engine import format_suggestion, suggest_next
 from vivado_mcp.analysis.timing_parser import (
     derive_stage_warning,
     format_timing_report,
@@ -24,6 +26,7 @@ from vivado_mcp.tcl_scripts import (
     CHECK_PRE_BITSTREAM,
     QUERY_DESIGN_STAGE,
     QUERY_PROJECT_INFO,
+    QUERY_RUN_PROGRESS,
 )
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
@@ -310,3 +313,90 @@ async def get_project_info(
         return format_project_info(info)
     except Exception as e:
         return f"[ERROR] 获取项目信息失败: {e}"
+
+
+@mcp.tool()
+async def get_run_progress(
+    run_name: str = "impl_1",
+    tail_lines: int = 30,
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """查看 run 的运行进度(适合长任务等待时看"走到哪一步")。
+
+    综合或实现常跑 10-30 分钟,这个工具让你不用开 GUI 就能看到:
+    - 当前状态(running / complete / error)与 PROGRESS 百分比
+    - runme.log 里最近若干条 Phase 行(Phase 1 → Phase 2.1 → Phase 3 ...)
+    - 日志尾部 N 行(含最新 WARNING / CRITICAL WARNING 原文)
+    - 日志最后更新时间(判断 Vivado 是否还在活跃)
+
+    Args:
+        run_name: run 名称(如 "synth_1" / "impl_1"),默认 "impl_1"。
+        tail_lines: 日志尾部要读多少行,默认 30。
+        session_id: 目标会话 ID。
+    """
+    try:
+        run_name = validate_identifier(run_name, "run_name")
+    except ValueError as e:
+        return f"[ERROR] {e}"
+
+    if tail_lines < 0 or tail_lines > 500:
+        return "[ERROR] tail_lines 必须在 0~500 之间"
+
+    session = _require_session(ctx, session_id)
+    if not session:
+        return _NO_SESSION.format(sid=session_id)
+
+    try:
+        result = await session.execute(
+            QUERY_RUN_PROGRESS.format(run_name=run_name, tail_n=tail_lines),
+            timeout=30.0,
+        )
+        if result.is_error:
+            return (
+                f"[ERROR] 查询 run 进度失败（rc={result.return_code}）：\n"
+                f"{result.output}"
+            )
+        rp = parse_run_progress(result.output, run_name=run_name)
+        return format_run_progress(rp)
+    except Exception as e:
+        return f"[ERROR] 查询 run 进度失败: {e}"
+
+
+@mcp.tool()
+async def get_next_suggestion(
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """根据当前项目状态推断下一步应该做什么。
+
+    适合新手、刚打开老项目、或者不知道从哪下手的场景。规则:
+    - 没项目 → 建议 open_project / create_project
+    - 有项目没源文件 → 建议 add_files
+    - 没顶层 → 建议 set_property TOP
+    - 没 XDC → 建议添加约束
+    - 可综合 → xdc_lint + run_synthesis
+    - 综合完成 → run_implementation
+    - 布线完成 → check_bitstream_readiness + generate_bitstream
+    - 比特流就绪 → program_device
+    - 任何阶段失败 → 引导到 get_critical_warnings
+
+    Args:
+        session_id: 目标会话 ID。
+    """
+    session = _require_session(ctx, session_id)
+    if not session:
+        return _NO_SESSION.format(sid=session_id)
+
+    try:
+        result = await session.execute(QUERY_PROJECT_INFO, timeout=30.0)
+        if result.is_error:
+            return (
+                f"[ERROR] 获取项目信息失败（rc={result.return_code}）：\n"
+                f"{result.output}"
+            )
+        info = parse_project_info(result.output)
+        sug = suggest_next(info)
+        return format_suggestion(info, sug)
+    except Exception as e:
+        return f"[ERROR] 生成下一步建议失败: {e}"

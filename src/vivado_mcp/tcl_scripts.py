@@ -235,6 +235,69 @@ if {[catch {current_project} __proj]} {
 """
 
 
+# --------------------------------------------------------------------------- #
+#  查询指定 run 的运行进度:状态 / PROGRESS / log 大小 / Phase 行 / 尾部 N 行
+#  用于 get_run_progress 工具:长任务等待时看"走到哪一步"
+#  格式:
+#    VMCP_RUN:key=value            —— 元信息(status/progress/dir/log_*/total_lines)
+#    VMCP_RUN_PHASE:lineno|text    —— Phase/Starting/Finished 关键阶段行
+#    VMCP_RUN_TAIL:lineno|text     —— 日志尾部若干行
+#    VMCP_RUN_DONE                 —— 结束标记
+# --------------------------------------------------------------------------- #
+
+QUERY_RUN_PROGRESS = """\
+set __run [get_runs -quiet {run_name}]
+if {{$__run eq ""}} {{
+    puts "VMCP_RUN_ERROR:run '{run_name}' not found"
+}} else {{
+    set __status [get_property STATUS $__run]
+    set __progress [get_property PROGRESS $__run]
+    set __dir [get_property DIRECTORY $__run]
+    set __log "$__dir/runme.log"
+    puts "VMCP_RUN:status=$__status"
+    puts "VMCP_RUN:progress=$__progress"
+    puts "VMCP_RUN:dir=$__dir"
+    if {{[file exists $__log]}} {{
+        set __size [file size $__log]
+        set __mtime [file mtime $__log]
+        puts "VMCP_RUN:log_exists=1"
+        puts "VMCP_RUN:log_size=$__size"
+        puts "VMCP_RUN:log_mtime=$__mtime"
+        set __fp [open $__log r]
+        set __lines [list]
+        while {{[gets $__fp __line] >= 0}} {{
+            lappend __lines $__line
+        }}
+        close $__fp
+        set __total [llength $__lines]
+        puts "VMCP_RUN:total_lines=$__total"
+        # 扫描 Phase / Starting / Finished / Running 关键阶段行
+        set __ln 0
+        foreach __line $__lines {{
+            incr __ln
+            if {{[regexp {{^Phase [0-9]+}} $__line]
+              || [regexp {{^Starting }} $__line]
+              || [regexp {{^Finished }} $__line]
+              || [regexp {{^Running }} $__line]}} {{
+                puts "VMCP_RUN_PHASE:$__ln|$__line"
+            }}
+        }}
+        # tail 最后 {tail_n} 行
+        set __start [expr {{$__total - {tail_n}}}]
+        if {{$__start < 0}} {{ set __start 0 }}
+        set __ln $__start
+        foreach __line [lrange $__lines $__start end] {{
+            incr __ln
+            puts "VMCP_RUN_TAIL:$__ln|$__line"
+        }}
+    }} else {{
+        puts "VMCP_RUN:log_exists=0"
+    }}
+    puts "VMCP_RUN_DONE"
+}}
+"""
+
+
 CHECK_PRE_BITSTREAM = """\
 set __impl [get_runs {impl_run}]
 set __status [get_property STATUS $__impl]
