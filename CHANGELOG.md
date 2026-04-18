@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.6] — 2026-04-18
+
+### 修复(B14 第二层)
+
+- **B14-2 [P1] `verilog_compile_check` iverilog 启动时 DLL 加载失败 0xC0000135** —— 0.3.5 的 `_scoop_fallback` 解决了 `shutil.which` 找不到的问题,但在 MCP server 的 subprocess 里调 iverilog.exe 仍返回 returncode=3221225781(0xC0000135 STATUS_DLL_NOT_FOUND),因为 iverilog.exe 启动要加载同目录里的 mingw/cygwin DLL,而父进程 PATH 里没有 scoop 的 apps bin 目录。修复:`compile_check` 里组装 `subprocess.run(env=...)` 时,把 exe 所在目录 + `~/scoop/apps/<name>/current/bin` 双保险注入 PATH 开头。
+- **UI bug**:returncode 非 0 但没解析到 issue 时被错误显示为 "WARN (0 warnings)" —— 改判定为"运行异常"并输出 raw stderr + 0xC0000135 专项提示。
+
+### 测试
+
+- **327 → 328**(+1):新增 `test_subprocess_env_gets_scoop_bin_on_path`,验证 env 正确注入 scoop bin + 不覆盖原 PATH。
+
 ## [0.3.5] — 2026-04-18
 
 ### 修复

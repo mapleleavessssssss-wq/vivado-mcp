@@ -95,6 +95,38 @@ def test_auto_prefers_iverilog():
             assert "-t" in cmd
 
 
+def test_subprocess_env_gets_scoop_bin_on_path(tmp_path):
+    """subprocess.run 的 env 应该把 exe 目录 + scoop apps bin 补到 PATH 开头,
+    避免 iverilog 启动时 DLL 加载失败(0xC0000135)。"""
+    fake_home = tmp_path
+    # 准备一个假的 scoop apps bin + shims
+    apps_bin = fake_home / "scoop" / "apps" / "iverilog" / "current" / "bin"
+    apps_bin.mkdir(parents=True)
+    (apps_bin / "iverilog.exe").write_text("")
+    (apps_bin / "libmingw.dll").write_text("")
+    shims = fake_home / "scoop" / "shims"
+    shims.mkdir()
+    shim = shims / "iverilog.exe"
+    shim.write_text("")
+
+    with patch.dict("os.environ", {"USERPROFILE": str(fake_home), "PATH": "/existing"}):
+        with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
+                   return_value=None):
+            with patch(
+                "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="", stderr=""),
+            ) as sp:
+                compile_check(["foo.v"], tool="iverilog")
+
+    env_passed = sp.call_args.kwargs.get("env")
+    assert env_passed is not None, "env 应该被显式传入"
+    path = env_passed.get("PATH", "")
+    # apps bin 目录和 shims 目录都在 PATH 开头(前置 > 原 PATH)
+    assert str(apps_bin) in path
+    # 原 PATH 仍保留(不覆盖)
+    assert "/existing" in path
+
+
 def test_scoop_fallback_when_path_missing(tmp_path):
     """Windows+scoop 经典坑:which 找不到但 ~/scoop/shims/iverilog.exe 存在。"""
     fake_home = tmp_path
