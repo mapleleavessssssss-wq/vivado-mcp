@@ -63,14 +63,16 @@ def test_verilator_parses_warning_with_category():
 # -- detect_tool 流程 --------------------------------------------------------- #
 
 def test_no_tool_available_returns_skip_report():
-    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", return_value=None):
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", return_value=None), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
         rep = compile_check(["foo.v"], tool="auto")
     assert rep.tool_available is False
     assert "iverilog" in rep.install_hint
 
 
 def test_specific_tool_request_missing():
-    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", return_value=None):
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", return_value=None), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
         rep = compile_check(["foo.v"], tool="verilator")
     assert not rep.tool_available
     assert "verilator" in rep.install_hint
@@ -79,7 +81,8 @@ def test_specific_tool_request_missing():
 def test_auto_prefers_iverilog():
     def _which(name):
         return "/fake/iverilog" if name == "iverilog" else None
-    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", side_effect=_which):
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", side_effect=_which), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
         with patch(
             "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
             return_value=MagicMock(returncode=0, stdout="", stderr=""),
@@ -87,14 +90,39 @@ def test_auto_prefers_iverilog():
             rep = compile_check(["foo.v"], tool="auto")
             assert rep.tool_used == "iverilog"
             cmd = sp.call_args[0][0]
-            assert cmd[0] == "iverilog"
+            # cmd[0] 是绝对路径,可能是 shutil.which 结果或 scoop fallback
+            assert "iverilog" in cmd[0]
             assert "-t" in cmd
+
+
+def test_scoop_fallback_when_path_missing(tmp_path):
+    """Windows+scoop 经典坑:which 找不到但 ~/scoop/shims/iverilog.exe 存在。"""
+    fake_home = tmp_path
+    shim_dir = fake_home / "scoop" / "shims"
+    shim_dir.mkdir(parents=True)
+    fake_shim = shim_dir / "iverilog.exe"
+    fake_shim.write_text("")
+
+    with patch.dict("os.environ", {"USERPROFILE": str(fake_home)}):
+        with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
+                   return_value=None):
+            with patch(
+                "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="", stderr=""),
+            ) as sp:
+                rep = compile_check(["foo.v"], tool="iverilog")
+    assert rep.tool_available is True
+    assert rep.tool_used == "iverilog"
+    # subprocess 拿到 shim 绝对路径
+    cmd = sp.call_args[0][0]
+    assert cmd[0] == str(fake_shim)
 
 
 def test_auto_falls_back_to_verilator():
     def _which(name):
         return "/fake/verilator" if name == "verilator" else None
-    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", side_effect=_which):
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", side_effect=_which), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
         with patch(
             "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
             return_value=MagicMock(returncode=0, stdout="", stderr=""),
@@ -105,7 +133,8 @@ def test_auto_falls_back_to_verilator():
 
 def test_pass_when_returncode_0_and_no_issues():
     with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
-               return_value="/fake/iverilog"):
+               return_value="/fake/iverilog"), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
         with patch(
             "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
             return_value=MagicMock(returncode=0, stdout="", stderr=""),
@@ -117,7 +146,8 @@ def test_pass_when_returncode_0_and_no_issues():
 
 def test_error_passthrough():
     with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
-               return_value="/fake/iverilog"):
+               return_value="/fake/iverilog"), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
         with patch(
             "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
             return_value=MagicMock(
@@ -136,7 +166,8 @@ def test_error_passthrough():
 def test_timeout_returns_negative_returncode():
     import subprocess
     with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
-               return_value="/fake/iverilog"):
+               return_value="/fake/iverilog"), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
         with patch(
             "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="iverilog", timeout=1.0),

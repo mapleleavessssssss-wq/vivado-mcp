@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.5] — 2026-04-18
+
+### 修复
+
+- **B14 [P1] `verilog_compile_check` 在 Windows+scoop 环境下 shutil.which 找不到 iverilog** —— 实机发现的典型坑:scoop 装完 iverilog 后 User PATH(注册表)已更新,但 Claude Code 父进程启动时 snapshot 的 PATH 仍是旧的,MCP server 子进程继承的 PATH 里没有 `%USERPROFILE%\scoop\shims`。用户要完全关闭 CC 应用重开才生效,体验很差。新增 `_scoop_fallback(name)` 辅助函数:`shutil.which` 失败时扫 `~/scoop/shims/{name}.exe` 默认路径,subprocess 拿到绝对路径能直接调。其他 Windows 包管理器(choco/winget)默认路径未来可以用同样模式扩展。
+
+### 测试
+
+- **326 → 327**(+1):新增 `test_scoop_fallback_when_path_missing`,mock USERPROFILE + 伪造 shim 文件,验证 which 返回 None 时 subprocess 拿到 shim 绝对路径。
+
 ## [0.3.4] — 2026-04-18
 
 ### 新增工具(批 3+4:生态联动,22 → 25)

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -149,11 +150,26 @@ def _parse_verilator(stderr: str) -> list[CompileIssue]:
     return issues
 
 
+def _scoop_fallback(name: str) -> str | None:
+    """shutil.which 失败时,扫 scoop 默认安装路径。
+
+    Windows + scoop 的经典坑:User PATH 注册表已更新,但父进程
+    (IDE / MCP host)启动时 snapshot 的 PATH 仍是旧的,`which` 失败。
+    返回 scoop shim 的绝对路径,subprocess 能直接调。
+    """
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    for suffix in (".exe", ".cmd", ""):
+        cand = os.path.join(home, "scoop", "shims", name + suffix)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
 def _detect_tool(preference: str = "auto") -> tuple[str, str]:
     """返回 (tool_name, install_hint)。tool_name='' 表示没找到。"""
     pref = preference.lower()
-    iverilog = shutil.which("iverilog")
-    verilator = shutil.which("verilator")
+    iverilog = shutil.which("iverilog") or _scoop_fallback("iverilog")
+    verilator = shutil.which("verilator") or _scoop_fallback("verilator")
 
     if pref == "iverilog":
         if iverilog:
@@ -194,13 +210,17 @@ def compile_check(
     report.tool_used = tool_name
     report.tool_available = True
 
+    # 拿到绝对路径(PATH 上找到优先,否则走 scoop fallback)
+    # 这样即使父进程 PATH snapshot 过旧,subprocess 也能定位
+    exe_path = shutil.which(tool_name) or _scoop_fallback(tool_name) or tool_name
+
     # 组装命令
     if tool_name == "iverilog":
         # -t null:不产物,只做 parse + elab + 连接性检查
-        cmd = ["iverilog", "-t", "null"] + file_strs
+        cmd = [exe_path, "-t", "null"] + file_strs
     else:
         # verilator --lint-only:静态检查,不编译
-        cmd = ["verilator", "--lint-only", "-Wall"] + file_strs
+        cmd = [exe_path, "--lint-only", "-Wall"] + file_strs
 
     try:
         r = subprocess.run(
