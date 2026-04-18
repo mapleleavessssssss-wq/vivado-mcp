@@ -5,11 +5,19 @@
 [![License](https://img.shields.io/github/license/mapleleavessssssss-wq/vivado-mcp)](LICENSE)
 [![CI](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml)
 
-精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **15 个工具** 控制 Xilinx Vivado EDA——少即是多。
+精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **25 个工具 + 5 个智能 Hook** 控制 Xilinx Vivado EDA——少即是多。
 
-> **0.2.0 升级了什么**：新增 GUI 可视化模式（能看到 Vivado 图标）、修复 7 个关键 bug（含最致命的"假 PASS"时序报告）、删除 8 个 facade 工具（交给大模型拼 Tcl）。详见 [CHANGELOG](CHANGELOG.md) 和 [迁移指南](docs/MIGRATION_0.1_to_0.2.md)。
+> **0.3 系列新增了什么**:
+> - **长任务可视化**:`get_run_progress` 让 10-30 分钟的综合/实现不再是黑盒
+> - **新手引导**:`get_next_suggestion` 根据项目状态告诉你下一步该干啥
+> - **XDC 一键自修**:`xdc_auto_fix` 自动补 IOSTANDARD 和 create_clock period
+> - **外部 Verilog 预检**:`verilog_compile_check` 用 iverilog/verilator,比 Vivado 综合快 50 倍
+> - **IP 老化检测**:`get_ip_status` 扫出项目里哪些 IP 需要升级
+> - **Commit 摘要**:`get_pre_commit_summary` 生成 WNS/资源/CW 的 markdown 片段直接贴 commit body
+>
+> 详见 [CHANGELOG](CHANGELOG.md)。
 
-## 设计哲学 — 为什么是 15 个工具而不是 500 个？
+## 设计哲学 — 为什么是 25 个工具而不是 500 个？
 
 主流 Vivado MCP（如 SynthPilot）动辄 500+ 工具，每个工具本质是一行 Tcl 包装。问题是：
 
@@ -29,8 +37,8 @@
 ## 特性
 
 - **双模式会话**：默认 GUI 可视化（能看到 Vivado 图标 + Tcl Console 实时输出），也支持无头 CI 模式和 attach 已开 GUI
-- **15 个精简工具** — 覆盖完整 FPGA 开发流程 + 智能诊断 + IP 调试
-- **智能诊断** — 综合/实现后自动提取 CRITICAL WARNING 分类 + 中文修复建议（含 12 种已知 warning）
+- **25 个精简工具 + 5 个智能 Hook** — 覆盖完整 FPGA 开发流程 + 智能诊断 + 新手引导 + 外部工具链联动
+- **智能诊断** — 综合/实现后自动提取 CRITICAL WARNING / ERROR 分类 + 中文修复建议（含 19 种已知 ID）
 - **IO 验证** — XDC 约束（**支持 -dict 和传统两种语法**）对比实际引脚分配，GT 端口不匹配标记为 CRITICAL
 - **IP 调试** — 查询 IP 所有 CONFIG.* 参数（含 GUI 隐藏参数）、纯 Python 对比两个 XCI 文件
 - **Bitstream 安全检查** — 生成比特流前自动检测 CRITICAL WARNING 并阻止（可 force 跳过）
@@ -80,7 +88,7 @@ vivado-mcp install
 
 ### 4. 重启 Claude Code
 
-配置完成后重启 Claude Code，即可使用 15 个 Vivado 工具。
+配置完成后重启 Claude Code，即可使用 25 个 Vivado 工具。
 
 <details>
 <summary>从源码安装（开发/贡献）</summary>
@@ -116,7 +124,7 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI，跑得更快
 | 工具 | 说明 |
 |------|------|
 | `start_session` | 启动 Vivado 会话（gui/tcl/attach 三种模式） |
-| `stop_session` | 关闭指定会话 |
+| `stop_session` | 关闭指定会话(B13 修复:taskkill /T 递归杀进程树 + 清 vivado_pid*.str) |
 | `list_sessions` | 列出所有活跃会话 |
 
 ### Tcl 执行（核心）
@@ -130,39 +138,54 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI，跑得更快
 |------|------|
 | `run_synthesis` | 运行综合，Python 轮询不阻塞，完成后自动 open_run + 诊断 |
 | `run_implementation` | 运行实现（布局布线） |
+| `get_run_progress` | **0.3.2** 查 run 实时进度:Phase 序列 + log 尾部 + mtime,log 超 2 分钟不更新自动提示可能卡住 |
 | `generate_bitstream` | 生成比特流（默认前置 CRITICAL WARNING 安全检查） |
 | `program_device` | 编程 FPGA 设备（封装 open_hw_manager → connect → program） |
 
-### 诊断（独家差异化）
+### 新手引导 & 工程摸底
 | 工具 | 说明 |
 |------|------|
-| `get_critical_warnings` | 提取并按 ID 分类 CRITICAL WARNING，含 12 种已知类型的中文修复建议 |
+| `get_next_suggestion` | **0.3.2** 11 档决策表:没项目 → open/create,没顶层 → set_property TOP,综合完成 → run_implementation...每档附可执行命令 |
+| `get_project_info` | **0.3.0** 一次拿齐项目摸底:名称/part/顶层/源文件/XDC/IP/runs 状态 |
+| `get_pre_commit_summary` | **0.3.4** 生成 markdown 工程摘要直接贴 commit body:项目/时序 WNS+WHS/资源/CW/READY-WARN-BLOCK 门禁 |
+
+### 诊断(独家差异化)
+| 工具 | 说明 |
+|------|------|
+| `get_critical_warnings` | 提取并按 ID 分类 CRITICAL WARNING + ERROR,含 19 种已知 ID 的中文修复建议 |
+| `check_bitstream_readiness` | **0.3.0** 烧板前一键 READY/WARN/BLOCK 综合判定 |
 | `verify_io_placement` | 对比 XDC 约束（-dict/传统两种语法）与实际 IO 布局，GT 不匹配标为 CRITICAL |
+| `xdc_lint` | **0.3.0** 纯 Python 静态 XDC 检查(PIN_CONFLICT / 漏 IOSTANDARD / DUPLICATE_PORT / CLOCK_NO_PERIOD / 跨文件冲突),不需 Vivado |
+| `xdc_auto_fix` | **0.3.3** 自动补 IOSTANDARD + create_clock -period,dry_run 预览 + 板卡 profile(basys3/nexys/arty/zybo/kc705),不碰 PIN_CONFLICT |
+| `verilog_compile_check` | **0.3.4** 用 iverilog / verilator 做语法 + 连接性检查,比 Vivado 综合快 50 倍。未装返回 SKIP + 安装指引,支持 Windows+scoop 路径自动发现 |
 
 ### IP 调试
 | 工具 | 说明 |
 |------|------|
 | `inspect_ip_params` | 查询 IP 实例所有 CONFIG.* 参数（含 GUI 隐藏项），支持关键词过滤 |
 | `compare_xci` | 纯 Python 对比两个 XCI 文件的参数差异（无需 Vivado 会话） |
+| `get_ip_status` | **0.3.4** 检查哪些 IP 需要升级 / 被锁定 / 已最新,附 upgrade_ip 批量建议 |
 
 ### 结构化报告
 | 工具 | 说明 |
 |------|------|
 | `get_io_report` | IO 引脚报告（JSON），自动判定 GT/GPIO 类型 |
-| `get_timing_report` | 时序报告，含 PASS/FAIL 判定和关键路径详情 |
+| `get_timing_report` | 时序报告，含 PASS/FAIL 判定、**数据来源标注**(post-synth 估算 vs post-route 最终)、关键路径详情 |
+| `get_utilization_report` | **0.3.0** 结构化资源占用(LUT/FF/BRAM/DSP/IOB),> 90% 标 CRITICAL,70-90% 标 WARN |
 
-> 通用报告（utilization / power / drc / clock / methodology / cdc 等）请直接用
-> `run_tcl("report_utilization -return_string")`，无需包装。
+> 通用报告（power / drc / clock / methodology / cdc 等）请直接用
+> `run_tcl("report_power -return_string")`，无需包装。
 
 ## 智能 Hook(Claude Code 独有)
 
-仓库的 `.claude/settings.json` 预置了 **4 个 Claude Code hook**,让 AI 不只会"被动应答",还能**主动守门**:
+仓库的 `.claude/settings.json` 预置了 **5 个 Claude Code hook**,让 AI 不只会"被动应答",还能**主动守门**:
 
 | Hook | 触发事件 | 作用 |
 |---|---|---|
 | `bitstream-guard` | AI 调 `generate_bitstream` 前 | 拦截并提醒先跑 `check_bitstream_readiness`,避免时序违例时烧出废比特流 |
 | `xdc-lint` | 保存任意 `.xdc` 文件后 | 纯 Python 静态检查:PIN_CONFLICT / 漏 IOSTANDARD / create_clock 缺 -period 等,无需等综合 |
 | `verilog-lint` | 保存任意 `.v` / `.sv` 文件后 | 零依赖预检:module 名匹配文件名 / endmodule 存在 / 括号配对 |
+| `iverilog-check` | 保存任意 `.v` / `.sv` 文件后 | **0.3.4** iverilog 或 verilator 语法+连接性检查,未装静默跳过,有 error 时阻断 |
 | `session-guard` | Claude 停下时 | 扫 `vivado_pid*.str` 文件,提醒清理未关闭的 Vivado session |
 
 首次打开本仓库时 Claude Code 会弹框:*"检测到项目配置了 hook,是否信任?"* — 选 **Yes** 即启用。
