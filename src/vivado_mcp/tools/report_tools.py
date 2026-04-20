@@ -20,6 +20,7 @@ from vivado_mcp.analysis.timing_parser import (
     format_timing_report,
     parse_design_stage,
     parse_timing_summary,
+    parse_violating_paths,
 )
 from vivado_mcp.analysis.util_parser import format_utilization_report, parse_utilization
 from vivado_mcp.analysis.warning_parser import parse_diag_counts, parse_pre_bitstream
@@ -30,6 +31,7 @@ from vivado_mcp.tcl_scripts import (
     QUERY_DESIGN_STAGE,
     QUERY_PROJECT_INFO,
     QUERY_RUN_PROGRESS,
+    REPORT_VIOLATING_PATHS,
 )
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
@@ -122,6 +124,29 @@ async def get_timing_report(
         timing_report.source_stage = stage
         timing_report.source_detail = source_detail
         timing_report.stage_warning = stage_warning
+
+        # 时序违例 → 二次查询违例路径详情 + 模式嗅探 + 修复建议
+        # 健康工程跳过不跑,省 10-30s。异常降级:不阻断主报告。
+        if not timing_report.summary.timing_met:
+            try:
+                paths_result = await session.execute(
+                    REPORT_VIOLATING_PATHS, timeout=60.0
+                )
+                if paths_result.is_error:
+                    err = (
+                        f"rc={paths_result.return_code}: "
+                        f"{paths_result.output[:200]}"
+                    )
+                    timing_report.violating_paths_error = err
+                    logger.warning("违例路径查询返回错误: %s", err)
+                else:
+                    timing_report.violating_paths = parse_violating_paths(
+                        paths_result.output
+                    )
+            except Exception as e:
+                err_msg = f"{type(e).__name__}: {e}"
+                timing_report.violating_paths_error = err_msg
+                logger.warning("违例路径查询异常: %s", err_msg)
 
         return format_timing_report(timing_report)
     except Exception as e:

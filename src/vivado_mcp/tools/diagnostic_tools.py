@@ -4,6 +4,8 @@
 对比 XDC 约束与实际 IO 布局，帮助快速定位引脚映射等问题。
 """
 
+import logging
+
 from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
@@ -16,6 +18,12 @@ from vivado_mcp.analysis.warning_parser import (
     parse_critical_warnings,
     parse_diag_counts,
     parse_errors,
+)
+from vivado_mcp.analysis.warning_snapshot import (
+    diff_warnings,
+    format_diff_report,
+    load_snapshot,
+    snapshot_cw,
 )
 from vivado_mcp.analysis.xdc_auto_fixer import (
     BOARD_PROFILES,
@@ -33,6 +41,34 @@ from vivado_mcp.tcl_scripts import (
     LIST_PROJECT_XDC_FILES,
 )
 from vivado_mcp.vivado.tcl_utils import validate_identifier
+
+logger = logging.getLogger(__name__)
+
+# 轻量 Tcl:查当前项目目录,没打开项目时输出 NONE。快照路径解析会用到。
+_QUERY_PROJECT_DIR = (
+    "if {[catch {current_project} __p]} { "
+    'puts "VMCP_PROJDIR:NONE" '
+    "} else { "
+    'puts "VMCP_PROJDIR:[get_property DIRECTORY [current_project]]" '
+    "}"
+)
+
+
+async def _get_project_dir(session) -> str | None:
+    """查当前项目目录;未打开项目或查询失败返回 None(走 fallback 路径)。"""
+    try:
+        r = await session.execute(_QUERY_PROJECT_DIR, timeout=5.0)
+    except Exception as e:
+        logger.warning("查询项目目录失败,快照将走 fallback: %s", e)
+        return None
+
+    for line in r.output.splitlines():
+        line = line.strip()
+        if line.startswith("VMCP_PROJDIR:"):
+            value = line[len("VMCP_PROJDIR:"):].strip()
+            if value and value != "NONE":
+                return value
+    return None
 
 
 async def _fetch_project_xdc_paths(session) -> tuple[list[str] | None, str]:
@@ -65,6 +101,7 @@ async def _fetch_project_xdc_paths(session) -> tuple[list[str] | None, str]:
 @mcp.tool()
 async def get_critical_warnings(
     run_name: str = "impl_1",
+    compare_with_last: bool = False,
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
@@ -73,8 +110,13 @@ async def get_critical_warnings(
     解析指定 run 的 runme.log，按 warning ID 聚合分类，返回中文诊断报告。
     包含已知 warning 的分类标签和修复建议。
 
+    每次调用会静默把本次 CW 列表存成一份快照(存到项目目录 ``.vmcp/`` 下,
+    或 fallback 到 ``~/.claude/vivado-mcp/``)。启用 ``compare_with_last=True`` 时,
+    读上次快照与本次对比,报告消除/新增/仍存在的条目,帮你判断"修没修对"。
+
     Args:
-        run_name: run 名称（如 "synth_1"、"impl_1"），默认 "impl_1"。
+        run_name: run 名称(如 "synth_1"、"impl_1"),默认 "impl_1"。
+        compare_with_last: True 时追加一段与上次快照的差分报告。
         session_id: 目标会话 ID。
     """
     try:
@@ -98,16 +140,11 @@ async def get_critical_warnings(
     if cw_count == -1:
         return "[ERROR] 未找到 runme.log，请确认 run 已执行过。"
 
-    # 无异常快速返回
-    if errors == 0 and cw_count == 0:
-        return (
-            f"诊断概览: errors=0, critical_warnings=0, warnings={w_count}\n"
-            "未发现 ERROR 或 CRITICAL WARNING。"
-        )
-
     # 第二步：按需提取详情(ERROR 优先,CW 次之)
+    # 即使 cw_count == 0 也要把 cw_list(空) 写快照,下次才能识别"全部消除"
     error_groups = []
     cw_groups = []
+    cw_list = []
 
     if errors > 0:
         try:
@@ -129,7 +166,7 @@ async def get_critical_warnings(
         except Exception as e:
             return f"[ERROR] 提取 CRITICAL WARNING 详情失败: {e}"
 
-    # 第三步：格式化报告
+    # 第三步:构造 Report,写快照(无论 compare_with_last 与否,总是写)
     report = WarningReport(
         errors=errors,
         critical_warnings=cw_count,
@@ -137,7 +174,48 @@ async def get_critical_warnings(
         groups=cw_groups,
         error_groups=error_groups,
     )
-    return format_warning_report(report)
+
+    # 查项目目录,失败走 fallback
+    project_dir = await _get_project_dir(session)
+
+    # 读上次快照(diff 时要用,所以要在覆盖前读)
+    prev_report, prev_cws = (None, [])
+    if compare_with_last:
+        prev_report, prev_cws = load_snapshot(run_name, project_dir)
+
+    # 写本次快照(失败只警告,不打断主流程 —— 按铁律 1.4 要打印具体原因)
+    try:
+        snapshot_cw(report, cw_list, run_name, project_dir)
+    except (OSError, PermissionError, ValueError) as e:
+        logger.warning(
+            "保存 CW 快照失败(run=%s, project_dir=%s): %s",
+            run_name,
+            project_dir,
+            e,
+        )
+
+    # 第四步:格式化主报告 —— 无 CW 无 ERROR 的短路分支
+    if errors == 0 and cw_count == 0:
+        main = (
+            f"诊断概览: errors=0, critical_warnings=0, warnings={w_count}\n"
+            "未发现 ERROR 或 CRITICAL WARNING。"
+        )
+    else:
+        main = format_warning_report(report)
+
+    # 第五步:追加差分报告(仅当 compare_with_last 启用)
+    if compare_with_last:
+        if prev_report is None:
+            return (
+                main
+                + "\n\n=== CW 差分报告 ===\n"
+                "无上次快照,本次作为基线已保存。下次再调带 compare_with_last=True "
+                "就能看到修复效果了。"
+            )
+        diff = diff_warnings(prev_cws, cw_list)
+        return main + "\n\n" + format_diff_report(diff)
+
+    return main
 
 
 @mcp.tool()

@@ -61,6 +61,14 @@ def _mock_context(session):
 class TestGetCriticalWarnings:
     """测试 get_critical_warnings 工具。"""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path, monkeypatch):
+        """把 Path.home() 劫持到 tmp_path,避免快照写入污染真实 ~/.claude/vivado-mcp/。
+
+        每个 test 独立 tmp_path,互不干扰。
+        """
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
     @pytest.mark.asyncio
     async def test_returns_report_with_cw(self):
         """有 CRITICAL WARNING 时，返回包含分类和建议的报告。"""
@@ -241,6 +249,244 @@ class TestGetCriticalWarnings:
             run_name="impl;rm -rf /", session_id="default", ctx=ctx
         )
         assert "[ERROR]" in result
+
+
+# ====================================================================== #
+#  get_critical_warnings 的 compare_with_last 差分功能
+# ====================================================================== #
+
+
+class TestCompareWithLast:
+    """测试 compare_with_last=True 时的快照 + 差分行为。
+
+    关键:用 monkeypatch 把 Path.home() 改到 tmp_path,避免污染真实 ~/。
+    """
+
+    def _make_session_with_cws(self, cw_messages: list[str], proj_dir: str = ""):
+        """构造一个按序返回 counts → extract CW → query project_dir 的 session。"""
+        vmcp_cw = "\n".join(
+            f"VMCP_CW:{i + 1}|{msg}" for i, msg in enumerate(cw_messages)
+        )
+        vmcp_cw += "\nVMCP_CW_DONE"
+        projdir_out = (
+            f"VMCP_PROJDIR:{proj_dir}" if proj_dir else "VMCP_PROJDIR:NONE"
+        )
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                # 1. COUNT_WARNINGS
+                _make_tcl_result(
+                    f"VMCP_DIAG:errors=0,critical_warnings={len(cw_messages)},warnings=0"
+                ),
+                # 2. EXTRACT_CRITICAL_WARNINGS
+                _make_tcl_result(vmcp_cw),
+                # 3. _QUERY_PROJECT_DIR
+                _make_tcl_result(projdir_out),
+            ]
+        )
+        return session
+
+    @pytest.mark.asyncio
+    async def test_first_call_writes_snapshot_no_diff_section(
+        self, tmp_path, monkeypatch
+    ):
+        """第一次调(无上次快照):写快照,报告不含差分段。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        proj = tmp_path / "proj"
+        proj.mkdir()
+
+        session = self._make_session_with_cws(
+            [
+                "CRITICAL WARNING: [Vivado 12-1411] GT pin conflict.",
+                "CRITICAL WARNING: [DRC BIVC-1] Bank voltage conflict.",
+            ],
+            proj_dir=str(proj),
+        )
+
+        ctx = _mock_context(session)
+
+        # 默认 compare_with_last=False:不应含差分段
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="impl_1", session_id="default", ctx=ctx
+            )
+
+        assert "差分报告" not in result
+        # 但快照必须已经落盘到 proj/.vmcp/
+        snapshot_path = proj / ".vmcp" / "last_cw_impl_1.json"
+        assert snapshot_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_compare_without_prior_snapshot_shows_baseline_hint(
+        self, tmp_path, monkeypatch
+    ):
+        """compare_with_last=True 但无上次快照:提示"基线已保存"。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        proj = tmp_path / "proj2"
+        proj.mkdir()
+
+        session = self._make_session_with_cws(
+            ["CRITICAL WARNING: [Vivado 12-1411] GT conflict."],
+            proj_dir=str(proj),
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="impl_1",
+                compare_with_last=True,
+                session_id="default",
+                ctx=ctx,
+            )
+
+        assert "差分报告" in result
+        assert "基线" in result or "无上次快照" in result
+
+    @pytest.mark.asyncio
+    async def test_second_call_compare_shows_resolved_and_persistent(
+        self, tmp_path, monkeypatch
+    ):
+        """第一次调存 2 条 CW,第二次只剩 1 条 → 差分应显示 1 条消除 + 1 条仍存在。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        proj = tmp_path / "proj3"
+        proj.mkdir()
+
+        # 第一次:2 条 CW
+        session1 = self._make_session_with_cws(
+            [
+                "CRITICAL WARNING: [Vivado 12-1411] pcie GT pin conflict.",
+                "CRITICAL WARNING: [DRC BIVC-1] bank 14 voltage conflict.",
+            ],
+            proj_dir=str(proj),
+        )
+        ctx1 = _mock_context(session1)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session1,
+        ):
+            await get_critical_warnings(
+                run_name="impl_1", session_id="default", ctx=ctx1
+            )
+
+        # 第二次:用户修掉了 GT_PIN_CONFLICT,只剩 BIVC-1
+        session2 = self._make_session_with_cws(
+            ["CRITICAL WARNING: [DRC BIVC-1] bank 14 voltage conflict."],
+            proj_dir=str(proj),
+        )
+        ctx2 = _mock_context(session2)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session2,
+        ):
+            result = await get_critical_warnings(
+                run_name="impl_1",
+                compare_with_last=True,
+                session_id="default",
+                ctx=ctx2,
+            )
+
+        assert "差分报告" in result
+        assert "已消除 1 条" in result
+        assert "仍存在 1 条" in result
+        # 已消除里应提到 Vivado 12-1411
+        assert "Vivado 12-1411" in result
+        # 仍存在里应提到 BIVC-1
+        assert "DRC BIVC-1" in result
+        # 由于只减不增,结论应是"修复方向正确"
+        assert "修复方向正确" in result
+
+    @pytest.mark.asyncio
+    async def test_compare_detects_newly_added(self, tmp_path, monkeypatch):
+        """第一次 1 条,第二次变成另一条不同的 CW → 1 消除 + 1 新出现。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        proj = tmp_path / "proj4"
+        proj.mkdir()
+
+        session1 = self._make_session_with_cws(
+            ["CRITICAL WARNING: [Vivado 12-1411] GT pin conflict."],
+            proj_dir=str(proj),
+        )
+        ctx1 = _mock_context(session1)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session1,
+        ):
+            await get_critical_warnings(
+                run_name="impl_1", session_id="default", ctx=ctx1
+            )
+
+        # 第二次出现完全不同的 CW
+        session2 = self._make_session_with_cws(
+            ["CRITICAL WARNING: [DRC NSTD-1] port uart_tx no IOSTANDARD."],
+            proj_dir=str(proj),
+        )
+        ctx2 = _mock_context(session2)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session2,
+        ):
+            result = await get_critical_warnings(
+                run_name="impl_1",
+                compare_with_last=True,
+                session_id="default",
+                ctx=ctx2,
+            )
+
+        assert "已消除 1 条" in result
+        assert "新出现 1 条" in result
+        assert "DRC NSTD-1" in result
+        assert "新问题" in result or "检查" in result
+
+    @pytest.mark.asyncio
+    async def test_project_dir_none_still_snapshots_to_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """没打开项目时快照也要落到 ~/.claude/vivado-mcp/ 不崩溃。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        session = self._make_session_with_cws(
+            ["CRITICAL WARNING: [Vivado 12-1411] GT conflict."],
+            proj_dir="",  # 未打开项目,返回 NONE
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="impl_1", session_id="default", ctx=ctx
+            )
+
+        # 没有错误、主报告正常
+        assert "!! 发现 1 条 CRITICAL WARNING !!" in result
+        # 快照落在 fallback 路径
+        fallback = tmp_path / ".claude" / "vivado-mcp" / "last_cw_impl_1.json"
+        assert fallback.exists()
 
 
 # ====================================================================== #
@@ -508,3 +754,123 @@ class TestGetTimingReport:
         assert "PASS" in result
         assert "WNS" in result
         assert "userclk2" in result
+
+
+class TestGetTimingReportWithPaths:
+    """测试 get_timing_report 在 timing_met=False 时自动追加违例路径详情。"""
+
+    # 构造一份 WNS 为负的 report_timing_summary 最小文本
+    _VIOLATED_SUMMARY = """\
+------------------------------------------------------------------------------------
+| Design Timing Summary
+| ---------------------
+------------------------------------------------------------------------------------
+
+    WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints
+    -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------
+     -1.234       -5.000                      5                  200       -0.080       -0.200                      2                  200
+"""  # noqa: E501
+
+    @pytest.mark.asyncio
+    async def test_triggers_violating_paths_query_on_fail(self):
+        """timing_met=False → 第三次 execute 必须跑 REPORT_VIOLATING_PATHS。"""
+        from vivado_mcp.tcl_scripts import REPORT_VIOLATING_PATHS
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        violating_text = _load_fixture("sample_violating_paths.txt")
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                # 1. QUERY_DESIGN_STAGE
+                _make_tcl_result(
+                    "VMCP_STAGE:stage=post-route"
+                    "|synth_status=synth_design Complete!"
+                    "|impl_status=route_design Complete!"
+                ),
+                # 2. report_timing_summary -> 违例
+                _make_tcl_result(self._VIOLATED_SUMMARY),
+                # 3. REPORT_VIOLATING_PATHS
+                _make_tcl_result(violating_text),
+            ]
+        )
+
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
+            result = await get_timing_report(session_id="default", ctx=ctx)
+
+        # 调用序列 = stage + summary + violating_paths
+        assert session.execute.call_count == 3
+        # 第三次调用必须是 REPORT_VIOLATING_PATHS 脚本本体
+        third_call_cmd = session.execute.call_args_list[2].args[0]
+        assert third_call_cmd == REPORT_VIOLATING_PATHS
+
+        # 报告必须含违例路径段和具体模式标签
+        assert "FAIL" in result
+        assert "违例路径" in result
+        assert "[CDC]" in result
+        assert "建议:" in result
+
+    @pytest.mark.asyncio
+    async def test_skips_violating_paths_query_on_pass(self):
+        """timing_met=True → 不跑 REPORT_VIOLATING_PATHS,省时间。"""
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        # sample_report_timing.txt 里 WNS=0.234, WHS=0.045 → timing_met=True
+        timing_text = _load_fixture("sample_report_timing.txt")
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                # 1. QUERY_DESIGN_STAGE
+                _make_tcl_result(
+                    "VMCP_STAGE:stage=post-route"
+                    "|synth_status=synth_design Complete!"
+                    "|impl_status=route_design Complete!"
+                ),
+                # 2. report_timing_summary -> PASS
+                _make_tcl_result(timing_text),
+                # 不应该有第 3 次调用!
+            ]
+        )
+
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
+            result = await get_timing_report(session_id="default", ctx=ctx)
+
+        # 只调两次:stage + summary
+        assert session.execute.call_count == 2
+        assert "PASS" in result
+        assert "违例路径 Top" not in result
+
+    @pytest.mark.asyncio
+    async def test_graceful_degrade_on_violating_paths_error(self):
+        """违例路径查询失败不阻断主报告,末尾加一行提示。"""
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_STAGE:stage=post-route"
+                    "|synth_status=synth_design Complete!"
+                    "|impl_status=route_design Complete!"
+                ),
+                _make_tcl_result(self._VIOLATED_SUMMARY),
+                # 第三次返回错误
+                _make_tcl_result("ERROR: some tcl error", return_code=1),
+            ]
+        )
+
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
+            result = await get_timing_report(session_id="default", ctx=ctx)
+
+        # 主报告仍然返回,但末尾有失败提示
+        assert "FAIL" in result
+        assert "违例路径查询失败" in result
+        # 不应该含正常的违例段
+        assert "违例路径 Top" not in result

@@ -1,0 +1,73 @@
+VMCP_PATH_START:type=setup
+Copyright 1986-2019 Xilinx, Inc. All Rights Reserved.
+------------------------------------------------------------------------------------
+| Report : Timing
+|
+------------------------------------------------------------------------------------
+
+Slack (VIOLATED) :        -1.234ns  (required time - arrival time)
+  Source:                 cpu_core/alu_inst/result_reg[31]/C
+                            (rising edge-triggered cell FDRE clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Destination:            dma_ctrl/rx_fifo/wr_data_reg[31]/D
+                            (rising edge-triggered cell FDRE clocked by dma_clk_200mhz  {rise@0.000ns fall@2.500ns period=5.000ns})
+  Path Group:             dma_clk_200mhz
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            5.000ns  (dma_clk_200mhz rise@5.000ns - sys_clk_100mhz rise@0.000ns)
+  Data Path Delay:        5.920ns  (logic 1.500ns (25.3%)  route 4.420ns (74.7%))
+  Logic Levels:           4  (LUT4=2 LUT6=2)
+  Clock Path Skew:        -0.314ns (DCD - SCD + CPR)
+
+Slack (VIOLATED) :        -0.876ns  (required time - arrival time)
+  Source:                 fsm_reg/state_reg[0]/C
+                            (rising edge-triggered cell FDRE clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Destination:            decode_reg/opcode_reg[7]/D
+                            (rising edge-triggered cell FDRE clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Path Group:             sys_clk_100mhz
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            10.000ns  (sys_clk_100mhz rise@10.000ns - sys_clk_100mhz rise@0.000ns)
+  Data Path Delay:        10.620ns  (logic 7.500ns (70.6%)  route 3.120ns (29.4%))
+  Logic Levels:           18  (LUT2=3 LUT4=7 LUT6=8)
+  Clock Path Skew:        0.050ns (DCD - SCD + CPR)
+
+Slack (VIOLATED) :        -0.512ns  (required time - arrival time)
+  Source:                 data_in[7]
+                            (input port clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Destination:            input_reg/data_reg[7]/D
+                            (rising edge-triggered cell FDRE clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Path Group:             sys_clk_100mhz
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            10.000ns  (sys_clk_100mhz rise@10.000ns - sys_clk_100mhz rise@0.000ns)
+  Data Path Delay:        10.250ns  (logic 2.100ns (20.5%)  route 8.150ns (79.5%))
+  Logic Levels:           2  (IBUF=1 LUT4=1)
+  Clock Path Skew:        0.000ns (DCD - SCD + CPR)
+
+Slack (VIOLATED) :        -0.300ns  (required time - arrival time)
+  Source:                 broadcast_reg/en_reg/C
+                            (rising edge-triggered cell FDRE clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Destination:            downstream/sink_reg[512]/D
+                            (rising edge-triggered cell FDRE clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Path Group:             sys_clk_100mhz
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            10.000ns  (sys_clk_100mhz rise@10.000ns - sys_clk_100mhz rise@0.000ns)
+  Data Path Delay:        10.100ns  (logic 1.200ns (11.9%)  route 8.900ns (88.1%))
+  Logic Levels:           3  (LUT4=1 LUT6=2)
+  Clock Path Skew:        0.020ns (DCD - SCD + CPR)
+
+VMCP_PATH_END:type=setup
+VMCP_PATH_START:type=hold
+Copyright 1986-2019 Xilinx, Inc. All Rights Reserved.
+
+Slack (VIOLATED) :        -0.080ns  (arrival time - required time)
+  Source:                 clk_divider/divided_clk_reg/C
+                            (rising edge-triggered cell FDRE clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Destination:            sample_reg/sample_reg[0]/D
+                            (rising edge-triggered cell FDRE clocked by sys_clk_100mhz  {rise@0.000ns fall@5.000ns period=10.000ns})
+  Path Group:             sys_clk_100mhz
+  Path Type:              Hold (Min at Fast Process Corner)
+  Requirement:            0.000ns  (sys_clk_100mhz rise@0.000ns - sys_clk_100mhz rise@0.000ns)
+  Data Path Delay:        0.420ns  (logic 0.180ns (42.9%)  route 0.240ns (57.1%))
+  Logic Levels:           1  (LUT2=1)
+  Clock Path Skew:        -0.500ns (DCD - SCD + CPR)
+
+VMCP_PATH_END:type=hold
+VMCP_PATH_DONE

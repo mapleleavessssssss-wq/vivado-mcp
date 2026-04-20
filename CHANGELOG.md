@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.9] — 2026-04-20
+
+### 增强(现有工具扩能,不新建 MCP tool)
+
+- **`get_timing_report` 违例路径详情 + 修复建议** —— 时序违例时自动跑二次 `report_timing -max_paths 10`(setup) + `-max_paths 5`(hold),解析 Top N 违例路径(起点/终点/slack/logic+route+skew 延迟分解/levels),嗅探 5 种模式自动给中文修复建议:
+  - `CDC` —— 起止时钟不同 → 建议加 2 级同步器或 `set_false_path`
+  - `IO_UNREGISTERED` —— 起止为顶层端口 → 建议加 IOB 寄存器 + `set_property IOB TRUE`
+  - `HIGH_FANOUT` —— route_delay > 3× logic_delay → `report_high_fanout_nets` + `MAX_FANOUT` 约束
+  - `LONG_COMBO` —— levels > 15 或 logic > 2× route → 切流水线寄存器
+  - `UNKNOWN` —— 兜底引导手动 `report_timing -from -to`
+  - 时序 PASS 时跳过二次查询省 10-30s;异常降级不阻断主报告。
+- **`get_critical_warnings` 快照差分(compare_with_last)** —— 每次调用静默写快照到 `<project>/.vmcp/last_cw_{run}.json`(无项目 fallback 到 `~/.claude/vivado-mcp/`)。启用 `compare_with_last=True` 时读上次快照做 diff,按 warning_id + port + pin + source_file + normalized_message_hash 的指纹识别:
+  - `[-]已消除` —— 修对了,结论用"修复生效"鼓励反馈
+  - `[+]新出现` —— 改坏了,结论用"回滚检查"警告
+  - `[=]仍存在` —— 没改到点子上
+  - 指纹剥离行号,XDC 改动导致行号漂移不会被误判为新 CW。向后兼容:不加参数时行为不变,只是偷偷写快照。
+
+### 测试
+
+- **328 → 373**(+45):新增 `TestViolatingPath` / `TestAnalyzePath` / `TestFormatViolatingPaths` / `TestGetTimingReportWithPaths` / `TestWarningSnapshot` / `TestDiffWarnings` / `TestCompareWithLast` 等 7 个测试类。`test_diagnostic_tools.TestGetCriticalWarnings` 加 `autouse` 的 `_isolate_home` fixture 防止快照写污染真实 home。
+- 新 fixture `tests/fixtures/sample_violating_paths.txt` 覆盖 5 种违例模式。
+
+### 设计哲学同步
+
+本轮遵守 `tcl_tools.py` 的原则 —— "工具的存在应该是因为它提供 Tcl 做不了或做不好的本地价值"。两个功能都选择**扩已有工具**而非新建 MCP tool:建议段集成到时序报告末尾,差分是 CW 工具的一个开关。避免工具集臃肿。
+
 ## [0.3.8] — 2026-04-20
 
 ### 修复(Bug 修复包,8 项漏洞)
