@@ -419,16 +419,20 @@ class TestGenerateBitstreamSafety:
 
     @pytest.mark.asyncio
     async def test_allows_with_force(self):
-        """force=True 时，跳过安全检查直接执行。"""
+        """force=True 时，跳过安全检查直接执行(0.3.8: Python 轮询架构)。"""
         from vivado_mcp.tools.flow_tools import generate_bitstream
 
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
-                # 不执行安全检查，直接 launch_runs
-                _make_tcl_result("Bitstream generation complete"),
-                # 查询比特流目录
-                _make_tcl_result("比特流目录: /project/impl_1"),
+                # 1. launch_runs -to_step write_bitstream
+                _make_tcl_result("Bitstream generation launched"),
+                # 2. 轮询 — 一次就完成
+                _make_tcl_result(
+                    "VMCP_POLL|write_bitstream Complete!|100%|00:05:00"
+                ),
+                # 3. 查询比特流目录
+                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
             ]
         )
 
@@ -440,8 +444,9 @@ class TestGenerateBitstreamSafety:
             )
 
         assert "安全检查未通过" not in result
-        # force=True 跳过 CHECK_PRE_BITSTREAM，execute 只被调用 2 次（launch+dir）
-        assert session.execute.call_count == 2
+        # force=True 跳过 CHECK_PRE_BITSTREAM,调用序列 = launch + poll + 查目录
+        assert session.execute.call_count == 3
+        assert "/project/impl_1" in result
 
 
 # ====================================================================== #

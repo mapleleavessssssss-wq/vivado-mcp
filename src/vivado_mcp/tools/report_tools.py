@@ -6,6 +6,7 @@
 """
 
 import json
+import logging
 
 from mcp.server.fastmcp import Context
 
@@ -31,6 +32,8 @@ from vivado_mcp.tcl_scripts import (
     QUERY_RUN_PROGRESS,
 )
 from vivado_mcp.vivado.tcl_utils import validate_identifier
+
+logger = logging.getLogger(__name__)
 
 
 @mcp.tool()
@@ -95,9 +98,10 @@ async def get_timing_report(
         stage_result = await session.execute(QUERY_DESIGN_STAGE, timeout=15.0)
         if not stage_result.is_error:
             stage, synth_status, impl_status = parse_design_stage(stage_result.output)
-    except Exception:
+    except Exception as e:
         # 阶段查询失败不致命,继续跑时序报告,source_stage 保持 "unknown"
-        pass
+        # 但把具体原因打出来,避免报告里 stage=unknown 让人困惑
+        logger.warning("查询 design stage 失败,stage 降级为 unknown: %s", e)
 
     # 第二步:跑时序报告
     try:
@@ -167,9 +171,10 @@ async def check_bitstream_readiness(
     except Exception as e:
         return f"[ERROR] 查询实现状态失败: {e}"
 
-    # 2. 查询时序摘要(尽力而为,失败不致命)
+    # 2. 查询时序摘要(尽力而为,失败不致命 —— 但一定要打出原因)
     timing_met = None
     timing_line = ""
+    timing_err: str = ""
     try:
         timing_raw = await session.execute(
             "report_timing_summary -return_string", timeout=60.0
@@ -181,8 +186,14 @@ async def check_bitstream_readiness(
                 f"  WNS = {tr.summary.wns:+.3f} ns  WHS = {tr.summary.whs:+.3f} ns  "
                 f"失败端点 = {tr.summary.failing_endpoints}/{tr.summary.total_endpoints}"
             )
-    except Exception:
-        pass
+        else:
+            timing_err = (
+                f"report_timing_summary rc={timing_raw.return_code}: "
+                f"{timing_raw.output[:200]}"
+            )
+    except Exception as e:
+        timing_err = f"{type(e).__name__}: {e}"
+        logger.warning("check_bitstream_readiness 时序查询失败: %s", timing_err)
 
     # 3. 判定总体结论
     is_routed = "route_design Complete" in status or "write_bitstream" in status
@@ -199,7 +210,9 @@ async def check_bitstream_readiness(
     if timing_met is False:
         blockers.append("时序违例(WNS/WHS 为负)")
     elif timing_met is None and is_routed:
-        warnings_list.append("未能读取时序摘要(可能 report_timing_summary 不可用)")
+        # 把具体失败原因显示出来,而不是笼统的"不可用"
+        detail = f": {timing_err}" if timing_err else ""
+        warnings_list.append(f"未能读取时序摘要{detail}")
 
     if cw_count > 0:
         if cw_count >= 5:
@@ -472,14 +485,21 @@ async def get_pre_commit_summary(
     if not session:
         return _NO_SESSION.format(sid=session_id)
 
+    # 采样失败列表:任何一项失败都降级 verdict,commit 摘要不能撒谎
+    # 空列表 = 全部采样成功,有元素 = 至少一项降级
+    sample_failures: list[str] = []
+
     # 1. 项目信息
     info = None
     try:
         proj = await session.execute(QUERY_PROJECT_INFO, timeout=30.0)
         if not proj.is_error:
             info = parse_project_info(proj.output)
-    except Exception:
-        pass
+        else:
+            sample_failures.append(f"项目信息 rc={proj.return_code}")
+    except Exception as e:
+        sample_failures.append(f"项目信息: {type(e).__name__}")
+        logger.warning("pre_commit 查项目信息失败: %s", e)
 
     # 2. 时序
     timing = None
@@ -489,8 +509,11 @@ async def get_pre_commit_summary(
         )
         if not tr.is_error:
             timing = parse_timing_summary(tr.output)
-    except Exception:
-        pass
+        else:
+            sample_failures.append(f"时序 rc={tr.return_code}")
+    except Exception as e:
+        sample_failures.append(f"时序: {type(e).__name__}")
+        logger.warning("pre_commit 查时序失败: %s", e)
 
     # 3. 资源
     util = None
@@ -500,8 +523,11 @@ async def get_pre_commit_summary(
         )
         if not ur.is_error:
             util = parse_utilization(ur.output)
-    except Exception:
-        pass
+        else:
+            sample_failures.append(f"资源 rc={ur.return_code}")
+    except Exception as e:
+        sample_failures.append(f"资源: {type(e).__name__}")
+        logger.warning("pre_commit 查资源失败: %s", e)
 
     # 4. CW 计数
     errs, cws, warns = -1, -1, -1
@@ -511,8 +537,11 @@ async def get_pre_commit_summary(
         )
         if not cr.is_error:
             errs, cws, warns = parse_diag_counts(cr.output)
-    except Exception:
-        pass
+        else:
+            sample_failures.append(f"CW 计数 rc={cr.return_code}")
+    except Exception as e:
+        sample_failures.append(f"CW 计数: {type(e).__name__}")
+        logger.warning("pre_commit 查 CW 计数失败: %s", e)
 
     # 门禁判定
     verdict = "READY"
@@ -527,6 +556,11 @@ async def get_pre_commit_summary(
 
     if problems:
         verdict = "BLOCK" if (timing and timing.summary.timing_met is False) or errs > 0 else "WARN"
+
+    # 关键:采样失败不能默认 READY —— 降级为 DEGRADED,避免误导 commit 摘要
+    # 例如项目没打开,之前会输出"[READY]"但其实全是空洞,现在会明确告警。
+    if sample_failures and verdict == "READY":
+        verdict = "DEGRADED"
 
     # 格式化为 markdown
     out: list[str] = [f"## 工程摘要 [{verdict}]"]
@@ -558,6 +592,12 @@ async def get_pre_commit_summary(
         out.append(f"- 诊断: ERROR `{errs}`, CRITICAL WARNING `{cws}`, WARNING `{warns}`")
     if problems:
         out.append(f"- ⚠️ 阻塞/风险: {' / '.join(problems)}")
+    if sample_failures:
+        out.append(
+            f"- ⚠️ 采样不完整({len(sample_failures)} 项失败): "
+            + ", ".join(sample_failures)
+            + " —— 摘要可能不准,勿直接贴进 commit"
+        )
 
     out.append("")
     out.append("_Generated by vivado-mcp get_pre_commit_summary._")

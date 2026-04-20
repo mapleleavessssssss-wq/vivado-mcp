@@ -30,8 +30,36 @@ from vivado_mcp.tcl_scripts import (
     COUNT_WARNINGS,
     EXTRACT_CRITICAL_WARNINGS,
     EXTRACT_ERRORS,
+    LIST_PROJECT_XDC_FILES,
 )
 from vivado_mcp.vivado.tcl_utils import validate_identifier
+
+
+async def _fetch_project_xdc_paths(session) -> tuple[list[str] | None, str]:
+    """从当前 session 的项目里拉所有 XDC 约束文件路径。
+
+    Returns:
+        (paths, error_message) — 成功时 error_message 为空;
+        失败时 paths=None,error_message 含 [ERROR] 前缀可直接 return 给用户。
+    """
+    try:
+        r = await session.execute(LIST_PROJECT_XDC_FILES, timeout=15.0)
+    except Exception as e:
+        return None, f"[ERROR] 获取 XDC 文件列表失败: {e}"
+
+    if r.is_error:
+        return None, (
+            f"[ERROR] 获取 XDC 文件列表失败(rc={r.return_code}):\n"
+            f"{r.output}\n"
+            "提示: 需要先打开项目(run_tcl 'open_project ...')"
+        )
+
+    paths = [
+        line[len("VMCP_XDC_FILE:"):].strip()
+        for line in r.output.splitlines()
+        if line.startswith("VMCP_XDC_FILE:")
+    ]
+    return paths, ""
 
 
 @mcp.tool()
@@ -133,27 +161,9 @@ async def verify_io_placement_tool(
 
     # 第一步：从 Vivado 获取 XDC 文件路径列表，然后 Python 读文件解析
     # B3 修复：不再走 Tcl 正则（不支持 -dict），改 Python 文件解析支持两种语法
-    try:
-        list_result = await session.execute(
-            'foreach __f [get_files -of_objects [get_filesets constrs_1] '
-            '-filter {FILE_TYPE == XDC}] { puts "VMCP_XDC_FILE:$__f" }',
-            timeout=15.0,
-        )
-    except Exception as e:
-        return f"[ERROR] 获取 XDC 文件列表失败: {e}"
-
-    if list_result.is_error:
-        return (
-            f"[ERROR] 获取 XDC 文件列表失败（rc={list_result.return_code}）：\n"
-            f"{list_result.output}\n"
-            "提示: 需要先打开项目（run_tcl 'open_project ...'）"
-        )
-
-    xdc_paths = [
-        line[len("VMCP_XDC_FILE:"):].strip()
-        for line in list_result.output.splitlines()
-        if line.startswith("VMCP_XDC_FILE:")
-    ]
+    xdc_paths, err = await _fetch_project_xdc_paths(session)
+    if err:
+        return err
 
     if not xdc_paths:
         return "项目未添加任何 XDC 约束文件。"
@@ -228,25 +238,9 @@ async def xdc_lint(
                 "[ERROR] 未传 xdc_paths 且 session 不存在。"
                 "请传 xdc_paths=['xxx.xdc',...] 或先 start_session + 打开项目。"
             )
-        try:
-            list_result = await session.execute(
-                'foreach __f [get_files -of_objects [get_filesets constrs_1] '
-                '-filter {FILE_TYPE == XDC}] { puts "VMCP_XDC_FILE:$__f" }',
-                timeout=15.0,
-            )
-            if list_result.is_error:
-                return (
-                    f"[ERROR] 无法从项目拉 XDC 文件(rc={list_result.return_code}):\n"
-                    f"{list_result.output}\n"
-                    "提示:先 open_project 或直接传 xdc_paths 参数。"
-                )
-            xdc_paths = [
-                line[len("VMCP_XDC_FILE:"):].strip()
-                for line in list_result.output.splitlines()
-                if line.startswith("VMCP_XDC_FILE:")
-            ]
-        except Exception as e:
-            return f"[ERROR] 拉 XDC 列表失败: {e}"
+        xdc_paths, err = await _fetch_project_xdc_paths(session)
+        if err:
+            return err
 
     if not xdc_paths:
         return "项目未添加任何 XDC 约束文件,没什么可检查的。"
@@ -297,25 +291,9 @@ async def xdc_auto_fix(
                 "[ERROR] 未传 xdc_paths 且 session 不存在。"
                 "请传 xdc_paths=['xxx.xdc',...] 或先 start_session + 打开项目。"
             )
-        try:
-            list_result = await session.execute(
-                'foreach __f [get_files -of_objects [get_filesets constrs_1] '
-                '-filter {FILE_TYPE == XDC}] { puts "VMCP_XDC_FILE:$__f" }',
-                timeout=15.0,
-            )
-            if list_result.is_error:
-                return (
-                    f"[ERROR] 无法从项目拉 XDC 文件(rc={list_result.return_code}):\n"
-                    f"{list_result.output}\n"
-                    "提示:先 open_project 或直接传 xdc_paths 参数。"
-                )
-            xdc_paths = [
-                line[len("VMCP_XDC_FILE:"):].strip()
-                for line in list_result.output.splitlines()
-                if line.startswith("VMCP_XDC_FILE:")
-            ]
-        except Exception as e:
-            return f"[ERROR] 拉 XDC 列表失败: {e}"
+        xdc_paths, err = await _fetch_project_xdc_paths(session)
+        if err:
+            return err
 
     if not xdc_paths:
         return "项目未添加任何 XDC 约束文件,没什么可修的。"
