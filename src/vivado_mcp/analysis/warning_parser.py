@@ -167,8 +167,10 @@ _RE_DIAG = re.compile(
 # 匹配 VMCP_CW 行：行号|消息
 _RE_CW_LINE = re.compile(r"VMCP_CW:(\d+)\|(.+)")
 
-# 匹配 VMCP_ERR 行：行号|消息（ERROR 详情提取,严重级别 > CW）
-_RE_ERR_LINE = re.compile(r"VMCP_ERR:(\d+)\|(.+)")
+# 匹配 VMCP_RUNLOG_ERR 行：行号|消息(ERROR 详情提取,严重级别 > CW)
+# 不用 VMCP_ERR: 前缀:会被 SubprocessSession 的 sentinel 协议层吞掉
+# (session.py 对 VMCP_ERR: 前缀做前缀剥离)。0.3.10 field test 发现。
+_RE_ERR_LINE = re.compile(r"VMCP_RUNLOG_ERR:(\d+)\|(.+)")
 
 # 从消息中提取 warning ID，支持:
 #   - 纯数字 ID:    [Vivado 12-1411] / [Timing 38-282]
@@ -212,7 +214,7 @@ def parse_diag_counts(raw: str) -> tuple[int, int, int]:
 def _parse_log_entries(raw: str, line_re: re.Pattern) -> list[CriticalWarning]:
     """通用解析器:匹配 ``<prefix>:行号|消息`` 格式,抽取 warning_id/port/pin/source_file。
 
-    同时服务 CRITICAL WARNING(``VMCP_CW:``)和 ERROR(``VMCP_ERR:``)两类日志条目,
+    同时服务 CRITICAL WARNING(``VMCP_CW:``)和 ERROR(``VMCP_RUNLOG_ERR:``)两类日志条目,
     数据结构复用 ``CriticalWarning``(字段语义通用,仅严重级别不同)。
     """
     results: list[CriticalWarning] = []
@@ -260,7 +262,7 @@ def parse_critical_warnings(raw: str) -> list[CriticalWarning]:
 
 
 def parse_errors(raw: str) -> list[CriticalWarning]:
-    """解析 EXTRACT_ERRORS 脚本输出的 ``VMCP_ERR:`` 行(结构与 CW 同构)。"""
+    """解析 EXTRACT_ERRORS 脚本输出的 ``VMCP_RUNLOG_ERR:`` 行(结构与 CW 同构)。"""
     return _parse_log_entries(raw, _RE_ERR_LINE)
 
 

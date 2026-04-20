@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.10] — 2026-04-20
+
+### 修复(field test 发现的老 bug)
+
+- **B16 [P1] `get_critical_warnings` 在 tcl 模式下 ERROR 详情全部被吞** —— 实机用 Vivado 2019.1 + basys3_uart 项目测试 0.3.9 时发现:`place_design ERROR` 状态的项目调用工具只返回 "!! 发现 3 条 ERROR !!" 表头,无任何详情;`compare_with_last` 也没追加差分段。
+  - **根因**:`EXTRACT_ERRORS` Tcl 脚本输出 `VMCP_ERR:行号|文本` 前缀,与 `SubprocessSession` 内部 sentinel 协议的 `VMCP_ERR: $__out`(见 `tcl_utils.py wrap_command`)**命名冲突**。session 层对所有 `VMCP_ERR:` 开头的行做前缀剥离,把我们应用层输出的 ERROR 详情吞成了 `行号|文本`(前 10 字符被砍掉),`parse_errors` regex 匹配失败 → 空列表 → 报告无内容。
+  - **为什么长期没发现**:单元测试用 mock 直接注入 `VMCP_ERR:` 字符串,完全绕过 session 层,测试永远 pass。GUI 模式走 JSON 协议不走前缀剥离所以不受影响。这个 bug 从 0.3.0 引入 `EXTRACT_ERRORS` 至今一直潜伏。
+  - **修复**:`EXTRACT_ERRORS` 输出改为 `VMCP_RUNLOG_ERR:行号|文本` 明确区分命名空间。同步更新 `parse_errors` regex + 4 处测试 mock 字符串。
+
+### 经验教训
+
+- 单元测试 mock 拍在解析器输入上,绕过了 session 传输层 —— 这类"协议穿透"问题靠 mock 测不出来,必须实机跑。考虑以后加一个 "session 原样透传"的集成测试(走 subprocess session 但跑 `puts "VMCP_RUNLOG_ERR:test"` 然后验证 Python 拿到的是原文)。
+- 前缀命名要能看出是"谁的地盘"—— `VMCP_ERR:` 两边都在用,`VMCP_RUNLOG_ERR:` / `VMCP_CW:` / `VMCP_DIAG:` 这种语义化前缀不容易撞。
+
+### 测试
+
+- 373 → 373,全部依然绿。mock 字符串全量更新到新前缀。
+
 ## [0.3.9] — 2026-04-20
 
 ### 增强(现有工具扩能,不新建 MCP tool)

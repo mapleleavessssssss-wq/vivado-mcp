@@ -134,13 +134,13 @@ class TestGetCriticalWarnings:
 
         # 模拟 DRC BIVC-1 场景:place_design 失败,3 条 ERROR
         err_log = (
-            "VMCP_ERR:120|ERROR: [DRC BIVC-1] Bank IO standard Vcc: "
+            "VMCP_RUNLOG_ERR:120|ERROR: [DRC BIVC-1] Bank IO standard Vcc: "
             "Conflicting Vcc voltages in bank 14. [basys3.xdc:15]\n"
-            "VMCP_ERR:125|ERROR: [Vivado_Tcl 4-23] Error(s) found during DRC. "
+            "VMCP_RUNLOG_ERR:125|ERROR: [Vivado_Tcl 4-23] Error(s) found during DRC. "
             "Placer not run.\n"
-            "VMCP_ERR:130|ERROR: [Common 17-39] 'place_design' failed due to "
+            "VMCP_RUNLOG_ERR:130|ERROR: [Common 17-39] 'place_design' failed due to "
             "earlier errors.\n"
-            "VMCP_ERR_DONE"
+            "VMCP_RUNLOG_ERR_DONE"
         )
 
         session = AsyncMock()
@@ -171,8 +171,8 @@ class TestGetCriticalWarnings:
         from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
 
         err_log = (
-            "VMCP_ERR:100|ERROR: [DRC BIVC-1] Bank voltage conflict in bank 14.\n"
-            "VMCP_ERR_DONE"
+            "VMCP_RUNLOG_ERR:100|ERROR: [DRC BIVC-1] Bank voltage conflict in bank 14.\n"
+            "VMCP_RUNLOG_ERR_DONE"
         )
         cw_log = (
             "VMCP_CW:50|CRITICAL WARNING: [DRC NSTD-1] port uart_rxd has no IOSTANDARD.\n"
