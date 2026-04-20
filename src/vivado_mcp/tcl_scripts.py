@@ -13,6 +13,17 @@
 #  用于 _launch_and_wait 后快速诊断（<2s）
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+#  通用:列出项目 constrs_1 下所有 XDC 文件路径
+#  诊断工具多处共用,抽出避免重复
+# --------------------------------------------------------------------------- #
+
+LIST_PROJECT_XDC_FILES = (
+    'foreach __f [get_files -of_objects [get_filesets constrs_1] '
+    '-filter {FILE_TYPE == XDC}] { puts "VMCP_XDC_FILE:$__f" }'
+)
+
+
 COUNT_WARNINGS = """\
 set __run_dir [get_property DIRECTORY [get_runs {run_name}]]
 set __log "$__run_dir/runme.log"

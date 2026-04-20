@@ -164,13 +164,19 @@ class SessionManager:
         logger.info("所有 Vivado 会话已清理完毕。")
 
     def list_sessions(self) -> list[dict]:
-        """列出所有活跃会话的状态信息。"""
-        # 先清理死亡的会话
+        """列出所有会话的状态信息(含死会话,标记 is_alive=False)。
+
+        纯只读,不会清理死会话 —— 否则 AI 连续调 list → stop 时第二次会
+        拿到 "会话不存在" 的误导反馈。需要清理时显式调 prune_dead()。
+        """
+        return [s.status_dict() for s in self._sessions.values()]
+
+    def prune_dead(self) -> list[str]:
+        """清理已死亡的会话条目,返回被清理的 session_id 列表。"""
         dead = [
             sid for sid, s in self._sessions.items()
             if not s.is_alive
         ]
         for sid in dead:
             del self._sessions[sid]
-
-        return [s.status_dict() for s in self._sessions.values()]
+        return dead

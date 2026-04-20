@@ -35,7 +35,7 @@
           {
             "type": "command",
             "statusMessage": "iverilog-check",
-            "command": "python -c \"\nimport json, sys, shutil\nsys.stderr.reconfigure(encoding='utf-8')\ntry: data = json.load(sys.stdin)\nexcept Exception: sys.exit(0)\nfp = data.get('tool_input', {}).get('file_path') or data.get('tool_response', {}).get('filePath') or ''\nif not fp.lower().endswith(('.v','.sv')): sys.exit(0)\nif not shutil.which('iverilog') and not shutil.which('verilator'): sys.exit(0)\nfrom vivado_mcp.analysis.verilog_compile_check import compile_check, format_compile_report\nr = compile_check([fp], tool='auto', timeout=15.0)\nif r.errors:\n    sys.stderr.write('[iverilog-check hook] ' + format_compile_report(r) + chr(10))\n    sys.exit(2)\n\""
+            "command": "python -c \"\nimport json, sys\nsys.stderr.reconfigure(encoding='utf-8')\ntry: data = json.load(sys.stdin)\nexcept Exception: sys.exit(0)\nfp = data.get('tool_input', {}).get('file_path') or data.get('tool_response', {}).get('filePath') or ''\nif not fp.lower().endswith(('.v','.sv')): sys.exit(0)\nfrom vivado_mcp.analysis.verilog_compile_check import compile_check, format_compile_report\nr = compile_check([fp], tool='auto', timeout=15.0)\nif not r.tool_available: sys.exit(0)\nif r.errors:\n    sys.stderr.write('[iverilog-check hook] ' + format_compile_report(r) + chr(10))\n    sys.exit(2)\n\""
           }
         ]
       }

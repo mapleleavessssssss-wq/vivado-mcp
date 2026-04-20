@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.8] — 2026-04-20
+
+### 修复(Bug 修复包,8 项漏洞)
+
+- **B15 [P1] `iverilog-check` hook 重蹈 B14 覆辙** —— hook 脚本硬编码 `shutil.which('iverilog')` 判断工具存在,Windows+scoop 的 PATH snapshot 问题下永远返回 None,装了 iverilog 也永不触发。改为调 `compile_check(..., tool='auto').tool_available`,复用 0.3.5 的 scoop fallback。
+- **[P1] 7 处 `except Exception: pass` 静默吞错(违反 CLAUDE.md 1.4)** —— 最严重:`get_pre_commit_summary` 项目没打开时 4 次 pass 后 verdict 仍 `[READY]`,误导用户贴假摘要进 commit。现在:全部 `logger.warning` 记录真实原因;`pre_commit` 增加 `[DEGRADED]` verdict + 采样失败列表显示;`check_bitstream_readiness` 时序查询失败时把具体异常展示给用户;`generate_bitstream` 前置安全检查失败时 logger 记录并在后续流程保留降级标记。
+- **[P1] `generate_bitstream` 未同步 D5 Python 轮询架构** —— 仍用 Tcl `wait_on_run` 阻塞 Vivado event loop,GUI 模式下冻住界面且无进度反馈。重构为 `launch_runs` + Python 2s 轮询 STATUS/PROGRESS + `ctx.report_progress`,与 synthesis/implementation 对齐。
+- **[P2] `open_run` catch 不看 `__open_err`** —— 旧写法 `catch { open_run } __open_err` 后只看 Tcl 外层 is_error(永远 false),错误被吞致后续 `report_*` 在旧 design 上跑。改为 `if {[catch { open_run } __open_err]} { puts VMCP_OPEN_ERR:$__open_err }`,Python 侧 grep 并在 "already open" 之外的错误上告警。
+- **[P2] `program_device` 不校验 bitstream 路径** —— 用户传错路径要等到 `program_hw_devices` 才报 file not found,此时 hw_server/target 已连上留下脏状态。入口加 `os.path.isfile` + `.bit` 扩展名预检。
+- **[P3] `list_sessions` 偷偷删死会话** —— 违反"查询无副作用"原则,AI 链式调 `list → stop` 会拿到误导的"会话不存在"。拆出 `prune_dead()` 显式清理,`list_sessions` 纯只读。
+- **[P3] 临时 Tcl 脚本无 atexit 兜底** —— GUI 模式下 MCP server 被强杀时 `/tmp/tmp*.tcl` 堆积。新增全局 `_TMP_SCRIPTS` 集合 + `atexit.register` 清理钩子,正常 stop() 路径从集合移除避免重复 unlink。
+- **[P3] DRY:XDC 文件列表 Tcl 串重复 3 处** —— `diagnostic_tools.py` 里 `verify_io_placement_tool` / `xdc_lint` / `xdc_auto_fix` 都硬编码同一段 `foreach __f [get_files ... FILE_TYPE == XDC] ...`。抽 `LIST_PROJECT_XDC_FILES` 常量到 `tcl_scripts.py` + `_fetch_project_xdc_paths(session)` 共享函数。
+
+### 测试
+
+- **328 pass → 328 pass**:同步 `test_allows_with_force` 的 mock side_effect 到新的 launch+poll+bit_dir 三步调用序列。
+
+### 变更统计
+
+8 文件 / +284 / -103 行。无 API 破坏。
+
 ## [0.3.7] — 2026-04-18
 
 ### 文档

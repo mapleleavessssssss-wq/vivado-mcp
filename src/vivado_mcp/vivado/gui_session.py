@@ -14,9 +14,11 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import importlib.resources
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -30,6 +32,23 @@ _PORT_POOL_SIZE = 5
 
 # 默认最大响应大小（10MB）
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+
+# 进程退出兜底:记录所有临时 tcl 脚本,强杀 MCP 时也会被 atexit 清掉
+# 避免 /tmp/tmp*.tcl 堆积。正常路径 stop() 会主动 unlink 并从此集合移除。
+_TMP_SCRIPTS: set[str] = set()
+
+
+def _cleanup_tmp_scripts_atexit() -> None:
+    """atexit 钩子:清理遗留的临时 Tcl 脚本。"""
+    for path in list(_TMP_SCRIPTS):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    _TMP_SCRIPTS.clear()
+
+
+atexit.register(_cleanup_tmp_scripts_atexit)
 
 
 def _locate_server_script() -> Path:
@@ -127,6 +146,8 @@ class GuiSession(BaseSession):
                     tmp.write(f'source "{script_path.as_posix()}"\n')
                     tmp_script = tmp.name
                 self._tmp_script = tmp_script
+                # atexit 兜底:MCP 进程被强杀时仍会清理
+                _TMP_SCRIPTS.add(tmp_script)
 
                 self._proc = await asyncio.create_subprocess_exec(
                     self.vivado_path,
@@ -411,12 +432,13 @@ class GuiSession(BaseSession):
             except OSError as e:
                 logger.debug("清理 %s 失败: %s", pid_file, e)
 
-        # 步骤 5:清理临时脚本
+        # 步骤 5:清理临时脚本(正常路径,同时从 atexit 集合移除)
         if self._tmp_script:
             try:
                 os.unlink(self._tmp_script)
             except OSError:
                 pass
+            _TMP_SCRIPTS.discard(self._tmp_script)
             self._tmp_script = None
 
         self._state = SessionState.STOPPED
