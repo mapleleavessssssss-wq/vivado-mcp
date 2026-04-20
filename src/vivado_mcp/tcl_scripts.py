@@ -309,6 +309,42 @@ if {{$__run eq ""}} {{
 """
 
 
+# --------------------------------------------------------------------------- #
+#  查询违例路径详情 (setup top 10 + hold top 5)
+#  用途: 在 report_timing_summary 显示时序 FAIL 时,追加给出哪些路径违例、可以怎么修
+#
+#  实现细节:
+#  - 不再自己尝试判 WNS/WHS — 调用方(Python 侧 get_timing_report)发现 timing_met
+#    为 False 时才跑本脚本,避免浪费 10-30s 在健康工程上
+#  - 输出用 VMCP_PATH_START / VMCP_PATH_END 分隔每段 report_timing 结果,
+#    Python 侧按块解析
+#  - report_timing 的 -return_string 会输出一大段原始文本(和 Slack 块格式相同),
+#    所以这里把类型标签在块外面打,正文透传
+# --------------------------------------------------------------------------- #
+
+REPORT_VIOLATING_PATHS = """\
+# Setup top 10
+puts "VMCP_PATH_START:type=setup"
+if {[catch {report_timing -delay_type max -max_paths 10 -return_string} __setup_out]} {
+    puts "VMCP_PATH_ERROR:setup|$__setup_out"
+} else {
+    puts $__setup_out
+}
+puts "VMCP_PATH_END:type=setup"
+
+# Hold top 5
+puts "VMCP_PATH_START:type=hold"
+if {[catch {report_timing -delay_type min -max_paths 5 -return_string} __hold_out]} {
+    puts "VMCP_PATH_ERROR:hold|$__hold_out"
+} else {
+    puts $__hold_out
+}
+puts "VMCP_PATH_END:type=hold"
+
+puts "VMCP_PATH_DONE"
+"""
+
+
 CHECK_PRE_BITSTREAM = """\
 set __impl [get_runs {impl_run}]
 set __status [get_property STATUS $__impl]

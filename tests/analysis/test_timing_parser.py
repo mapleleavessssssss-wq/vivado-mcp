@@ -18,10 +18,13 @@ import pytest
 from vivado_mcp.analysis.timing_parser import (
     TimingReport,
     TimingSummary,
+    ViolatingPath,
+    analyze_path_pattern,
     derive_stage_warning,
     format_timing_report,
     parse_design_stage,
     parse_timing_summary,
+    parse_violating_paths,
 )
 
 # ====================================================================== #
@@ -30,6 +33,7 @@ from vivado_mcp.analysis.timing_parser import (
 
 _FIXTURE_DIR = Path(__file__).parent.parent / "fixtures"
 _SAMPLE_TIMING = _FIXTURE_DIR / "sample_report_timing.txt"
+_SAMPLE_VIOLATING = _FIXTURE_DIR / "sample_violating_paths.txt"
 
 
 @pytest.fixture
@@ -362,3 +366,255 @@ class TestFormatWithStage:
         # 关键:用户必须看到警告
         assert "[!]" in text
         assert "impl_1 失败" in text
+
+
+# ====================================================================== #
+#  违例路径解析与模式嗅探
+# ====================================================================== #
+
+
+@pytest.fixture
+def violating_text() -> str:
+    """读取 sample_violating_paths.txt fixture。"""
+    return _SAMPLE_VIOLATING.read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def violating_paths(violating_text: str) -> list[ViolatingPath]:
+    """解析 fixture 得到的违例路径列表(已按 slack 升序)。"""
+    return parse_violating_paths(violating_text)
+
+
+class TestViolatingPath:
+    """parse_violating_paths 解析测试。
+
+    fixture 含 5 条违例路径(4 setup + 1 hold),每条覆盖一种典型模式。
+    """
+
+    def test_parse_returns_five_paths(self, violating_paths: list[ViolatingPath]):
+        """4 setup + 1 hold 共 5 条都能解析出来。"""
+        assert len(violating_paths) == 5
+
+    def test_parse_sorted_by_slack_ascending(self, violating_paths: list[ViolatingPath]):
+        """按 slack 升序:最差(最负)在前。"""
+        slacks = [p.slack for p in violating_paths]
+        assert slacks == sorted(slacks)
+        assert slacks[0] == pytest.approx(-1.234)
+
+    def test_parse_setup_path_fields(self, violating_paths: list[ViolatingPath]):
+        """第一条 setup 路径字段完整解析。"""
+        p = violating_paths[0]  # CDC 路径
+        assert p.type == "setup"
+        assert p.slack == pytest.approx(-1.234)
+        assert "result_reg[31]/C" in p.startpoint
+        assert "wr_data_reg[31]/D" in p.endpoint
+        assert p.start_clock == "sys_clk_100mhz"
+        assert p.end_clock == "dma_clk_200mhz"
+        assert p.logic_delay == pytest.approx(1.500)
+        assert p.route_delay == pytest.approx(4.420)
+        assert p.levels == 4
+        assert p.clock_skew == pytest.approx(-0.314)
+
+    def test_parse_hold_path(self, violating_paths: list[ViolatingPath]):
+        """hold 违例路径被识别为 type='hold'。"""
+        hold_paths = [p for p in violating_paths if p.type == "hold"]
+        assert len(hold_paths) == 1
+        h = hold_paths[0]
+        assert h.slack == pytest.approx(-0.080)
+        assert h.clock_skew == pytest.approx(-0.500)
+
+    def test_parse_empty_input(self):
+        """空输入不抛异常。"""
+        assert parse_violating_paths("") == []
+
+    def test_parse_ignores_met_paths(self):
+        """即使输出里含 Slack (MET),也不应出现在违例列表里。"""
+        raw = """\
+VMCP_PATH_START:type=setup
+Slack (MET) :             0.500ns  (required time - arrival time)
+  Source:                 reg_a/C
+                            (rising edge-triggered cell FDRE clocked by clk1)
+  Destination:            reg_b/D
+                            (rising edge-triggered cell FDRE clocked by clk1)
+  Data Path Delay:        2.000ns  (logic 0.500ns (25.0%)  route 1.500ns (75.0%))
+  Logic Levels:           2  (LUT2=1)
+  Clock Path Skew:        0.000ns (DCD - SCD + CPR)
+VMCP_PATH_END:type=setup
+VMCP_PATH_DONE
+"""
+        assert parse_violating_paths(raw) == []
+
+    def test_parse_handles_tcl_error(self):
+        """Tcl 层报错(VMCP_PATH_ERROR)不会抛异常,返回空列表。"""
+        raw = (
+            "VMCP_PATH_START:type=setup\n"
+            "VMCP_PATH_ERROR:setup|no_design_loaded\n"
+            "VMCP_PATH_END:type=setup\n"
+            "VMCP_PATH_DONE\n"
+        )
+        assert parse_violating_paths(raw) == []
+
+
+class TestAnalyzePath:
+    """analyze_path_pattern 模式嗅探测试。
+
+    用 fixture 中 5 条路径分别验证 CDC / LONG_COMBO / IO_UNREGISTERED /
+    HIGH_FANOUT / UNKNOWN 这 5 种 tag 都能命中,并且中文建议具体(含路径名)。
+    """
+
+    def _by_slack(
+        self, paths: list[ViolatingPath], slack: float
+    ) -> ViolatingPath:
+        """按 slack 近似匹配取路径(fixture 里每条 slack 唯一)。"""
+        for p in paths:
+            if abs(p.slack - slack) < 1e-6:
+                return p
+        raise AssertionError(f"fixture 中未找到 slack={slack} 的路径")
+
+    def test_cdc_detected(self, violating_paths: list[ViolatingPath]):
+        """路径 1: start_clock != end_clock → CDC。"""
+        p = self._by_slack(violating_paths, -1.234)
+        tag, advice = analyze_path_pattern(p)
+        assert tag == "CDC"
+        # 建议要具体:提到两个时钟名和 set_false_path
+        assert "sys_clk_100mhz" in advice
+        assert "dma_clk_200mhz" in advice
+        assert "set_false_path" in advice or "同步器" in advice
+
+    def test_long_combo_detected(self, violating_paths: list[ViolatingPath]):
+        """路径 2: levels=18 > 15,logic >= 2*route → LONG_COMBO。"""
+        p = self._by_slack(violating_paths, -0.876)
+        tag, advice = analyze_path_pattern(p)
+        assert tag == "LONG_COMBO"
+        # 建议要具体:提到起点/终点和"流水线"
+        assert "流水线" in advice
+        assert "state_reg" in advice or "opcode_reg" in advice
+
+    def test_io_unregistered_detected(self, violating_paths: list[ViolatingPath]):
+        """路径 3: source 是顶层 port(data_in[7]) → IO_UNREGISTERED。"""
+        p = self._by_slack(violating_paths, -0.512)
+        tag, advice = analyze_path_pattern(p)
+        assert tag == "IO_UNREGISTERED"
+        assert "data_in[7]" in advice
+        assert "IOB" in advice
+
+    def test_high_fanout_detected(self, violating_paths: list[ViolatingPath]):
+        """路径 4: route=8.9 >= 3*logic(1.2) → HIGH_FANOUT。"""
+        p = self._by_slack(violating_paths, -0.300)
+        tag, advice = analyze_path_pattern(p)
+        assert tag == "HIGH_FANOUT"
+        # 建议要具体:MAX_FANOUT 或 report_high_fanout_nets
+        assert "MAX_FANOUT" in advice or "fanout" in advice.lower()
+
+    def test_unknown_fallback(self, violating_paths: list[ViolatingPath]):
+        """路径 5(hold, slack=-0.080): 不命中任何规则 → UNKNOWN。"""
+        p = self._by_slack(violating_paths, -0.080)
+        tag, advice = analyze_path_pattern(p)
+        assert tag == "UNKNOWN"
+        # 兜底建议应该告诉用户怎么手动继续诊断
+        assert "report_timing" in advice
+
+    def test_cdc_priority_over_other_patterns(self):
+        """CDC 优先级最高:即使 levels 巨大也先出 CDC tag。"""
+        p = ViolatingPath(
+            slack=-2.0,
+            startpoint="src_clk_domain/reg_a/C",
+            endpoint="dst_clk_domain/reg_b/D",
+            start_clock="clk_a",
+            end_clock="clk_b",
+            logic_delay=5.0,
+            route_delay=1.0,
+            clock_skew=0.0,
+            levels=20,  # LONG_COMBO 级别,但 CDC 优先
+            type="setup",
+        )
+        tag, _ = analyze_path_pattern(p)
+        assert tag == "CDC"
+
+
+class TestFormatViolatingPaths:
+    """format_timing_report 对 violating_paths 字段的格式化。"""
+
+    def _make_failing_report(
+        self, paths: list[ViolatingPath]
+    ) -> TimingReport:
+        summary = TimingSummary(
+            wns=-1.234, tns=-5.0, whs=-0.080, ths=-0.200,
+            failing_endpoints=5, total_endpoints=200, timing_met=False,
+        )
+        return TimingReport(summary=summary, paths=[], violating_paths=paths)
+
+    def test_format_includes_violating_section(
+        self, violating_paths: list[ViolatingPath]
+    ):
+        """timing_met=False 且有违例路径 → 输出含"违例路径 Top N"段。"""
+        r = self._make_failing_report(violating_paths)
+        text = format_timing_report(r)
+        assert "违例路径" in text
+        assert f"Top {len(violating_paths)}" in text
+
+    def test_format_shows_pattern_tag(
+        self, violating_paths: list[ViolatingPath]
+    ):
+        """格式化输出带 [CDC] / [IO_UNREGISTERED] 等 tag。"""
+        r = self._make_failing_report(violating_paths)
+        text = format_timing_report(r)
+        assert "[CDC]" in text
+        assert "[LONG_COMBO]" in text
+        assert "[IO_UNREGISTERED]" in text
+        assert "[HIGH_FANOUT]" in text
+
+    def test_format_shows_cdc_hint(
+        self, violating_paths: list[ViolatingPath]
+    ):
+        """CDC 路径额外显示 [CDC: src_clk→dst_clk] 标注。"""
+        r = self._make_failing_report(violating_paths)
+        text = format_timing_report(r)
+        assert "sys_clk_100mhz" in text
+        assert "dma_clk_200mhz" in text
+        # 箭头形式的 CDC 提示
+        assert "→" in text or "CDC" in text
+
+    def test_format_shows_advice(
+        self, violating_paths: list[ViolatingPath]
+    ):
+        """每条违例都附中文建议。"""
+        r = self._make_failing_report(violating_paths)
+        text = format_timing_report(r)
+        assert "建议:" in text
+
+    def test_format_shows_delay_breakdown(
+        self, violating_paths: list[ViolatingPath]
+    ):
+        """格式化输出含 logic/route/skew/levels 分解。"""
+        r = self._make_failing_report(violating_paths)
+        text = format_timing_report(r)
+        assert "logic" in text
+        assert "route" in text
+        assert "levels=" in text
+
+    def test_format_no_section_when_no_violating_paths(self):
+        """timing_met=True 时不追加违例路径段。"""
+        summary = TimingSummary(
+            wns=0.5, tns=0.0, whs=0.1, ths=0.0,
+            failing_endpoints=0, total_endpoints=100, timing_met=True,
+        )
+        r = TimingReport(summary=summary, paths=[], violating_paths=[])
+        text = format_timing_report(r)
+        assert "违例路径 Top" not in text
+
+    def test_format_shows_error_when_query_failed(self):
+        """timing_met=False 但查询违例路径失败时,显示错误提示。"""
+        summary = TimingSummary(
+            wns=-0.5, tns=-1.0, whs=0.1, ths=0.0,
+            failing_endpoints=3, total_endpoints=100, timing_met=False,
+        )
+        r = TimingReport(
+            summary=summary,
+            paths=[],
+            violating_paths=[],
+            violating_paths_error="TimeoutError: 60s",
+        )
+        text = format_timing_report(r)
+        assert "违例路径查询失败" in text
+        assert "TimeoutError" in text
