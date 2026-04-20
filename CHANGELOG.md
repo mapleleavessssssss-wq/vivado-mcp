@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.7] — 2026-04-18
+
+### 文档
+
+- README 同步到 0.3.6 代码实况:25 工具 + 5 Hook 完整列表、"新手引导 & 工程摸底"新分类、`iverilog-check` hook、`get_critical_warnings` 19 种已知 ID 等。纯文档发布,让 PyPI 页面的 README 与 GitHub 一致。
+
 ## [0.3.6] — 2026-04-18
 
 ### 修复(B14 第二层)
