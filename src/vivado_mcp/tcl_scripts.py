@@ -74,8 +74,13 @@ if {{[file exists $__log]}} {{
 
 # --------------------------------------------------------------------------- #
 #  提取 ERROR 详情：逐行扫描 runme.log，只输出 ERROR: 前缀行
-#  格式：VMCP_ERR:行号|原始文本
+#  格式：VMCP_RUNLOG_ERR:行号|原始文本
 #  用途：补齐 get_critical_warnings 的严重级别盲区（ERROR > CW）
+#
+#  注意:前缀用 ``VMCP_RUNLOG_ERR:`` 而非 ``VMCP_ERR:``,避免和内部 sentinel
+#  协议的 ``VMCP_ERR: $__out``(见 tcl_utils.py wrap_command)命名冲突 ——
+#  SubprocessSession 会对 ``VMCP_ERR:`` 开头的行做前缀剥离,我们应用层输出
+#  的 ERROR 详情会被吞掉。0.3.10 field test 发现。
 # --------------------------------------------------------------------------- #
 
 EXTRACT_ERRORS = """\
@@ -87,13 +92,13 @@ if {{[file exists $__log]}} {{
     while {{[gets $__fp __line] >= 0}} {{
         incr __ln
         if {{[string match "ERROR:*" $__line]}} {{
-            puts "VMCP_ERR:$__ln|$__line"
+            puts "VMCP_RUNLOG_ERR:$__ln|$__line"
         }}
     }}
     close $__fp
-    puts "VMCP_ERR_DONE"
+    puts "VMCP_RUNLOG_ERR_DONE"
 }} else {{
-    puts "VMCP_ERR_ERROR:runme.log not found at $__log"
+    puts "VMCP_RUNLOG_ERR_MISSING:runme.log not found at $__log"
 }}
 """
 
