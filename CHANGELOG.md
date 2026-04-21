@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.11] — 2026-04-21
+
+### 文档(纯 docs 发布)
+
+- **README 重组使用示例段** —— 删掉散的 5 个小段(基本流程 / 诊断 / 验证引脚 / XCI / 任意 Tcl),换成一条贯穿的实机调试闭环故事:`get_critical_warnings` 看 ERROR 详情 → `xdc_auto_fix` 修 XDC → `compare_with_last` 差分验证修复生效 → 时序违例时 `get_timing_report` 自动给 HIGH_FANOUT + MAX_FANOUT 建议 → 烧板。所有输出片段都来自 Vivado 2019.1 实机(basys3_uart + xdma_bd_test)。
+- **头部「0.3 系列新增」置顶 0.3.9 两条**:时序违例自动定位(5 种模式 + Tcl 修复命令)、CW 修复效果差分可视化。0.3.6 之后的两次迭代在 README 头部终于可见。
+- **工具表补全**:`get_timing_report` / `get_critical_warnings` 两行描述补上 0.3.9 关键字。
+- 同步 PyPI README,让包详情页跟上 GitHub。
+
+### 无代码改动
+
+- 373 tests 不变,无 API 变化,安全升级。
+
 ## [0.3.10] — 2026-04-20
 
 ### 修复(field test 发现的老 bug)
