@@ -124,19 +124,29 @@ class TestSnapshotRoundTrip:
         assert len(loaded_cws) == 1
 
     def test_readonly_project_dir_falls_back(self, tmp_path, monkeypatch):
-        """项目目录不可写时自动降级到 fallback。"""
+        """项目目录不可写时自动降级到 fallback。
+
+        跨平台一致:monkeypatch ``Path.mkdir`` 只对项目目录下的 ``.vmcp`` 抛 OSError,
+        fallback 目录下的 mkdir 走原行为。原版用 ``Z:/`` 假盘符,Linux 下 ``Z:`` 是
+        合法目录名能直接创建,fallback 不触发(0.3.9 子代理写测试时只考虑了 Windows)。
+        """
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        # 给一个根本不存在(且父级不可创建)的项目目录
-        # Windows 上"绝对不可写"比较难造,用一个非法盘符路径代替
-        bad_project = "Z:/nonexistent/path/that/cannot/exist"
+        bad_project = str(tmp_path / "readonly_project")
+        real_mkdir = Path.mkdir
+
+        def fake_mkdir(self, *args, **kwargs):
+            if "readonly_project" in str(self) and ".vmcp" in str(self):
+                raise OSError("simulated read-only project dir")
+            return real_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", fake_mkdir)
 
         cws = [_cw("Vivado 12-1411")]
         report = _empty_report(cw_count=1)
 
         path = snapshot_cw(report, cws, "impl_1", bad_project)
 
-        # 应该落在 fallback 目录下
         expected_dir = tmp_path / ".claude" / "vivado-mcp"
         assert path.parent == expected_dir
         assert path.exists()
