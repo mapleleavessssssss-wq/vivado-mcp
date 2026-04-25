@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.12] — 2026-04-25
+
+### 修复(CI 跨平台)
+
+- **`test_readonly_project_dir_falls_back` 在 Linux runner 上挂掉,导致 0.3.9/0.3.10/0.3.11 三个 tag 的 publish.yml 全部失败,PyPI 自 0.3.8 起停滞** —— 子代理在 0.3.9 写测试时用 `Z:/nonexistent/...` 假盘符模拟"项目目录不可写",本地 Windows 因为没 Z 盘所以 fallback 触发、断言通过;但 GitHub runner 是 Linux,`Z:` 不是盘符只是合法目录名,Linux 把它当相对路径直接 mkdir 成功,fallback 没触发 → AssertionError → test job 红 → build/publish 跳过(`needs: [lint, test]`) → PyPI 没收到包。
+  - **修复**:`monkeypatch Path.mkdir`,只对项目目录下 `.vmcp` 抛 OSError,fallback 目录走原行为。跨平台一致,不再依赖盘符假设。
+  - **副作用**:这一改也补上 0.3.9/0.3.10/0.3.11 三个 tag 的 PyPI 发布 —— 0.3.12 一次性把 README 重组、违例路径建议、CW 差分、B16 修复都带上 PyPI。
+
+### 经验教训
+
+- 子代理写跨平台测试要主动想"在 Linux 上这条断言会怎样"。`Z:/` 看似"明显非法"其实只对 Windows 成立。
+- WebFetch 看 GitHub Actions 页面拿不到 job 级别状态,顶层"success/failure"图标会误导(本案它把 failed 报成 success);要诊断 publish 失败必须人工进 run 详情页或用 gh CLI。
+
 ## [0.3.11] — 2026-04-21
 
 ### 文档(纯 docs 发布)
