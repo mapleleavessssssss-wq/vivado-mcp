@@ -359,6 +359,49 @@ pytest
 ruff check src/ tests/
 ```
 
+## 反馈与 Bug 提交
+
+### 通过 Code Agent 提交 Bug
+
+遇到问题?把下面的 prompt 复制到你的 agent(Claude Code、Cursor、Codex 等)中,它会自动收集环境信息并创建规范的 issue:
+
+<details>
+<summary>点击展开</summary>
+
+````
+我在使用 vivado-mcp (https://github.com/mapleleavessssssss-wq/vivado-mcp) 时遇到了问题。
+
+请帮我提交一个 GitHub issue,按以下步骤操作:
+
+1. 收集我的环境信息:
+   - 操作系统: 运行 `[System.Environment]::OSVersion.VersionString`(PowerShell)或 `systeminfo | findstr /B /C:"OS"`(cmd)
+   - Python 版本: 运行 `python --version`
+   - vivado-mcp 版本: 运行 `vivado-mcp version`(或 `pip show vivado-mcp`)
+   - Vivado 版本: 运行 `vivado -version`(若 vivado 在 PATH 中);否则从我项目的 .xpr 文件里抓 Project 标签
+   - 当前 Vivado 进程: PowerShell 跑 `Get-Process | Where-Object { $_.ProcessName -like "*vivado*" }`
+   - MCP 客户端类型(Claude Code / Cursor / Codex 等)及版本
+   - 我使用的 Vivado 模式(`gui` / `tcl` / `attach`)
+
+2. 询问我:
+   - 期望的行为是什么
+   - 实际发生了什么
+   - 复现步骤(从 `start_session` 开始的完整工具调用序列)
+   - 相关的工具输出 / 错误日志(优先 `get_critical_warnings` 或 `get_run_progress` 的输出)
+
+3. 使用 `gh issue create` 在 GitHub 上创建 issue,格式如下:
+   - 标题: 简洁的问题概述,前缀建议 `[bug]` / `[feature]` / `[docs]`
+   - 正文包含以下部分: **环境信息**、**问题描述**、**复现步骤**、**期望行为 vs 实际行为**、**相关日志**
+   - 如果是 bug 请添加 `bug` 标签;如果涉及特定工具(如 `get_critical_warnings`),在标题里点出来
+
+仓库: mapleleavessssssss-wq/vivado-mcp
+````
+
+</details>
+
+### 直接提 issue
+
+也可以直接到 [GitHub Issues](https://github.com/mapleleavessssssss-wq/vivado-mcp/issues) 提交 —— 麻烦带上 `vivado-mcp version`、Vivado 版本、复现步骤。
+
 ## 文档
 
 - [CHANGELOG](CHANGELOG.md) — 版本变更历史
