@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.13] — 2026-05-02
+
+### 修复
+
+- **`__version__` 自 0.2.0 起一直停在 "0.2.0",`vivado-mcp version` CLI 长期打印错版本** —— `src/vivado_mcp/__init__.py` 硬编码 `__version__ = "0.2.0"` 从未跟随 pyproject.toml 更新。直接后果:用户照 README 「通过 Code Agent 提交 Bug」段跑 `vivado-mcp version` 上报版本号 → 全部报 "0.2.0",issue triage 看到老版本号会找错方向。
+  - **修复**:`__init__.py` 改用 `importlib.metadata.version("vivado-mcp")` 单一来源,wheel 元数据改了 `__version__` 自动跟。包没装(直接跑源码)时兜底为 `"unknown"`。
+  - **回归锁定**:新增 `tests/test_version.py`,断言 `__version__` 与 `pyproject.toml` 严格一致 + 格式必须是 `\d+\.\d+\.\d+`。再忘记同步会立刻 CI 红灯。
+
+### 发布链路
+
+- **publish.yml 加 `verify` job,在 PyPI 真出现新版本前不许 workflow 绿** —— 0.3.9/10/11 三个 tag 因 `test` job 跨平台问题静默失败到 0.3.12 才发现(`needs: [lint, test]` 链断了 publish 跳过,但顶层 workflow 状态被 GitHub Actions 报成 success)。新 verify job 在 publish 后回打 `https://pypi.org/pypi/vivado-mcp/json`,轮询 5 分钟拿不到新版本就红灯,彻底闭环。
+
+### 测试
+
+- **373 → 375**(+2):新增 `test_version.py` 两条断言。
+
 ## [0.3.12] — 2026-04-25
 
 ### 修复(CI 跨平台)
