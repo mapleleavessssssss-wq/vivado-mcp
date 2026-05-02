@@ -55,17 +55,15 @@ usage_statistics_webtalk.*
 # Vivado GUI TCP server 运行时 PID/Port 快照
 vivado_pid*.str
 
-# Claude Code
-# 项目共享配置 (.claude/settings.json、.claude/*.md) 会 commit 进来供协作者自动拿到
-# 忽略的只是个人数据
-.claude/settings.local.json
-.claude/history/
-.claude/sessions/
-.claude/projects/
-.claude/tool-results/
-# 本地 MCP 客户端注册,不同机器的入口可能不一样,各自生成
+# 本地编辑器/工具配置目录(各机器自定义,不入库)
+.claude/
+.trellis/
 .mcp.json
+AGENTS.md
 
 # 内部文档
 .spec-workflow/
 vivado_mcp_requirements.md
+
+# 本地启动脚本(含个人 API token,各自维护)
+claude-start.bat
