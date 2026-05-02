@@ -1,0 +1,89 @@
+name: Bug 反馈
+description: 报告一个 vivado-mcp 的 bug
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈!请尽量补全下方信息,**带 Vivado 实机日志的 issue 修复速度通常 >5 倍**。
+        如果你在用 Code Agent (Claude Code / Cursor / Cline 等),可以直接把这个模板贴给它,让它帮你填。
+
+  - type: input
+    id: version
+    attributes:
+      label: vivado-mcp 版本
+      description: 在终端跑 `vivado-mcp version` 拿到的输出。**不要凭印象填**(0.3.13 起这个命令才会返回正确版本)。
+      placeholder: "例如:0.3.13"
+    validations:
+      required: true
+
+  - type: input
+    id: vivado_version
+    attributes:
+      label: Vivado 版本
+      placeholder: "例如:2019.1 / 2023.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows 10
+        - Windows 11
+        - Linux (Ubuntu)
+        - Linux (其他发行版)
+        - macOS (不官方支持,仅记录)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: session_mode
+    attributes:
+      label: Session 模式
+      description: 你是怎么启动 Vivado 的?
+      options:
+        - subprocess(无头,默认)
+        - GUI attach(图形界面)
+        - 不确定 / 都试过
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 越具体越好。最理想是给一段最小可复现的 MCP 工具调用序列或 Tcl 命令。
+      placeholder: |
+        1. start_session 启动项目 X
+        2. 调用 run_synthesis
+        3. 调用 get_critical_warnings
+        4. 报错:...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      placeholder: 应该返回 ... / 应该完成 ...
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为(贴日志/报错)
+      description: 完整错误堆栈或 Vivado 日志片段。多行日志请用代码块包裹。
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息(可选)
+      description: |
+        - 是否能稳定复现?
+        - 之前哪个版本能用?
+        - 是否走了 critical_warnings / xdc / timing 哪条路径?

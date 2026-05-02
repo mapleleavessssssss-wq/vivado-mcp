@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 问题讨论 / 经验分享
+    url: https://github.com/mapleleavessssssss-wq/vivado-mcp/discussions
+    about: 不是 bug 也不是功能建议?用 Discussions 聊。

@@ -1,0 +1,41 @@
+name: 功能建议
+description: 提一个新功能或改进想法
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提建议前请先看一下 README 顶部的"少即是多"哲学:
+        - 已经能用 `run_tcl` 完成的事情,基本不会再加新 facade 工具
+        - 优先做"减少用户心智负担"的改进(更好的报错、更清晰的报告、自动诊断扩展)
+        - 实机踩到的 bug 模式 / CW 编号 / 时序违例新模式,我们最欢迎
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到了什么场景?
+      description: 描述具体问题,**不要直接说"加个 X 工具"**,先说你想达成什么。
+      placeholder: 我在用 Vivado 做 ... 时,发现 ... 很麻烦,因为 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: 你期望的解决方式
+      description: 可以是新工具、改进现有工具、扩充 CW 知识库、加 hook 等等。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 现有工具能不能凑合?
+      description: 试过 `run_tcl` / `safe_tcl` / 其他工具吗?为什么不够?
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充
+      description: 参考资料 / 类似 EDA 工具的做法 / 实机数据等
