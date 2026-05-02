@@ -65,3 +65,29 @@ jobs:
           path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  # 发布完成后回打 PyPI JSON API 校验:
+  # 0.3.9/10/11 三个 tag 因 publish 链路静默失败,
+  # 直到 0.3.12 才修。从此让 PyPI 没真出现新版本时 workflow 红灯。
+  verify:
+    name: Verify PyPI publication
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+      - name: Wait + poll PyPI JSON API
+        run: |
+          tag="${{ steps.ver.outputs.version }}"
+          for i in $(seq 1 10); do
+            got=$(curl -fsSL "https://pypi.org/pypi/vivado-mcp/json" | jq -r '.info.version')
+            echo "Attempt $i: PyPI reports $got, expected $tag"
+            if [ "$got" = "$tag" ]; then
+              echo "PyPI refreshed to $tag"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "PyPI did not update to $tag within 5 minutes"
+          exit 1
