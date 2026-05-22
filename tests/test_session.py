@@ -102,8 +102,45 @@ class TestWinCurdirPolicyCheck:
         monkeypatch.setattr(session_tools.sys, "platform", "linux")
         assert session_tools._check_win_curdir_policy() == ""
 
-    def test_windows_policy_disabled_returns_empty(self, monkeypatch):
-        """注册表都没值 → 默认 = 不警告(避免老 Win 误报)。"""
+    def _mock_no_registry(self, monkeypatch):
+        """两处注册表都 FileNotFoundError(无显式键)。"""
+        import sys
+
+        if sys.platform != "win32":
+            import pytest
+            pytest.skip("Windows only")
+        import winreg
+
+        def fake_open(root, subkey, *a, **kw):
+            raise FileNotFoundError("simulated empty registry")
+
+        monkeypatch.setattr(winreg, "OpenKey", fake_open)
+
+    def test_no_registry_old_win_returns_empty(self, monkeypatch):
+        """注册表无值 + 老 Win(build < 26100) → 不警告(默认 0)。"""
+        from vivado_mcp.tools import session_tools
+
+        self._mock_no_registry(monkeypatch)
+        monkeypatch.setattr(
+            session_tools, "_is_win11_24h2_or_newer", lambda: False
+        )
+        assert session_tools._check_win_curdir_policy() == ""
+
+    def test_no_registry_win11_24h2_returns_warning(self, monkeypatch):
+        """注册表无值 + Win 11 24H2+ → 警告(默认 1,0.3.16 实测漏报的修复)。"""
+        from vivado_mcp.tools import session_tools
+
+        self._mock_no_registry(monkeypatch)
+        monkeypatch.setattr(
+            session_tools, "_is_win11_24h2_or_newer", lambda: True
+        )
+        warn = session_tools._check_win_curdir_policy()
+        assert "24H2" in warn
+        assert "reg add" in warn
+        assert "compile.bat" in warn
+
+    def test_explicit_disabled_returns_empty(self, monkeypatch):
+        """HKCU 显式 = 0 → 不警告(用户已 opt-out,根治命令的效果)。"""
         import sys
 
         if sys.platform != "win32":
@@ -113,10 +150,21 @@ class TestWinCurdirPolicyCheck:
 
         from vivado_mcp.tools import session_tools
 
-        def fake_open(root, subkey, *a, **kw):
-            raise FileNotFoundError("simulated empty registry")
+        class FakeKey:
+            def __enter__(self):
+                return self
 
-        monkeypatch.setattr(winreg, "OpenKey", fake_open)
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(winreg, "OpenKey", lambda *a, **kw: FakeKey())
+        monkeypatch.setattr(
+            winreg, "QueryValueEx", lambda k, n: (0, winreg.REG_DWORD)
+        )
+        # 即使在 24H2 上,显式 = 0 也不警告
+        monkeypatch.setattr(
+            session_tools, "_is_win11_24h2_or_newer", lambda: True
+        )
         assert session_tools._check_win_curdir_policy() == ""
 
     def test_windows_policy_enabled_returns_warning(self, monkeypatch):

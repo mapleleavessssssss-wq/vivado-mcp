@@ -12,6 +12,23 @@ from vivado_mcp.server import _get_manager, mcp
 logger = logging.getLogger(__name__)
 
 
+_WIN11_24H2_BUILD = 26100  # Win 11 24H2 起,NoDefaultCurrentDirectoryInExePath 默认 = 1
+
+
+def _is_win11_24h2_or_newer() -> bool:
+    """是否 Win 11 24H2 及更新(build >= 26100)。
+
+    24H2 起微软把 ``NoDefaultCurrentDirectoryInExePath`` 默认值从 0 改成 1,即使
+    注册表里没显式写键,行为也按 1 走。识别这条边界,无键时按版本判默认。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        return sys.getwindowsversion().build >= _WIN11_24H2_BUILD
+    except Exception:
+        return False
+
+
 def _check_win_curdir_policy() -> str:
     """检测 Windows ``NoDefaultCurrentDirectoryInExePath`` 安全策略。
 
@@ -20,10 +37,13 @@ def _check_win_curdir_policy() -> str:
     spawn .bat 不传完整路径,直接受此策略 block,launch_simulation 全挂(0.3.16
     实战实测确认)。
 
-    本函数 **只读** 注册表,**不改**。检测到 =1 时返回警告 + 给用户根治命令。
-    非 Windows 直接返回空串。
+    本函数 **只读** 注册表,**不改**。决策:
 
-    检测位置:HKCU\\Environment 和 HKLM\\SYSTEM\\...\\Environment(任一 =1 即开)。
+    1. HKCU/HKLM 任一显式 = 1 → 警告(用户/管理员显式开启)
+    2. HKCU 显式 = 0 → 不警告(用户已 opt-out,根治命令的效果)
+    3. 两处都无值 + Win 11 24H2+ → 警告(微软默认改成开,无键 = 开)
+    4. 两处都无值 + 老 Win → 不警告(老系统默认 0)
+    5. 非 Windows → 不警告
     """
     if sys.platform != "win32":
         return ""
@@ -42,26 +62,36 @@ def _check_win_curdir_policy() -> str:
         ),
     ]
 
-    enabled_at: list[str] = []
+    explicit_enabled_at: list[str] = []
+    explicit_disabled = False
     for root, subkey, label in locations:
         try:
             with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as k:
                 v, _ = winreg.QueryValueEx(k, "NoDefaultCurrentDirectoryInExePath")
-                if int(v) == 1:
-                    enabled_at.append(label)
+                iv = int(v)
+                if iv == 1:
+                    explicit_enabled_at.append(label)
+                elif iv == 0:
+                    explicit_disabled = True
         except FileNotFoundError:
-            # 值不存在 = 默认值(Win 11 24H2 默认 1,但注册表里没显式写),
-            # 这里保守判定:没显式写 → 不警告(避免对老 Win 误报)
+            # 值不存在 → 由 fallthrough 逻辑根据 Win 版本判默认
             pass
         except OSError as e:
             logger.debug("读注册表失败 %s\\%s: %s", label, subkey, e)
 
-    if not enabled_at:
+    if explicit_enabled_at:
+        source = f"({' + '.join(explicit_enabled_at)} = 1)"
+    elif explicit_disabled:
+        # 用户已显式关闭,不警告(根治命令已生效)
+        return ""
+    elif _is_win11_24h2_or_newer():
+        source = "(Win 11 24H2+ 默认开启,注册表未显式覆盖)"
+    else:
         return ""
 
     return (
-        "\n⚠  警告:Windows NoDefaultCurrentDirectoryInExePath = 1"
-        f"({' + '.join(enabled_at)})。"
+        "\n⚠  警告:Windows NoDefaultCurrentDirectoryInExePath 策略已开启 "
+        f"{source}。"
         "\n   Vivado 2019.1 spawn compile.bat 时不带路径,本策略下会报"
         "'compile.bat 不是内部或外部命令',launch_simulation 全挂(0.3.16 实测)。"
         "\n   根治命令(用户级,不需要管理员,只影响你自己,下次登录生效):"

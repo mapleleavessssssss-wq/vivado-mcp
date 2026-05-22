@@ -478,7 +478,11 @@ if {{$__sim_fs eq ""}} {{
     set __sim_dir "[get_property DIRECTORY $__proj]/[get_property NAME $__proj].sim/$__sim_fs"
     puts "VMCP_BAT:sim_dir=$__sim_dir"
     if {{[file isdirectory $__sim_dir]}} {{
-        set __existing [glob -nocomplain "$__sim_dir/*/compile.bat" "$__sim_dir/*/compile.sh"]
+        # Vivado layout 实际是 <sim_fs>/<phase>/xsim/<step>.{{bat,sh}}(三层),
+        # 跟 TAIL_SIM_LOGS 的 *.log glob 一致。0.3.16 漏了 /xsim,导致 fallback
+        # 永远 glob 空,触发 -scripts_only 但拿不到 .bat,被 0.3.17 实测打出。
+        set __existing [glob -nocomplain \\
+            "$__sim_dir/*/xsim/compile.bat" "$__sim_dir/*/xsim/compile.sh"]
         if {{[llength $__existing] == 0}} {{
             puts "VMCP_BAT:scripts_only=triggering"
             if {{[catch {{launch_simulation -scripts_only -simset $__sim_fs}} __err]}} {{
@@ -491,7 +495,7 @@ if {{$__sim_fs eq ""}} {{
         }}
         foreach __pat {{compile elaborate simulate}} {{
             foreach __ext {{bat sh}} {{
-                set __gp "$__sim_dir/*/$__pat.$__ext"
+                set __gp "$__sim_dir/*/xsim/$__pat.$__ext"
                 foreach __f [glob -nocomplain $__gp] {{
                     puts "VMCP_BAT_FILE:$__pat|$__ext|$__f"
                 }}
@@ -526,6 +530,12 @@ RUN_BAT_STEP = """\
 set __bat "{bat_path}"
 set __out ""
 set __rc 0
+# .bat 内部 xvlog/xelab 用 **相对路径** 引 .prj / .ini(Vivado 生成时假设
+# cwd=xsim_dir)。Vivado launch_simulation 自己 spawn 时会先 cd 进去,我们
+# 复刻它,否则 fallback 抓到的"真错"实际是 cwd 错误诱发的假错(0.3.17 实测)。
+set __orig_pwd [pwd]
+set __xsim_dir [file dirname $__bat]
+cd $__xsim_dir
 if {{[catch {{exec cmd /c $__bat}} __out __opt]}} {{
     set __ec [dict get $__opt -errorcode]
     if {{[llength $__ec] >= 3 && [lindex $__ec 0] eq "CHILDSTATUS"}} {{
@@ -535,6 +545,7 @@ if {{[catch {{exec cmd /c $__bat}} __out __opt]}} {{
         set __rc 0
     }}
 }}
+cd $__orig_pwd
 puts "VMCP_BAT_RUN:rc=$__rc"
 puts "VMCP_BAT_RUN_OUT_START"
 foreach __l [split $__out "\\n"] {{

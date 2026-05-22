@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.3.17] — 2026-05-22
+
+### 修复(0.3.16 实测发现的 3 个 sim 诊断漏洞)
+
+- **Bug D:`LAUNCH_SCRIPTS_AND_GLOB` glob 漏 `/xsim` 三层路径 ⭐** ——
+  Vivado 2019.1 实际 layout 是 `<sim_fs>/<phase>/xsim/<step>.{bat,sh}`(三层),
+  跟 `TAIL_SIM_LOGS` 的 `*/xsim/*.log` 一致。但 0.3.16 fallback 模板写的是
+  两层 `$__sim_dir/*/compile.bat` —— glob **永远空**,触发 `-scripts_only` 但
+  拿不到 .bat,fallback 输出"未跑任何 .bat / .sh"完全失效。修:glob 模式补
+  `/xsim/` 中间层。
+
+- **Bug E:`RUN_BAT_STEP` 没 cd 到 `xsim_dir`,.bat 内相对路径全错位** ——
+  Vivado 生成的 compile.bat 内部用 `-prj tb_xxx_vlog.prj` 等**相对路径**引
+  依赖文件(假设 cwd = xsim_dir,这是 Vivado launch_simulation 自己的约定)。
+  0.3.16 fallback `exec cmd /c <bat>` 没切 cwd → 抓到 "Unable to open project
+  file"假错(实际是 cwd 错位诱发),把真错盖了。修:`cd [file dirname $__bat]`
+  后再 exec,跑完 `cd $__orig_pwd` 复原。实测:compile + elaborate 全 rc=0,
+  xvlog 完整分析所有 RTL,xelab 出 snapshot。
+
+- **Bug C(0.3.16 实现 bug 补完):24H2 默认无注册表键时漏报** ——
+  0.3.16 `_check_win_curdir_policy` 把"注册表无值"硬编码为"不警告",但 Win 11
+  24H2 起微软改默认值 = 1(无键即等价于开启)。导致 24H2 用户**没改注册表**
+  时 banner 不警告,正中我们的目标用户群体。修:加 `_is_win11_24h2_or_newer()`
+  读 `sys.getwindowsversion().build >= 26100`,无键 + 24H2+ → 警告;HKCU 显式
+  = 0 → 不警告(opt-out)。
+
+### 关键认知校准(可让后人少走弯路)
+
+- 0.3.16 推测过"是否 spawn vivado 时注入 env `NoDefaultCurrentDirectoryInExePath=0`
+  绕开策略"。实测**不行**:Win 24H2 起 cmd.exe **只读注册表,忽略同名 env var**。
+  Tcl `::env(NDCD)=0` 子进程能读到,但 cmd 自身仍按注册表行为(`compile.bat`
+  无路径前缀照样报"不是命令")。**唯一根治路径 = 改注册表 + 注销重登**。
+  fallback 用绝对路径 `cmd /c <full-path>/compile.bat` 是合法绕道。
+
+### 测试
+
+- 测试总数:436 → 437(+1 `_is_win11_24h2_or_newer` 分支,改原"无值=不警告"
+  → 拆成老 Win / 24H2+ / 显式 = 0 三个 case)
+- ruff `All checks passed!`
+
 ## [0.3.16] — 2026-05-22
 
 ### 修复(0.3.15 实战定位的 3 个核心问题)
