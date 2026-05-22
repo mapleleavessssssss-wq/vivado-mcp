@@ -1,0 +1,20 @@
+Command: synth_design -top top -part xc7a35tcpg236-1
+Starting synth_design
+Attempting to get a license for feature 'Synthesis' and/or device 'xc7a35t'
+INFO: [Common 17-349] Got license for feature 'Synthesis' and/or device 'xc7a35t'
+INFO: [Device 21-403] Loading part xc7a35tcpg236-1
+Phase 1 Elaborate Design
+Phase 1.1 Read Design
+INFO: [Synth 8-7079] Multithreading enabled for synth_design using a maximum of 2 processes.
+INFO: [Synth 8-7078] Launching helper process for spawning children vivado processes
+INFO: [Synth 8-7077] Helper process launched with PID 12345
+Phase 1.5 GENERATE_TARGET
+INFO: [filemgmt 56-13] Updating IP file references in 'pcie_top'.
+Phase 1.6 Set Synthesis Properties
+WARNING: [Synth 8-3331] Some warning here
+TclStackFree: incorrect freePtr 0x0000000007d3b520. Call out of sequence?
+
+while executing
+"rdi::run_program -no_log [list synth_design -top top -part xc7a35tcpg236-1]"
+
+abort() has been called

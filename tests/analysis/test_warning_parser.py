@@ -15,13 +15,18 @@ import pathlib
 
 from vivado_mcp.analysis.warning_parser import (
     CriticalWarning,
+    NonStandardError,
     WarningGroup,
     WarningReport,
+    format_nonstandard_section,
     format_warning_report,
     group_warnings,
     parse_critical_warnings,
     parse_diag_counts,
     parse_pre_bitstream,
+    parse_sim_logs_output,
+    parse_tail_runme_output,
+    scan_nonstandard_errors,
 )
 
 # ====================================================================== #
@@ -397,3 +402,261 @@ class TestEndToEnd:
         text = format_warning_report(report)
         assert "!! 发现 16 条 CRITICAL WARNING !!" in text
         assert "board_pins.xdc" in text
+
+
+# ====================================================================== #
+#  scan_nonstandard_errors / format_nonstandard_section
+# ====================================================================== #
+
+
+class TestScanNonstandardErrors:
+    """非标错误关键词扫描器。补 Vivado messageDb 看不见的内部异常。"""
+
+    def test_detects_tclstackfree_and_abort(self):
+        text = (
+            "Phase 1.5 GENERATE_TARGET\n"
+            "TclStackFree: incorrect freePtr 0x0123. Call out of sequence?\n"
+            "abort() has been called\n"
+        )
+        results = scan_nonstandard_errors(text)
+        kws = {r.keyword for r in results}
+        # 第二行同时匹配 TclStackFree 和 incorrect freePtr,
+        # 但实现保证一行只算一条(取首个 pattern) → 只命中 TclStackFree
+        assert "TclStackFree" in kws
+        assert "abort" in kws
+
+    def test_skips_standard_error_and_cw_prefixes(self):
+        """ERROR: / CRITICAL WARNING: 前缀的行不归非标(它们走 messageDb 解析)。"""
+        text = (
+            "ERROR: [Common 17-39] failed due to earlier errors\n"
+            "CRITICAL WARNING: [DRC NSTD-1] port has no IOSTANDARD\n"
+            "FATAL: panic in elaborate\n"
+        )
+        results = scan_nonstandard_errors(text)
+        # 只有 FATAL 行算非标
+        assert len(results) == 1
+        assert results[0].keyword == "FATAL"
+
+    def test_detects_chinese_cmd_not_found(self):
+        text = "'xvlog' 不是内部或外部命令,也不是可运行的程序\n"
+        results = scan_nonstandard_errors(text)
+        assert any(r.keyword == "not_recognized_cmd_zh" for r in results)
+
+    def test_detects_english_cmd_not_found(self):
+        text = "'xvlog' is not recognized as an internal or external command\n"
+        results = scan_nonstandard_errors(text)
+        assert any(r.keyword == "not_recognized_cmd" for r in results)
+
+    def test_detects_segfault_and_oom(self):
+        text = (
+            "Segmentation fault\n"
+            "std::bad_alloc: out of memory\n"
+        )
+        results = scan_nonstandard_errors(text)
+        kws = {r.keyword for r in results}
+        assert "segfault" in kws
+        assert "OOM" in kws
+
+    def test_empty_input_returns_empty(self):
+        assert scan_nonstandard_errors("") == []
+
+    def test_no_match_returns_empty(self):
+        text = "INFO: all good\nPhase 1 Complete\nINFO: [Synth 8-7079] launched\n"
+        assert scan_nonstandard_errors(text) == []
+
+    def test_start_line_offset_applies(self):
+        """start_line=100 时,文本中第 1 行 → 报告中第 101 行。"""
+        text = "TclStackFree: incorrect freePtr\n"
+        results = scan_nonstandard_errors(text, start_line=100)
+        assert results[0].line_number == 101
+
+    def test_one_line_one_record(self):
+        """一行多关键词只算一条,避免重复轰炸。"""
+        text = "TclStackFree FATAL abort segfault\n"
+        results = scan_nonstandard_errors(text)
+        assert len(results) == 1
+
+    def test_fixture_tclstackfree_log(self):
+        log_path = FIXTURES / "runme_tclstackfree.txt"
+        text = log_path.read_text(encoding="utf-8")
+        results = scan_nonstandard_errors(text)
+        kws = {r.keyword for r in results}
+        assert "TclStackFree" in kws
+        assert "abort" in kws
+
+    def test_fixture_xvlog_not_found_log(self):
+        log_path = FIXTURES / "xvlog_not_found.txt"
+        text = log_path.read_text(encoding="utf-8")
+        results = scan_nonstandard_errors(text)
+        kws = {r.keyword for r in results}
+        # 中文 cmd 提示必须命中
+        assert "not_recognized_cmd_zh" in kws
+
+
+class TestFormatNonstandardSection:
+    """非标错误段格式化。"""
+
+    def test_empty_returns_empty_string(self):
+        assert format_nonstandard_section([]) == ""
+
+    def test_includes_tclstackfree_hint(self):
+        errs = [
+            NonStandardError(
+                keyword="TclStackFree",
+                line_number=42,
+                text="TclStackFree: incorrect freePtr",
+                severity="high",
+            )
+        ]
+        out = format_nonstandard_section(errs)
+        assert "非标错误" in out
+        assert "第 42 行" in out
+        assert "ASCII" in out  # hint 提到中文路径迁移建议
+
+    def test_includes_cmd_not_found_hint(self):
+        errs = [
+            NonStandardError(
+                keyword="not_recognized_cmd_zh",
+                line_number=10,
+                text="'xvlog' 不是内部或外部命令",
+                severity="high",
+            )
+        ]
+        out = format_nonstandard_section(errs)
+        assert "PATH" in out  # 提示查 $::env(PATH)
+
+    def test_multiple_errors_aggregate_hints(self):
+        errs = [
+            NonStandardError("TclStackFree", 1, "TclStackFree: ...", "high"),
+            NonStandardError("OOM", 50, "bad_alloc", "high"),
+        ]
+        out = format_nonstandard_section(errs)
+        # 两类 hint 都要在
+        assert "ASCII" in out
+        assert "jobs" in out  # OOM hint 提示降低 jobs
+
+    def test_medium_severity_does_not_trigger_high_hint(self):
+        """只有 permission_denied(medium)时,不应触发 TclStackFree/OOM hint。"""
+        errs = [
+            NonStandardError("permission_denied", 1, "permission denied", "medium")
+        ]
+        out = format_nonstandard_section(errs)
+        # medium 没有 hint,只有头部 + 条目
+        assert "可能的修复方向" not in out
+        assert "permission_denied" in out
+
+
+# ====================================================================== #
+#  parse_tail_runme_output / parse_sim_logs_output
+# ====================================================================== #
+
+
+class TestParseTailRunmeOutput:
+    """TAIL_RUNME_LOG 输出解析。"""
+
+    def test_full_output(self):
+        raw = (
+            "VMCP_TAIL:status=synth_design ERROR\n"
+            "VMCP_TAIL:total=1500\n"
+            "VMCP_TAIL_LINE:1451|Phase 1.5\n"
+            "VMCP_TAIL_LINE:1452|TclStackFree: incorrect freePtr\n"
+            "VMCP_TAIL_LINE:1453|abort()\n"
+            "VMCP_TAIL_DONE\n"
+        )
+        status, start_line, body = parse_tail_runme_output(raw)
+        assert status == "synth_design ERROR"
+        # tail 起始为 1451 → start_line=1450(0-based 偏移)
+        assert start_line == 1450
+        assert body.splitlines() == [
+            "Phase 1.5",
+            "TclStackFree: incorrect freePtr",
+            "abort()",
+        ]
+
+    def test_log_missing(self):
+        raw = (
+            "VMCP_TAIL:status=Not started\n"
+            "VMCP_TAIL:log_missing=1\n"
+            "VMCP_TAIL_DONE\n"
+        )
+        status, start_line, body = parse_tail_runme_output(raw)
+        assert status == "Not started"
+        assert start_line == 0
+        assert body == ""
+
+    def test_run_not_found(self):
+        raw = "VMCP_TAIL:error=run_not_found\nVMCP_TAIL_DONE\n"
+        status, start_line, body = parse_tail_runme_output(raw)
+        assert status == ""
+        assert body == ""
+
+    def test_body_feeds_scan_nonstandard(self):
+        """tail 输出经过解析后,start_line 让 scan 报出的行号还原原始位置。"""
+        raw = (
+            "VMCP_TAIL:status=synth_design ERROR\n"
+            "VMCP_TAIL_LINE:1247|TclStackFree: incorrect freePtr\n"
+            "VMCP_TAIL_DONE\n"
+        )
+        status, start_line, body = parse_tail_runme_output(raw)
+        errs = scan_nonstandard_errors(body, start_line=start_line)
+        assert len(errs) == 1
+        assert errs[0].line_number == 1247  # 原始行号还原
+
+
+class TestParseSimLogsOutput:
+    """TAIL_SIM_LOGS 输出解析。"""
+
+    def test_fileset_not_found(self):
+        raw = "VMCP_SIM:error=fileset_not_found\nVMCP_SIM_DONE\n"
+        sim_dir, logs = parse_sim_logs_output(raw)
+        assert sim_dir == ""
+        assert logs == []
+
+    def test_dir_exists_no_logs(self):
+        raw = (
+            "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+            "VMCP_SIM:log_count=0\n"
+            "VMCP_SIM_DONE\n"
+        )
+        sim_dir, logs = parse_sim_logs_output(raw)
+        assert sim_dir == "C:/proj/proj.sim/sim_1"
+        assert logs == []
+
+    def test_two_logs(self):
+        raw = (
+            "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+            "VMCP_SIM:log_count=2\n"
+            "VMCP_SIM_LOG_START:C:/proj/proj.sim/sim_1/behav/xsim/xvlog.log\n"
+            "VMCP_SIM_LOG_LINE:1|Running xvlog\n"
+            "VMCP_SIM_LOG_LINE:2|'xvlog' 不是内部或外部命令\n"
+            "VMCP_SIM_LOG_END:C:/proj/proj.sim/sim_1/behav/xsim/xvlog.log\n"
+            "VMCP_SIM_LOG_START:C:/proj/proj.sim/sim_1/behav/xsim/compile.log\n"
+            "VMCP_SIM_LOG_LINE:8|ERROR: [USF-XSim-62] compile failed\n"
+            "VMCP_SIM_LOG_END:C:/proj/proj.sim/sim_1/behav/xsim/compile.log\n"
+            "VMCP_SIM_DONE\n"
+        )
+        sim_dir, logs = parse_sim_logs_output(raw)
+        assert sim_dir == "C:/proj/proj.sim/sim_1"
+        assert len(logs) == 2
+        # 第一份日志
+        assert logs[0].log_path.endswith("xvlog.log")
+        assert logs[0].start_line == 0  # tail 第一行是原文件第 1 行 → offset=0
+        assert "不是内部或外部命令" in logs[0].body
+        # 第二份日志
+        assert logs[1].log_path.endswith("compile.log")
+        assert logs[1].start_line == 7  # tail 第一行是原文件第 8 行 → offset=7
+
+    def test_log_lines_feed_scan(self):
+        """tail 的 body 给 scan 后,行号能还原(基于 start_line 偏移)。"""
+        raw = (
+            "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+            "VMCP_SIM_LOG_START:xvlog.log\n"
+            "VMCP_SIM_LOG_LINE:42|'xvlog' 不是内部或外部命令\n"
+            "VMCP_SIM_LOG_END:xvlog.log\n"
+            "VMCP_SIM_DONE\n"
+        )
+        _, logs = parse_sim_logs_output(raw)
+        errs = scan_nonstandard_errors(logs[0].body, start_line=logs[0].start_line)
+        assert len(errs) == 1
+        assert errs[0].line_number == 42
+        assert errs[0].keyword == "not_recognized_cmd_zh"

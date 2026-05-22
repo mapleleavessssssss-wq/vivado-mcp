@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.3.14] — 2026-05-22
+
+### 修复(0.3.13 实战发现的 5 个诊断盲区集中补)
+
+- **`get_critical_warnings` 漏报非标 ERROR** —— Vivado 内部异常(中文路径触发的
+  `TclStackFree`、`abort()`、`Segmentation fault`、xvlog 子进程 `'xxx' 不是内部或
+  外部命令` 等)**不进 Vivado messageDb**,只在 runme.log 尾部 stderr 一行。0.3.13
+  及之前 `get_critical_warnings` 只 grep `CRITICAL WARNING:` / `ERROR:` 前缀,这类
+  非标错误全部漏报,AI 收到的反馈是 "未发现 ERROR 或 CRITICAL WARNING" —— 完全相反
+  于实际情况。0.3.14 起:`errors=0` 且 `cw=0` 但 run STATUS 含 ERROR 时,自动 tail
+  runme.log 最后 50 行,扫描非标关键词,命中就拼成"非标错误"段附在主报告下面,
+  并按命中关键词给定向修复 hint(中文路径 → ASCII 迁移、xvlog 未找到 → 查 PATH 等)。
+
+- **`launch_simulation` 失败时真错被吞** —— Vivado spawn `compile.bat` 调 xvlog/xelab/
+  xsim,真错在 `<proj>.sim/sim_1/behav/xsim/*.log`(**不在** runme.log),0.3.13 之前
+  MCP 完全没读这些路径,AI 只能看到 `failed due to earlier errors` 的二手错误。
+  0.3.14 起:`get_critical_warnings(run_name='sim_1')` 自动 glob
+  `<sim_fs>/*/xsim/*.log`,每个文件 tail 末尾 N 行 + 扫非标关键词,把真错暴露出来。
+
+- **中文路径无预警** —— Vivado 2019.1 在 Windows 中文路径下已知会触发 TclStackFree
+  内部 bug(0.3.13 实战遇到,工程目录搬到纯 ASCII 才好)。0.3.14 起 `start_session`
+  自动检测 `vivado_path` / `cwd` 是否含非 ASCII 字符,触发醒目警告(只 warn 不 block,
+  因为不是所有 2019.x 都必崩,且源文件中文路径仍可用)。
+
+- **`run_tcl` / `safe_tcl` 失败缺诊断指引** —— AI 拿到 rc=1 不知道下一步该调什么。
+  0.3.14 起 `_safe_execute` 在 Tcl 命令命中 run/sim 失败模式(`launch_simulation` /
+  `launch_runs` / `synth_design` 等)且 rc!=0 时,自动追加一条 hint 指向
+  `get_critical_warnings`。
+
+- **launch_simulation 状态污染** —— `launch_simulation` 失败后 close_design + reset_run
+  常常救不回,Vivado simulator runtime 内部状态残留。0.3.14 起仿真诊断输出末尾追加
+  "考虑 close_sim / stop_session → start_session 重启" 提示。
+
+### 新增 spec 文档
+
+- **`.trellis/spec/backend/vivado-quirks.md`** —— 集中沉淀 7 条 Vivado 2019.1 / XSim
+  实战 quirks:中文路径 TclStackFree、launch_simulation 真错位置、`set_property generic`
+  类型反转、XSim add_wave 不认 `-label`/`-divider`、Tcl 命令替换吃 generate 层级路径
+  `[0]` 等。把"踩了才知道"的坑变成可读的 case 库,新人 / AI 调试时能直接命中。
+
+### 测试
+
+- **391 → 415**(+24):
+  - `tests/analysis/test_warning_parser.py`:`scan_nonstandard_errors` / `format_nonstandard_section` /
+    `parse_tail_runme_output` / `parse_sim_logs_output` 4 个新函数共 17 条单测 + 2 个
+    fixture log 文件(中文路径 TclStackFree、xvlog not in PATH)
+  - `tests/test_diagnostic_tools.py`:`get_critical_warnings` 非标 fallback + sim 路径
+    分支共 7 条集成测试
+  - `tests/test_session.py`:`_check_ascii_paths` + `_safe_execute` hint 共 7 条单测
+
 ## [0.3.13] — 2026-05-02
 
 ### 修复

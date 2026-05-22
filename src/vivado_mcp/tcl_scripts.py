@@ -350,6 +350,105 @@ puts "VMCP_PATH_DONE"
 """
 
 
+# --------------------------------------------------------------------------- #
+#  Tail runme.log 末尾 N 行 + run STATUS
+#  用途:get_critical_warnings 在 errors=0 且 cw=0 但实际失败时,扫描非标错误
+#  (如 TclStackFree / xvlog not in PATH 等不带 ERROR: 前缀的内部异常)
+#  格式:
+#    VMCP_TAIL:status=<STATUS>     —— run 的 Vivado STATUS
+#    VMCP_TAIL:total=<N>           —— 日志总行数
+#    VMCP_TAIL:log_missing=1       —— runme.log 不存在时
+#    VMCP_TAIL:error=run_not_found —— run 不存在时
+#    VMCP_TAIL_LINE:<原行号>|<文本> —— tail 出的每行
+#    VMCP_TAIL_DONE                 —— 结束标记
+# --------------------------------------------------------------------------- #
+
+TAIL_RUNME_LOG = """\
+set __run [get_runs -quiet {run_name}]
+if {{$__run eq ""}} {{
+    puts "VMCP_TAIL:error=run_not_found"
+}} else {{
+    set __status [get_property STATUS $__run]
+    set __run_dir [get_property DIRECTORY $__run]
+    set __log "$__run_dir/runme.log"
+    puts "VMCP_TAIL:status=$__status"
+    if {{[file exists $__log]}} {{
+        set __fp [open $__log r]
+        set __lines [list]
+        while {{[gets $__fp __l] >= 0}} {{
+            lappend __lines $__l
+        }}
+        close $__fp
+        set __total [llength $__lines]
+        puts "VMCP_TAIL:total=$__total"
+        set __start [expr {{$__total - {tail_n}}}]
+        if {{$__start < 0}} {{ set __start 0 }}
+        set __ln $__start
+        foreach __l [lrange $__lines $__start end] {{
+            incr __ln
+            puts "VMCP_TAIL_LINE:$__ln|$__l"
+        }}
+    }} else {{
+        puts "VMCP_TAIL:log_missing=1"
+    }}
+}}
+puts "VMCP_TAIL_DONE"
+"""
+
+
+# --------------------------------------------------------------------------- #
+#  Tail simulation fileset (sim_*) 下所有 xsim 子日志
+#  Vivado launch_simulation 走 .bat/.sh 子进程调 xvlog/xelab/xsim,真错误在
+#  <proj>.sim/<sim_fs>/<phase>/xsim/*.log,不进 runme.log。本脚本 glob 扫
+#  <sim_fs_dir>/*/xsim/*.log 并 tail 末尾 N 行。
+#  格式:
+#    VMCP_SIM:sim_dir=<path>       —— fileset 目录
+#    VMCP_SIM:log_count=<N>        —— 命中的 log 数
+#    VMCP_SIM:error=fileset_not_found / dir_missing=1
+#    VMCP_SIM_LOG_START:<log_path>
+#    VMCP_SIM_LOG_LINE:<原行号>|<文本>
+#    VMCP_SIM_LOG_END:<log_path>
+#    VMCP_SIM_DONE
+# --------------------------------------------------------------------------- #
+
+TAIL_SIM_LOGS = """\
+set __sim_fs [get_filesets -quiet {run_name}]
+if {{$__sim_fs eq ""}} {{
+    puts "VMCP_SIM:error=fileset_not_found"
+}} else {{
+    set __sim_dir [get_property DIRECTORY $__sim_fs]
+    puts "VMCP_SIM:sim_dir=$__sim_dir"
+    if {{[file isdirectory $__sim_dir]}} {{
+        set __logs [glob -nocomplain "$__sim_dir/*/xsim/*.log"]
+        puts "VMCP_SIM:log_count=[llength $__logs]"
+        foreach __log $__logs {{
+            puts "VMCP_SIM_LOG_START:$__log"
+            if {{[file exists $__log]}} {{
+                set __fp [open $__log r]
+                set __lines [list]
+                while {{[gets $__fp __l] >= 0}} {{
+                    lappend __lines $__l
+                }}
+                close $__fp
+                set __total [llength $__lines]
+                set __start [expr {{$__total - {tail_n}}}]
+                if {{$__start < 0}} {{ set __start 0 }}
+                set __ln $__start
+                foreach __l [lrange $__lines $__start end] {{
+                    incr __ln
+                    puts "VMCP_SIM_LOG_LINE:$__ln|$__l"
+                }}
+            }}
+            puts "VMCP_SIM_LOG_END:$__log"
+        }}
+    }} else {{
+        puts "VMCP_SIM:dir_missing=1"
+    }}
+}}
+puts "VMCP_SIM_DONE"
+"""
+
+
 CHECK_PRE_BITSTREAM = """\
 set __impl [get_runs {impl_run}]
 set __status [get_property STATUS $__impl]

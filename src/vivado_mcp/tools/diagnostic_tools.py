@@ -13,11 +13,15 @@ from vivado_mcp.analysis.io_verifier import format_io_verification, verify_io_pl
 from vivado_mcp.analysis.verilog_compile_check import compile_check, format_compile_report
 from vivado_mcp.analysis.warning_parser import (
     WarningReport,
+    format_nonstandard_section,
     format_warning_report,
     group_warnings,
     parse_critical_warnings,
     parse_diag_counts,
     parse_errors,
+    parse_sim_logs_output,
+    parse_tail_runme_output,
+    scan_nonstandard_errors,
 )
 from vivado_mcp.analysis.warning_snapshot import (
     diff_warnings,
@@ -39,6 +43,8 @@ from vivado_mcp.tcl_scripts import (
     EXTRACT_CRITICAL_WARNINGS,
     EXTRACT_ERRORS,
     LIST_PROJECT_XDC_FILES,
+    TAIL_RUNME_LOG,
+    TAIL_SIM_LOGS,
 )
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
@@ -98,25 +104,144 @@ async def _fetch_project_xdc_paths(session) -> tuple[list[str] | None, str]:
     return paths, ""
 
 
+async def _scan_runme_nonstandard(
+    session, run_name: str, tail_n: int
+) -> tuple[str, str]:
+    """tail runme.log 末尾扫非标错误关键词。
+
+    用途:errors=0 且 cw=0 但 run STATUS 含 ERROR 时,Vivado messageDb 看不见
+    真正失败原因(典型 TclStackFree / 子进程报错),走这一路兜底。
+
+    Returns:
+        ``(status, nonstandard_section)``:
+        - ``status``: run STATUS 原文(用于上游判断是否真的失败)
+        - ``nonstandard_section``: 格式化后的非标错误段;无命中或脚本失败时为空串
+    """
+    try:
+        out = await session.execute(
+            TAIL_RUNME_LOG.format(run_name=run_name, tail_n=tail_n), timeout=20.0
+        )
+    except Exception as e:
+        logger.warning("tail runme.log 失败(run=%s): %s", run_name, e)
+        return "", ""
+
+    status, start_line, body = parse_tail_runme_output(out.output)
+    if not body:
+        return status, ""
+
+    errs = scan_nonstandard_errors(body, start_line=start_line)
+    return status, format_nonstandard_section(errs)
+
+
+async def _diagnose_sim_run(session, run_name: str, tail_n: int) -> str:
+    """诊断 simulation fileset(sim_*)失败:tail 所有 xsim 子日志 + 扫非标。
+
+    Vivado launch_simulation 走 .bat/.sh 子进程调 xvlog/xelab/xsim,真错误在
+    ``<proj>.sim/<sim_fs>/<phase>/xsim/*.log``(**不在 runme.log**)。本函数 glob
+    扫这些日志,tail 末尾 N 行并扫非标错误关键词(如 xvlog not in PATH 的中文
+    cmd 报错),把 messageDb 看不见的真错暴露给 AI。
+
+    Args:
+        session: vivado session
+        run_name: simulation fileset 名(如 ``sim_1``)
+        tail_n: 每个日志 tail 多少行
+    """
+    try:
+        out = await session.execute(
+            TAIL_SIM_LOGS.format(run_name=run_name, tail_n=tail_n), timeout=30.0
+        )
+    except Exception as e:
+        return f"[ERROR] 读取 simulation 日志失败: {e}"
+
+    sim_dir, logs = parse_sim_logs_output(out.output)
+
+    if not sim_dir:
+        return (
+            f"[ERROR] 找不到 fileset '{run_name}'。"
+            "请确认 launch_simulation 已执行过,或检查 fileset 名(默认 sim_1)。"
+        )
+
+    if not logs:
+        return (
+            f"仿真目录: {sim_dir}\n"
+            f"未找到任何 xsim 日志文件(预期 {sim_dir}/*/xsim/*.log)。\n"
+            "可能仿真还未启动,或目录结构与预期不符。"
+        )
+
+    lines: list[str] = []
+    lines.append(f"=== 仿真诊断: {run_name} ===")
+    lines.append(f"仿真目录: {sim_dir}")
+    lines.append(f"扫描到 {len(logs)} 个日志文件")
+    lines.append("")
+
+    total_nonstd = 0
+    for log in logs:
+        basename = log.log_path.replace("\\", "/").rsplit("/", 1)[-1]
+        errs = scan_nonstandard_errors(log.body, start_line=log.start_line)
+        total_nonstd += len(errs)
+        lines.append(f"--- {basename} (tail {tail_n} 行) ---")
+        if errs:
+            lines.append(f"  命中非标错误 {len(errs)} 条:")
+            for e in errs:
+                lines.append(f"    [{e.keyword}] 第 {e.line_number} 行: {e.text}")
+        body_lines = log.body.splitlines()
+        if body_lines:
+            preview = body_lines[-8:]
+            lines.append("  尾部内容预览:")
+            for ln in preview:
+                lines.append(f"    | {ln}")
+        else:
+            lines.append("  (日志为空)")
+        lines.append("")
+
+    if total_nonstd == 0:
+        lines.append(
+            "ℹ 未在 tail 区间命中非标错误关键词。如果仿真确实失败,真错误可能在"
+            "更早的日志区间 —— 加大 tail_n(如 tail_n=200)或手动打开日志查看。"
+        )
+        lines.append("")
+
+    # R4: launch_simulation 多次失败的状态污染提示
+    lines.append(
+        "提示: launch_simulation 连续失败可能存在 session 内部状态污染。"
+        "如本次修复后仍失败,试试 close_sim,或 stop_session → start_session 重启 Vivado。"
+    )
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def get_critical_warnings(
     run_name: str = "impl_1",
     compare_with_last: bool = False,
+    tail_n: int = 50,
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
-    """提取并分类 CRITICAL WARNING。
+    """提取并分类 CRITICAL WARNING / ERROR / 非标错误,统一失败诊断入口。
 
-    解析指定 run 的 runme.log，按 warning ID 聚合分类，返回中文诊断报告。
+    解析指定 run 的 runme.log,按 warning ID 聚合分类,返回中文诊断报告。
     包含已知 warning 的分类标签和修复建议。
 
-    每次调用会静默把本次 CW 列表存成一份快照(存到项目目录 ``.vmcp/`` 下,
-    或 fallback 到 ``~/.claude/vivado-mcp/``)。启用 ``compare_with_last=True`` 时,
-    读上次快照与本次对比,报告消除/新增/仍存在的条目,帮你判断"修没修对"。
+    **三种诊断模式根据 run_name 自动选择**:
+
+    1. ``synth_*`` / ``impl_*`` 等综合实现 run:走原流程(``runme.log`` 解析
+       ERROR/CRITICAL WARNING)。**额外**:errors=0 且 cw=0 但 STATUS 含 ERROR 时,
+       自动 tail ``runme.log`` 最后 N 行扫非标错误关键词(TclStackFree / segfault /
+       FATAL 等不带 ERROR: 前缀的内部异常),解决"messageDb 显示干净但 run 实际
+       崩了"的盲区。
+    2. ``sim_*`` simulation fileset:改去 tail ``<proj>.sim/<sim_fs>/*/xsim/*.log``
+       (Vivado launch_simulation 的真错误位置,**不在** runme.log),扫非标
+       关键词,自动暴露 xvlog 未找到等子进程错误。
+    3. 任何 run:无论结果如何,都会静默把本次 CW 列表写快照(存到项目目录 ``.vmcp/`` 下,
+       或 fallback 到 ``~/.claude/vivado-mcp/``)。启用 ``compare_with_last=True`` 时,
+       读上次快照与本次对比,报告消除/新增/仍存在的条目。(sim 模式不写快照)
 
     Args:
-        run_name: run 名称(如 "synth_1"、"impl_1"),默认 "impl_1"。
-        compare_with_last: True 时追加一段与上次快照的差分报告。
+        run_name: run / fileset 名称(如 ``synth_1`` / ``impl_1`` / ``sim_1``),
+            默认 ``impl_1``。``sim_*`` 走 simulation 日志诊断路径。
+        compare_with_last: True 时追加一段与上次快照的差分报告(仅对综合/实现有效)。
+        tail_n: 非标错误扫描时每个日志 tail 的末尾行数,默认 50。仿真模式适用于
+            每个 xsim 子日志。
         session_id: 目标会话 ID。
     """
     try:
@@ -128,6 +253,11 @@ async def get_critical_warnings(
     if not session:
         return _NO_SESSION.format(sid=session_id)
 
+    # ============== 仿真分支:走独立路径 ==============
+    if run_name.startswith("sim_"):
+        return await _diagnose_sim_run(session, run_name, tail_n)
+
+    # ============== 综合 / 实现流程 ==============
     # 第一步：获取计数
     try:
         count_result = await session.execute(
@@ -194,16 +324,35 @@ async def get_critical_warnings(
             e,
         )
 
-    # 第四步:格式化主报告 —— 无 CW 无 ERROR 的短路分支
+    # 第四步:errors=0 且 cw=0 时,tail runme.log 兜底扫非标错误
+    # 解决 0.3.13 实战发现的"中文路径 TclStackFree → messageDb 看不见"漏报
+    nonstandard_section = ""
     if errors == 0 and cw_count == 0:
-        main = (
-            f"诊断概览: errors=0, critical_warnings=0, warnings={w_count}\n"
-            "未发现 ERROR 或 CRITICAL WARNING。"
+        status, nonstandard_section = await _scan_runme_nonstandard(
+            session, run_name, tail_n
         )
+        # 只有 STATUS 含 ERROR 关键字且确实命中关键词时才展示,避免对健康 run 误报
+        if nonstandard_section and "ERROR" not in status.upper() \
+                and "ABORT" not in status.upper():
+            nonstandard_section = ""
+
+    # 第五步:格式化主报告 —— 无 CW 无 ERROR 的短路分支
+    if errors == 0 and cw_count == 0:
+        if nonstandard_section:
+            main = (
+                f"诊断概览: errors=0, critical_warnings=0, warnings={w_count}\n"
+                f"!! Vivado messageDb 显示无 ERROR/CW,但日志末尾发现非标错误 !!\n\n"
+                + nonstandard_section
+            )
+        else:
+            main = (
+                f"诊断概览: errors=0, critical_warnings=0, warnings={w_count}\n"
+                "未发现 ERROR 或 CRITICAL WARNING。"
+            )
     else:
         main = format_warning_report(report)
 
-    # 第五步:追加差分报告(仅当 compare_with_last 启用)
+    # 第六步:追加差分报告(仅当 compare_with_last 启用)
     if compare_with_last:
         if prev_report is None:
             return (

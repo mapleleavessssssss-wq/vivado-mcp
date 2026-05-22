@@ -88,16 +88,51 @@ def _require_session(ctx, session_id: str) -> VivadoSession | None:
     return _get_manager(ctx).get(session_id)
 
 
+_DIAG_HINT = (
+    "\n\n提示: Tcl 命令失败时,综合/实现真错可能不在 Vivado messageDb"
+    "(如中文路径触发的 TclStackFree),仿真真错在 <proj>.sim/<sim_fs>/*/xsim/*.log。"
+    "调 get_critical_warnings(run_name='synth_1' / 'impl_1' / 'sim_1') 兜底诊断。"
+)
+
+
+def _looks_like_run_failure(output: str) -> bool:
+    """粗判输出是否暗示 run / 仿真失败(用于决定是否拼诊断 hint)。
+
+    保守判断:命中其一即认为该展示 hint。避免对纯查询的 ERROR(如 get_property
+    on nonexistent)误展示 —— 但即使误展示也只是多一行文字,不破坏功能。
+    """
+    if not output:
+        return False
+    markers = (
+        "failed due to earlier errors",
+        "launch_simulation",
+        "launch_runs",
+        "synth_design",
+        "impl_design",
+        "place_design",
+        "route_design",
+        "write_bitstream",
+    )
+    return any(m in output for m in markers)
+
+
 async def _safe_execute(
     session: VivadoSession,
     tcl: str,
     timeout: float,
     error_label: str,
 ) -> str:
-    """安全执行 Tcl 命令，异常时返回错误字符串而非抛出。"""
+    """安全执行 Tcl 命令，异常时返回错误字符串而非抛出。
+
+    失败响应里如果命令模式涉及 run / 仿真,追加一条诊断 hint(0.3.14:0.3.13
+    实战发现 AI 拿到 'failed due to earlier errors' 无法定位真错的痛点)。
+    """
     try:
         result = await session.execute(tcl, timeout=timeout)
-        return result.summary
+        summary = result.summary
+        if result.is_error and _looks_like_run_failure(tcl + "\n" + result.output):
+            summary += _DIAG_HINT
+        return summary
     except Exception as e:
         return f"[ERROR] {error_label}: {e}"
 

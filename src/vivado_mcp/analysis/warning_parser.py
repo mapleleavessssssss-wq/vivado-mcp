@@ -6,7 +6,10 @@
 输入来源（参见 tcl_scripts.py）:
 - COUNT_WARNINGS  → ``VMCP_DIAG:errors=E,critical_warnings=CW,warnings=W``
 - EXTRACT_CRITICAL_WARNINGS → ``VMCP_CW:行号|原始消息``
+- EXTRACT_ERRORS → ``VMCP_RUNLOG_ERR:行号|原始消息``
 - CHECK_PRE_BITSTREAM → ``VMCP_PRE_BIT:status=S,critical_warnings=N``
+- TAIL_RUNME_LOG → ``VMCP_TAIL:status=...`` + ``VMCP_TAIL_LINE:行号|文本``
+- TAIL_SIM_LOGS → ``VMCP_SIM:sim_dir=...`` + ``VMCP_SIM_LOG_{START,LINE,END}:...``
 """
 
 from __future__ import annotations
@@ -29,6 +32,31 @@ class CriticalWarning:
     source_file: str  # 从消息末尾 [file.xdc:line] 提取的文件名
     port: str  # 从消息提取的端口名（如有）
     pin: str  # 从消息提取的引脚名（如有）
+
+
+@dataclass
+class SimLogTail:
+    """单个 xsim 子日志的 tail 结果(用于 launch_simulation 失败诊断)。"""
+
+    log_path: str       # 完整路径,如 ".../sim_1/behav/xsim/xvlog.log"
+    body: str           # tail 出的行拼接(无前缀 / 无行号,适合喂给 scan_nonstandard_errors)
+    start_line: int     # tail 第一行在原文件中的行号偏移(0-based,scan 会 +1)
+
+
+@dataclass(frozen=True)
+class NonStandardError:
+    """日志中不带 ERROR:/CRITICAL WARNING: 前缀的"明显错误"。
+
+    用途:补 Vivado messageDb 看不见的内部异常 / 子进程错误(如中文路径触发的
+    TclStackFree、xvlog 不在 PATH 的 cmd 报错、segfault 等)。get_critical_warnings
+    在 errors=0 且 cw=0 但 STATUS=ERROR 时,tail runme.log 扫这类条目,
+    避免 AI 看到"未发现 ERROR"的误导反馈。
+    """
+
+    keyword: str       # 命中的关键词标签,如 "TclStackFree"
+    line_number: int   # 在原文件中的行号(1-indexed)
+    text: str          # 完整行文本
+    severity: str      # "high" / "medium"
 
 
 @dataclass
@@ -186,6 +214,24 @@ _RE_PORT = re.compile(r"port\s+(\S+)", re.IGNORECASE)
 
 # 提取引脚名：package_pin XXXX
 _RE_PIN = re.compile(r"package_pin\s+(\w+)", re.IGNORECASE)
+
+# 非标错误关键词模式表(用于 scan_nonstandard_errors)
+# 严重度 high = 几乎肯定是失败原因;medium = 需上下文判断
+# 命中时 keyword 字段取这里第三列的稳定标签,而非原始正则,避免大小写漂移
+_NONSTANDARD_PATTERNS: tuple[tuple[re.Pattern, str, str], ...] = (
+    (re.compile(r"TclStackFree", re.IGNORECASE), "TclStackFree", "high"),
+    (re.compile(r"incorrect\s+freePtr", re.IGNORECASE), "incorrect freePtr", "high"),
+    (re.compile(r"\bsegmentation\s*fault\b|\bsegfault\b", re.IGNORECASE), "segfault", "high"),
+    (re.compile(r"access\s+violation", re.IGNORECASE), "access violation", "high"),
+    (re.compile(r"\bFATAL\b"), "FATAL", "high"),
+    (re.compile(r"\babort(ed)?\b\(?\)?", re.IGNORECASE), "abort", "high"),
+    (re.compile(r"out\s+of\s+memory|bad_alloc", re.IGNORECASE), "OOM", "high"),
+    (re.compile(r"is not recognized as an internal or external command", re.IGNORECASE),
+     "not_recognized_cmd", "high"),
+    (re.compile(r"不是内部或外部命令"), "not_recognized_cmd_zh", "high"),
+    (re.compile(r"command not found", re.IGNORECASE), "cmd_not_found", "high"),
+    (re.compile(r"permission denied", re.IGNORECASE), "permission_denied", "medium"),
+)
 
 # 匹配 VMCP_PRE_BIT 状态行
 _RE_PRE_BIT = re.compile(r"VMCP_PRE_BIT:status=([^,]+),critical_warnings=(-?\d+)")
@@ -367,6 +413,181 @@ def format_warning_report(report: WarningReport) -> str:
         lines.insert(0, f"!! 发现 {report.errors} 条 ERROR !!")
     elif report.critical_warnings > 0:
         lines.insert(0, f"!! 发现 {report.critical_warnings} 条 CRITICAL WARNING !!")
+
+    return "\n".join(lines)
+
+
+def parse_tail_runme_output(raw: str) -> tuple[str, int, str]:
+    """解析 TAIL_RUNME_LOG 输出。
+
+    Returns:
+        ``(status, start_line, body)``:
+        - ``status``: run 的 STATUS 字符串(如 ``"synth_design ERROR"``);run 不存在
+          或脚本失败时为空串
+        - ``start_line``: tail 区间第一行对应原文件的行号偏移(0-based)。喂给
+          ``scan_nonstandard_errors(body, start_line=start_line)`` 能还原原始行号
+        - ``body``: tail 区间所有行的拼接(无 VMCP_ 前缀、无行号),
+          可直接喂给 ``scan_nonstandard_errors``
+    """
+    status = ""
+    start_line = 0
+    body_lines: list[str] = []
+
+    for line in raw.splitlines():
+        if line.startswith("VMCP_TAIL:status="):
+            status = line[len("VMCP_TAIL:status="):].strip()
+        elif line.startswith("VMCP_TAIL_LINE:"):
+            rest = line[len("VMCP_TAIL_LINE:"):]
+            sep = rest.find("|")
+            if sep < 0:
+                continue
+            try:
+                ln = int(rest[:sep])
+            except ValueError:
+                continue
+            text = rest[sep + 1:]
+            # 只在第一条数据行时初始化 start_line(原文件 ln=1 时 offset=0,
+            # 用 body_lines 是否为空判断,避免用 0 作"未设置"哨兵被合法 ln=1 覆盖)
+            if not body_lines:
+                start_line = ln - 1
+            body_lines.append(text)
+
+    return status, start_line, "\n".join(body_lines)
+
+
+def parse_sim_logs_output(raw: str) -> tuple[str, list[SimLogTail]]:
+    """解析 TAIL_SIM_LOGS 输出。
+
+    Returns:
+        ``(sim_dir, logs)``:
+        - ``sim_dir``: simulation fileset 目录;fileset 不存在时为空串
+        - ``logs``: 每个 xsim 子日志的 tail 结果(``SimLogTail`` 列表)
+    """
+    sim_dir = ""
+    logs: list[SimLogTail] = []
+
+    current_path = ""
+    current_body: list[str] = []
+    current_start = 0
+
+    for line in raw.splitlines():
+        if line.startswith("VMCP_SIM:sim_dir="):
+            sim_dir = line[len("VMCP_SIM:sim_dir="):].strip()
+        elif line.startswith("VMCP_SIM_LOG_START:"):
+            current_path = line[len("VMCP_SIM_LOG_START:"):].strip()
+            current_body = []
+            current_start = 0
+        elif line.startswith("VMCP_SIM_LOG_LINE:"):
+            rest = line[len("VMCP_SIM_LOG_LINE:"):]
+            sep = rest.find("|")
+            if sep < 0:
+                continue
+            try:
+                ln = int(rest[:sep])
+            except ValueError:
+                continue
+            text = rest[sep + 1:]
+            # 同 parse_tail_runme_output:用 body 是否为空判断首行
+            if not current_body:
+                current_start = ln - 1
+            current_body.append(text)
+        elif line.startswith("VMCP_SIM_LOG_END:") and current_path:
+            logs.append(
+                SimLogTail(
+                    log_path=current_path,
+                    body="\n".join(current_body),
+                    start_line=current_start,
+                )
+            )
+            current_path = ""
+            current_body = []
+            current_start = 0
+
+    return sim_dir, logs
+
+
+def scan_nonstandard_errors(
+    text: str, start_line: int = 0
+) -> list[NonStandardError]:
+    """扫描日志文本,捕获不带 ERROR:/CRITICAL WARNING: 前缀的"明显错误"行。
+
+    典型场景:中文路径触发 ``TclStackFree``、xvlog 不在 PATH 导致 ``'xvlog'
+    不是内部或外部命令``、Vivado 段错误等。Vivado messageDb 看不见这些条目,
+    需要直接 tail 日志末尾按关键词扫描。
+
+    Args:
+        text: 待扫描的日志文本(通常是日志末尾 N 行)
+        start_line: 原文件中的起始行号(0-based),用于把相对位置回算成原始行号。
+            如果传 0,返回的 ``line_number`` 就是 text 内的 1-indexed 行号。
+
+    Returns:
+        命中条目列表,按原文出现顺序。一行只算一条(取首个命中的关键词)。
+        带 ``ERROR:`` / ``CRITICAL WARNING:`` 前缀的行会被跳过 —— 那些走
+        ``parse_errors`` / ``parse_critical_warnings``。
+    """
+    results: list[NonStandardError] = []
+    for idx, line in enumerate(text.splitlines()):
+        stripped = line.lstrip()
+        # 跳过有明确标准前缀的行 —— 那些由 parse_errors/parse_critical_warnings 处理
+        if stripped.startswith(("ERROR:", "CRITICAL WARNING:")):
+            continue
+        for pattern, label, severity in _NONSTANDARD_PATTERNS:
+            if pattern.search(line):
+                results.append(
+                    NonStandardError(
+                        keyword=label,
+                        line_number=start_line + idx + 1,
+                        text=line.rstrip(),
+                        severity=severity,
+                    )
+                )
+                break  # 一行只算一条
+    return results
+
+
+def format_nonstandard_section(errors: list[NonStandardError]) -> str:
+    """格式化非标错误段(供 get_critical_warnings 追加到主报告)。
+
+    输入为空时返回空串(调用方判断为空就不拼这一段)。
+    """
+    if not errors:
+        return ""
+
+    lines = ["=== 非标错误(日志末尾关键词扫描) ==="]
+    lines.append(
+        f"在日志末尾发现 {len(errors)} 条非标错误"
+        "(不带 ERROR:/CRITICAL WARNING: 前缀,Vivado messageDb 看不见,"
+        "但内容明显指向失败原因)。"
+    )
+    for e in errors:
+        lines.append(f"  [{e.keyword}] 第 {e.line_number} 行: {e.text}")
+
+    # 关键词聚合,给定向修复 hint
+    high_kw = {e.keyword for e in errors if e.severity == "high"}
+    hints: list[str] = []
+    if {"TclStackFree", "incorrect freePtr"} & high_kw:
+        hints.append(
+            "  • TclStackFree / incorrect freePtr → 工程目录可能含中文或非 ASCII 字符,"
+            "Vivado 2019.x 已知 bug。把工程搬到纯 ASCII 路径(如 C:/vivado_work/)。"
+        )
+    if {"not_recognized_cmd", "not_recognized_cmd_zh", "cmd_not_found"} & high_kw:
+        hints.append(
+            "  • 子进程命令未找到 → 一般是 xvlog/xelab 不在 PATH。"
+            "尝试在 Tcl 里 puts $::env(PATH) 确认是否含 <vivado>/bin。"
+        )
+    if {"segfault", "access violation"} & high_kw:
+        hints.append(
+            "  • Vivado 段错误/访问违规 → 通常是 IP 配置异常或工程文件损坏,"
+            "尝试 reset_project / 重新生成 IP / 干净 reopen。"
+        )
+    if {"OOM"} & high_kw:
+        hints.append(
+            "  • 内存不足 → 降低综合/实现 jobs 数,关闭其他大型程序后重试。"
+        )
+    if hints:
+        lines.append("")
+        lines.append("可能的修复方向:")
+        lines.extend(hints)
 
     return "\n".join(lines)
 

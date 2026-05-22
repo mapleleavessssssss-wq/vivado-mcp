@@ -874,3 +874,234 @@ class TestGetTimingReportWithPaths:
         assert "违例路径查询失败" in result
         # 不应该含正常的违例段
         assert "违例路径 Top" not in result
+
+
+# ====================================================================== #
+#  get_critical_warnings: 非标错误 fallback(R1) + sim 路径(R3)
+# ====================================================================== #
+
+
+class TestNonStandardFallback:
+    """errors=0 且 cw=0 但 STATUS=ERROR 时,tail runme.log 扫非标错误。"""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_tclstackfree_surfaced_when_messagedb_empty(self):
+        """TclStackFree 在 messageDb 看不见时,通过 tail 兜底应当浮出来。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        # COUNT_WARNINGS 显示干净,但 STATUS=ERROR + TAIL_RUNME_LOG 末尾含 TclStackFree
+        tail_output = (
+            "VMCP_TAIL:status=synth_design ERROR\n"
+            "VMCP_TAIL:total=1500\n"
+            "VMCP_TAIL_LINE:1499|Phase 1.5 GENERATE_TARGET\n"
+            "VMCP_TAIL_LINE:1500|TclStackFree: incorrect freePtr 0x0123\n"
+            "VMCP_TAIL_DONE\n"
+        )
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=2"),
+                _make_tcl_result("VMCP_PROJDIR:NONE"),
+                _make_tcl_result(tail_output),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="synth_1", session_id="default", ctx=ctx
+            )
+
+        assert "非标错误" in result
+        assert "TclStackFree" in result
+        assert "messageDb 显示无" in result
+        assert "1500" in result
+        assert "ASCII" in result
+
+    @pytest.mark.asyncio
+    async def test_no_nonstandard_when_status_is_complete(self):
+        """STATUS 不含 ERROR 时,即使 tail 命中关键词也不展示,避免对健康 run 误报。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        # tail 命中 abort 字样,但 STATUS=Complete → 不展示
+        tail_output = (
+            "VMCP_TAIL:status=synth_design Complete!\n"
+            "VMCP_TAIL_LINE:50|INFO: graceful abort handler installed\n"
+            "VMCP_TAIL_DONE\n"
+        )
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=2"),
+                _make_tcl_result("VMCP_PROJDIR:NONE"),
+                _make_tcl_result(tail_output),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="synth_1", session_id="default", ctx=ctx
+            )
+
+        assert "未发现 ERROR 或 CRITICAL WARNING" in result
+        assert "非标错误" not in result
+
+    @pytest.mark.asyncio
+    async def test_skips_tail_when_errors_present(self):
+        """errors>0 时走原 ERROR 流程,不调 TAIL_RUNME_LOG(开销控制)。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        err_log = (
+            "VMCP_RUNLOG_ERR:50|ERROR: [Common 17-39] real error here\n"
+            "VMCP_RUNLOG_ERR_DONE"
+        )
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result("VMCP_DIAG:errors=1,critical_warnings=0,warnings=0"),
+                _make_tcl_result(err_log),
+                _make_tcl_result("VMCP_PROJDIR:NONE"),
+            ]
+        )
+        # errors>0 时调用顺序:count → extract_errors → projdir,无 tail
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="synth_1", session_id="default", ctx=ctx
+            )
+
+        # 只 3 次 execute: count + extract_errors + projdir,没调 TAIL_RUNME_LOG
+        assert session.execute.call_count == 3
+        assert "Common 17-39" in result
+
+
+class TestSimDiagnose:
+    """run_name 是 sim_* 时,改走 TAIL_SIM_LOGS 独立路径。"""
+
+    @pytest.mark.asyncio
+    async def test_xvlog_not_found_surfaced(self):
+        """xvlog 不在 PATH 的中文 cmd 报错,要能从 xvlog.log 提取出来。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        sim_out = (
+            "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+            "VMCP_SIM:log_count=2\n"
+            "VMCP_SIM_LOG_START:C:/proj/proj.sim/sim_1/behav/xsim/xvlog.log\n"
+            "VMCP_SIM_LOG_LINE:1|Running xvlog\n"
+            "VMCP_SIM_LOG_LINE:2|xvlog 不是内部或外部命令,也不是可运行的程序\n"
+            "VMCP_SIM_LOG_END:C:/proj/proj.sim/sim_1/behav/xsim/xvlog.log\n"
+            "VMCP_SIM_LOG_START:C:/proj/proj.sim/sim_1/behav/xsim/compile.log\n"
+            "VMCP_SIM_LOG_LINE:5|INFO: USF-XSim-69 compile finished\n"
+            "VMCP_SIM_LOG_END:C:/proj/proj.sim/sim_1/behav/xsim/compile.log\n"
+            "VMCP_SIM_DONE\n"
+        )
+
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=_make_tcl_result(sim_out))
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        assert "仿真诊断" in result
+        assert "xvlog.log" in result
+        assert "不是内部或外部命令" in result
+        assert "not_recognized_cmd_zh" in result
+        # R4: 状态污染提示
+        assert "stop_session" in result or "重启" in result
+
+    @pytest.mark.asyncio
+    async def test_fileset_not_found(self):
+        """sim fileset 不存在时给清晰引导。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result(
+                "VMCP_SIM:error=fileset_not_found\nVMCP_SIM_DONE\n"
+            )
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        assert "[ERROR]" in result
+        assert "找不到 fileset" in result
+
+    @pytest.mark.asyncio
+    async def test_no_logs_found(self):
+        """sim 目录存在但 glob 不到 xsim/*.log。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result(
+                "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+                "VMCP_SIM:log_count=0\n"
+                "VMCP_SIM_DONE\n"
+            )
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        assert "未找到任何 xsim 日志文件" in result
+
+    @pytest.mark.asyncio
+    async def test_sim_path_skips_messagedb_queries(self):
+        """sim_* 走独立路径:不调 COUNT_WARNINGS / EXTRACT_ERRORS / 快照。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result(
+                "VMCP_SIM:sim_dir=/tmp\nVMCP_SIM:log_count=0\nVMCP_SIM_DONE\n"
+            )
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        # 只一次 execute:TAIL_SIM_LOGS,没调 COUNT_WARNINGS / EXTRACT_ERRORS
+        assert session.execute.call_count == 1

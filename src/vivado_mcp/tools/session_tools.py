@@ -1,10 +1,47 @@
 """会话管理工具：start_session / stop_session / list_sessions。"""
 
 import json
+import os
 
 from mcp.server.fastmcp import Context
 
 from vivado_mcp.server import _get_manager, mcp
+
+
+def _check_ascii_paths(vivado_path: str | None) -> str:
+    """检测 Vivado 路径 / 当前工作目录是否含非 ASCII 字符。
+
+    Vivado 2019.x 在中文路径下已知会触发 ``TclStackFree: incorrect freePtr``
+    内部异常(0.3.13 实战发现)。本检测只 warn,不 block —— 因为不是所有 2019.x
+    都必崩,且用户可能在某些场景下能用(源文件中文 OK,只有 .runs/ .sim/ 输出目录
+    必须 ASCII)。检测对象:
+    - vivado_path (可执行文件路径)
+    - 当前工作目录(create_project / open_project 多半在这里)
+
+    Returns:
+        警告文本(若需要),否则空串。
+    """
+    non_ascii_paths: list[str] = []
+    if vivado_path and not vivado_path.isascii():
+        non_ascii_paths.append(f"vivado_path: {vivado_path}")
+    try:
+        cwd = os.getcwd()
+        if not cwd.isascii():
+            non_ascii_paths.append(f"工作目录: {cwd}")
+    except OSError:
+        # 极少见:cwd 失效。检测能力降级,不让 start_session 失败
+        pass
+
+    if not non_ascii_paths:
+        return ""
+
+    return (
+        "\n⚠  警告:检测到路径含非 ASCII 字符:\n"
+        + "\n".join(f"   {p}" for p in non_ascii_paths)
+        + "\n   Vivado 2019.x 在中文路径下可能触发 TclStackFree 崩溃(0.3.13 实战见过)。"
+        "\n   建议工程目录搬到纯 ASCII(如 C:/vivado_work/)。"
+        "\n   源文件中文 OK,但 .runs/ .sim/ 等输出目录必须 ASCII。"
+    )
 
 
 @mcp.tool()
@@ -47,11 +84,13 @@ async def start_session(
             port=int(port),
         )
         status = session.status_dict()
+        ascii_warn = _check_ascii_paths(status.get("vivado_path") or vivado_path)
         return (
             f"会话 '{session_id}' 已就绪（mode={status['mode']}）。\n"
             f"Vivado: {status['vivado_path']}\n"
             f"状态: {status['state']}\n\n"
             f"--- 启动信息 ---\n{banner}"
+            f"{ascii_warn}"
         )
     except ValueError as e:
         return f"[ERROR] {e}"

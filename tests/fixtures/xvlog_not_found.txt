@@ -1,0 +1,11 @@
+Vivado Simulator 2019.1
+Copyright 1986-1999, 2001-2019 Xilinx, Inc. All Rights Reserved.
+
+Running: D:/Xilinx/Vivado/2019.1/bin/xvlog --incr --relax -prj top_vlog.prj
+'xvlog' 不是内部或外部命令,也不是可运行的程序
+或批处理文件。
+
+ERROR: [VRFC 10-1417] Cannot find file 'top_vlog.prj'
+ERROR: [USF-XSim-62] 'compile' step failed with error(s) while executing 'D:/Xilinx/Vivado/2019.1/bin/xvlog' command. Please check that the file has the correct 'Read' permission and the path is valid.
+
+INFO: [USF-XSim-69] 'compile' step finished in '0' seconds

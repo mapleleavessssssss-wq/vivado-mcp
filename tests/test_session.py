@@ -62,3 +62,102 @@ class TestSessionManager:
         """get 方法会验证 session_id 格式。"""
         with pytest.raises(ValueError, match="session_id"):
             session_manager.get("invalid;id")
+
+
+class TestAsciiPathCheck:
+    """_check_ascii_paths:Vivado 2019.x 中文路径预警。"""
+
+    def test_pure_ascii_returns_empty(self):
+        from vivado_mcp.tools.session_tools import _check_ascii_paths
+        assert _check_ascii_paths("C:/Xilinx/Vivado/2019.1/bin/vivado.bat") == ""
+
+    def test_chinese_path_returns_warning(self):
+        from vivado_mcp.tools.session_tools import _check_ascii_paths
+        warn = _check_ascii_paths("D:/项目/Vivado/2019.1/bin/vivado.bat")
+        assert "警告" in warn
+        assert "非 ASCII" in warn
+        assert "TclStackFree" in warn
+        assert "ASCII" in warn
+        assert "D:/项目/Vivado" in warn
+
+    def test_empty_vivado_path_still_checks_cwd(self, tmp_path, monkeypatch):
+        """vivado_path 为 None 也要检查 cwd(攻击面更广)。"""
+        from vivado_mcp.tools.session_tools import _check_ascii_paths
+        # cwd 为 ASCII → 无警告
+        monkeypatch.chdir(tmp_path)
+        assert _check_ascii_paths(None) == ""
+
+    def test_none_path_pure_ascii_cwd_empty(self, tmp_path, monkeypatch):
+        from vivado_mcp.tools.session_tools import _check_ascii_paths
+        monkeypatch.chdir(tmp_path)
+        assert _check_ascii_paths(None) == ""
+
+
+class TestSafeExecuteDiagHint:
+    """server._safe_execute:Tcl run/sim 失败时追加诊断 hint。"""
+
+    def test_looks_like_run_failure_synth(self):
+        from vivado_mcp.server import _looks_like_run_failure
+        assert _looks_like_run_failure("synth_design ERROR foo")
+        assert _looks_like_run_failure("ERROR: launch_simulation failed")
+        assert _looks_like_run_failure("Common 17-39 failed due to earlier errors")
+
+    def test_looks_like_run_failure_negative(self):
+        from vivado_mcp.server import _looks_like_run_failure
+        assert not _looks_like_run_failure("ERROR: get_property failed: no such object")
+        assert not _looks_like_run_failure("")
+        assert not _looks_like_run_failure("INFO: all good")
+
+    @pytest.mark.asyncio
+    async def test_safe_execute_appends_hint_on_run_failure(self):
+        from unittest.mock import AsyncMock
+
+        from vivado_mcp.server import _safe_execute
+        from vivado_mcp.vivado.tcl_utils import TclResult
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=TclResult(
+                output="ERROR: [Common 17-39] 'launch_simulation' failed",
+                return_code=1,
+                is_error=True,
+            )
+        )
+
+        result = await _safe_execute(session, "launch_simulation", 30.0, "run_tcl")
+        assert "get_critical_warnings" in result
+        assert "TclStackFree" in result or "messageDb" in result
+
+    @pytest.mark.asyncio
+    async def test_safe_execute_no_hint_on_success(self):
+        from unittest.mock import AsyncMock
+
+        from vivado_mcp.server import _safe_execute
+        from vivado_mcp.vivado.tcl_utils import TclResult
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=TclResult(
+                output="3.3", return_code=0, is_error=False
+            )
+        )
+        result = await _safe_execute(session, "puts 3.3", 30.0, "run_tcl")
+        assert "get_critical_warnings" not in result
+
+    @pytest.mark.asyncio
+    async def test_safe_execute_no_hint_on_unrelated_error(self):
+        from unittest.mock import AsyncMock
+
+        from vivado_mcp.server import _safe_execute
+        from vivado_mcp.vivado.tcl_utils import TclResult
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=TclResult(
+                output="ERROR: get_property failed: no such object 'foo'",
+                return_code=1,
+                is_error=True,
+            )
+        )
+        result = await _safe_execute(session, "get_property foo bar", 30.0, "run_tcl")
+        assert "get_critical_warnings" not in result
