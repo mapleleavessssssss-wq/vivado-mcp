@@ -1,11 +1,78 @@
 """会话管理工具：start_session / stop_session / list_sessions。"""
 
 import json
+import logging
 import os
+import sys
 
 from mcp.server.fastmcp import Context
 
 from vivado_mcp.server import _get_manager, mcp
+
+logger = logging.getLogger(__name__)
+
+
+def _check_win_curdir_policy() -> str:
+    """检测 Windows ``NoDefaultCurrentDirectoryInExePath`` 安全策略。
+
+    Win 11 24H2+ 默认开启 = 1。开启后 cmd 即使 cwd 已在脚本目录,跑 ``compile.bat``
+    (无路径前缀)也会报 "'compile.bat' 不是内部或外部命令"。Vivado 2019.1 内部
+    spawn .bat 不传完整路径,直接受此策略 block,launch_simulation 全挂(0.3.16
+    实战实测确认)。
+
+    本函数 **只读** 注册表,**不改**。检测到 =1 时返回警告 + 给用户根治命令。
+    非 Windows 直接返回空串。
+
+    检测位置:HKCU\\Environment 和 HKLM\\SYSTEM\\...\\Environment(任一 =1 即开)。
+    """
+    if sys.platform != "win32":
+        return ""
+
+    try:
+        import winreg  # 标准库,仅 Windows 可用
+    except ImportError:
+        return ""
+
+    locations = [
+        (winreg.HKEY_CURRENT_USER, r"Environment", "HKCU"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            "HKLM",
+        ),
+    ]
+
+    enabled_at: list[str] = []
+    for root, subkey, label in locations:
+        try:
+            with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as k:
+                v, _ = winreg.QueryValueEx(k, "NoDefaultCurrentDirectoryInExePath")
+                if int(v) == 1:
+                    enabled_at.append(label)
+        except FileNotFoundError:
+            # 值不存在 = 默认值(Win 11 24H2 默认 1,但注册表里没显式写),
+            # 这里保守判定:没显式写 → 不警告(避免对老 Win 误报)
+            pass
+        except OSError as e:
+            logger.debug("读注册表失败 %s\\%s: %s", label, subkey, e)
+
+    if not enabled_at:
+        return ""
+
+    return (
+        "\n⚠  警告:Windows NoDefaultCurrentDirectoryInExePath = 1"
+        f"({' + '.join(enabled_at)})。"
+        "\n   Vivado 2019.1 spawn compile.bat 时不带路径,本策略下会报"
+        "'compile.bat 不是内部或外部命令',launch_simulation 全挂(0.3.16 实测)。"
+        "\n   根治命令(用户级,不需要管理员,只影响你自己,下次登录生效):"
+        '\n   reg add "HKCU\\Environment" /v NoDefaultCurrentDirectoryInExePath /d 0 /f'
+        "\n   或暂时在当前 cmd 临时绕过:set NoDefaultCurrentDirectoryInExePath=0"
+        "\n   MCP get_critical_warnings(run_name='sim_1') 会用 Tcl exec + 完整路径"
+        "兜底,绕开此策略,但根治更省事。"
+    )
+
+
+
 
 
 def _check_ascii_paths(vivado_path: str | None) -> str:
@@ -85,12 +152,14 @@ async def start_session(
         )
         status = session.status_dict()
         ascii_warn = _check_ascii_paths(status.get("vivado_path") or vivado_path)
+        curdir_warn = _check_win_curdir_policy()
         return (
             f"会话 '{session_id}' 已就绪（mode={status['mode']}）。\n"
             f"Vivado: {status['vivado_path']}\n"
             f"状态: {status['state']}\n\n"
             f"--- 启动信息 ---\n{banner}"
             f"{ascii_warn}"
+            f"{curdir_warn}"
         )
     except ValueError as e:
         return f"[ERROR] {e}"

@@ -43,6 +43,23 @@ class SimLogTail:
     start_line: int     # tail 第一行在原文件中的行号偏移(0-based,scan 会 +1)
 
 
+@dataclass
+class BatStepResult:
+    """单步 .bat/.sh 子进程结果(launch_simulation -scripts_only fallback)。
+
+    Vivado launch_simulation wrapper 在 spawn .bat 之前炸时,MCP 进程直接接管这
+    几个脚本(compile.bat / elaborate.bat),把它们 spawn 出来抓 stderr,
+    暴露被 Vivado 吞掉的真错。simulate 步骤会启动 xsim/GUI,默认跳过(标记为
+    skipped),只把脚本路径回带,让用户决定是否手动跑。
+    """
+
+    step: str           # "compile" / "elaborate" / "simulate"
+    bat_path: str       # 完整路径
+    returncode: int     # 子进程退出码;-1=skipped, -2=timeout, -3=spawn 异常
+    stdout_tail: str    # tail N 行的 stdout
+    stderr_tail: str    # tail N 行的 stderr
+
+
 @dataclass(frozen=True)
 class NonStandardError:
     """日志中不带 ERROR:/CRITICAL WARNING: 前缀的"明显错误"。
@@ -504,6 +521,136 @@ def parse_sim_logs_output(raw: str) -> tuple[str, list[SimLogTail]]:
             current_start = 0
 
     return sim_dir, logs
+
+
+def parse_launch_scripts_output(
+    raw: str,
+) -> tuple[str, str, list[tuple[str, str, str]]]:
+    """解析 LAUNCH_SCRIPTS_AND_GLOB 输出。
+
+    Returns:
+        ``(sim_dir, scripts_only_status, bat_files)``:
+        - ``sim_dir``: simulation fileset 目录;fileset 不存在时为空串
+        - ``scripts_only_status``: ``already_present`` / ``ok`` / ``triggering`` /
+          ``failed:<原因>`` / ``unknown``;fileset 缺失时为 ``fileset_not_found``,
+          仿真目录缺失时为 ``dir_missing``
+        - ``bat_files``: ``[(step, ext, path), ...]``,step ∈ compile/elaborate/simulate
+    """
+    sim_dir = ""
+    status = "unknown"
+    files: list[tuple[str, str, str]] = []
+
+    for line in raw.splitlines():
+        if line.startswith("VMCP_BAT:sim_dir="):
+            sim_dir = line[len("VMCP_BAT:sim_dir="):].strip()
+        elif line.startswith("VMCP_BAT:scripts_only="):
+            status = line[len("VMCP_BAT:scripts_only="):].strip()
+        elif line.startswith("VMCP_BAT:scripts_only_failed="):
+            reason = line[len("VMCP_BAT:scripts_only_failed="):].strip()
+            status = f"failed:{reason}"
+        elif line.startswith("VMCP_BAT:error="):
+            status = line[len("VMCP_BAT:error="):].strip()
+        elif line.startswith("VMCP_BAT:dir_missing="):
+            status = "dir_missing"
+        elif line.startswith("VMCP_BAT_FILE:"):
+            rest = line[len("VMCP_BAT_FILE:"):]
+            parts = rest.split("|", 2)
+            if len(parts) == 3:
+                step, ext, path = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                if step and ext and path:
+                    files.append((step, ext, path))
+
+    return sim_dir, status, files
+
+
+def parse_bat_run_output(raw: str) -> tuple[int, str]:
+    """解析 RUN_BAT_STEP 输出。
+
+    Returns:
+        ``(rc, output)``:
+        - ``rc``:子进程退出码,-1 表示协议解析失败(没看到 VMCP_BAT_RUN:rc=)
+        - ``output``:stdout + stderr 合并的完整文本(逐行从 VMCP_BAT_RUN_LINE 拼)
+    """
+    rc = -1
+    lines: list[str] = []
+    in_body = False
+
+    for line in raw.splitlines():
+        if line.startswith("VMCP_BAT_RUN:rc="):
+            try:
+                rc = int(line[len("VMCP_BAT_RUN:rc="):].strip())
+            except ValueError:
+                pass
+        elif line == "VMCP_BAT_RUN_OUT_START":
+            in_body = True
+        elif line == "VMCP_BAT_RUN_OUT_END":
+            in_body = False
+        elif in_body and line.startswith("VMCP_BAT_RUN_LINE:"):
+            lines.append(line[len("VMCP_BAT_RUN_LINE:"):])
+
+    return rc, "\n".join(lines)
+
+
+def format_bat_steps_section(
+    results: list[BatStepResult],
+    scripts_only_status: str,
+    sim_dir: str,
+) -> str:
+    """拼接 -scripts_only fallback 诊断段。
+
+    主线展示:每步 .bat 路径 + returncode + stderr 尾。任一步 returncode!=0
+    时给"真错可能在这一步"的提示;全部为 0 时给"launch_simulation wrapper 失败
+    但 .bat 集合本身可跑"的关键结论。
+    """
+    lines: list[str] = []
+    lines.append("=== launch_simulation -scripts_only fallback ===")
+    lines.append(f"仿真目录: {sim_dir}")
+    lines.append(f"-scripts_only 触发状态: {scripts_only_status}")
+    lines.append("")
+
+    if not results:
+        lines.append("未跑任何 .bat / .sh —— 可能 fileset 不对、目录缺失或脚本没生成。")
+        return "\n".join(lines)
+
+    all_ok = all(r.returncode == 0 for r in results if r.returncode != -1)
+    failing = next((r for r in results if r.returncode > 0), None)
+
+    for r in results:
+        lines.append(f"--- {r.step} ({r.bat_path}) ---")
+        if r.returncode == -1:
+            lines.append(f"  跳过: {r.stderr_tail or 'skipped'}")
+        elif r.returncode == -2:
+            lines.append("  ✗ 超时(子进程未在限定时间内结束)")
+        elif r.returncode == -3:
+            lines.append(f"  ✗ spawn 失败: {r.stderr_tail}")
+        else:
+            lines.append(f"  returncode = {r.returncode}")
+            if r.stderr_tail.strip():
+                lines.append("  stderr 尾部:")
+                for ln in r.stderr_tail.splitlines():
+                    lines.append(f"    | {ln}")
+            if r.stdout_tail.strip():
+                lines.append("  stdout 尾部:")
+                for ln in r.stdout_tail.splitlines()[-8:]:
+                    lines.append(f"    | {ln}")
+        lines.append("")
+
+    if failing:
+        lines.append(
+            f"⚠ {failing.step} 步骤 returncode={failing.returncode},真错很可能就在这一步的 stderr。"
+        )
+    elif all_ok:
+        lines.append(
+            "✓ 复刻的 .bat 步骤全部正常退出。说明 launch_simulation 的 wrapper 失败"
+            "(脚本生成之后、spawn 之前的某一步)而非 xvlog/xelab/xsim 本身。"
+        )
+        lines.append(
+            "  绕过工作流: 用户自己 `launch_simulation -scripts_only` 后,在 shell"
+            "(PowerShell / bash)里逐个跑 compile.bat → elaborate.bat → simulate.bat,"
+            "或直接 `xsim.bat <snap> -gui` 拉仿真器。"
+        )
+
+    return "\n".join(lines)
 
 
 def scan_nonstandard_errors(

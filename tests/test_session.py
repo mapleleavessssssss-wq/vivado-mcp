@@ -93,6 +93,68 @@ class TestAsciiPathCheck:
         assert _check_ascii_paths(None) == ""
 
 
+class TestWinCurdirPolicyCheck:
+    """0.3.16:Win 11 24H2+ NoDefaultCurrentDirectoryInExePath 检测。"""
+
+    def test_non_windows_returns_empty(self, monkeypatch):
+        """非 Windows 直接空,不读注册表。"""
+        from vivado_mcp.tools import session_tools
+        monkeypatch.setattr(session_tools.sys, "platform", "linux")
+        assert session_tools._check_win_curdir_policy() == ""
+
+    def test_windows_policy_disabled_returns_empty(self, monkeypatch):
+        """注册表都没值 → 默认 = 不警告(避免老 Win 误报)。"""
+        import sys
+
+        if sys.platform != "win32":
+            import pytest
+            pytest.skip("Windows only")
+        import winreg
+
+        from vivado_mcp.tools import session_tools
+
+        def fake_open(root, subkey, *a, **kw):
+            raise FileNotFoundError("simulated empty registry")
+
+        monkeypatch.setattr(winreg, "OpenKey", fake_open)
+        assert session_tools._check_win_curdir_policy() == ""
+
+    def test_windows_policy_enabled_returns_warning(self, monkeypatch):
+        """注册表 =1 → 警告含 reg add 命令、键值名、根治步骤。"""
+        import sys
+
+        if sys.platform != "win32":
+            import pytest
+            pytest.skip("Windows only")
+        import winreg
+
+        from vivado_mcp.tools import session_tools
+
+        class FakeKey:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_open(root, subkey, *a, **kw):
+            return FakeKey()
+
+        def fake_query(key, name):
+            assert name == "NoDefaultCurrentDirectoryInExePath"
+            return (1, winreg.REG_DWORD)
+
+        monkeypatch.setattr(winreg, "OpenKey", fake_open)
+        monkeypatch.setattr(winreg, "QueryValueEx", fake_query)
+
+        warn = session_tools._check_win_curdir_policy()
+        assert "NoDefaultCurrentDirectoryInExePath" in warn
+        assert "reg add" in warn
+        assert "HKCU" in warn
+        # Vivado 真根因提示
+        assert "compile.bat" in warn
+
+
 class TestSafeExecuteDiagHint:
     """server._safe_execute:Tcl run/sim 失败时追加诊断 hint。"""
 

@@ -8,6 +8,8 @@
 精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **25 个工具 + 5 个智能 Hook** 控制 Xilinx Vivado EDA——少即是多。
 
 > **0.3 系列新增了什么**:
+> - **仿真失败自动剥洋葱(0.3.16)**:`launch_simulation` 失败 + xsim/*.log 全空时(Win 11 24H2 默认安全策略 + Vivado 2019.1 spawn bug 的经典坑),`get_critical_warnings(run_name='sim_1')` 自动 `-scripts_only` 触发 .bat 生成,在 Vivado session 内顺序 `exec` compile/elaborate.bat 抓真错,直接告诉你"是 wrapper 失败还是 RTL 失败" + 给一行 `reg add` 根治命令
+> - **环境陷阱启动自检(0.3.14 / 0.3.16)**:`start_session` 检测中文路径(2019.x TclStackFree)+ Win 11 24H2 `NoDefaultCurrentDirectoryInExePath`=1 + 注册表策略,踩坑前先给警告
 > - **时序违例自动定位(0.3.9)**:`get_timing_report` 违例时自动跑 `report_timing -max_paths 10`,嗅探 5 种模式(CDC / HIGH_FANOUT / LONG_COMBO / IO_UNREGISTERED / UNKNOWN)并给出具体 Tcl 修复命令,不再让你对着时序日志发呆
 > - **CW 修复效果可视化(0.3.9)**:`get_critical_warnings(compare_with_last=True)` 对比上次快照,报告"已消除 N 条 / 新出现 N 条 / 仍存在 N 条",让"改 XDC 有没有改到点子上"直接有数
 > - **长任务可视化**:`get_run_progress` 让 10-30 分钟的综合/实现不再是黑盒
@@ -154,7 +156,7 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI，跑得更快
 ### 诊断(独家差异化)
 | 工具 | 说明 |
 |------|------|
-| `get_critical_warnings` | 提取并按 ID 分类 CRITICAL WARNING + ERROR,含 19 种已知 ID 的中文修复建议。**0.3.9** 加 `compare_with_last=True` 参数:对比上次快照输出"已消除 / 新出现 / 仍存在" 差分,验证修改是否真修到点 |
+| `get_critical_warnings` | 提取并按 ID 分类 CRITICAL WARNING + ERROR,含 19 种已知 ID 的中文修复建议。**0.3.9** 加 `compare_with_last=True` 差分。**0.3.14** errors=0+cw=0 但 STATUS=ERROR 时 tail runme.log 扫非标关键词(TclStackFree/segfault/中文路径 cmd 报错)。**0.3.15/16** `run_name='sim_*'` 时:先 glob xsim/*.log;全空就自动 `launch_simulation -scripts_only` + Vivado session 内 `exec` 跑 compile/elaborate.bat 抓真错 |
 | `check_bitstream_readiness` | **0.3.0** 烧板前一键 READY/WARN/BLOCK 综合判定 |
 | `verify_io_placement` | 对比 XDC 约束（-dict/传统两种语法）与实际 IO 布局，GT 不匹配标为 CRITICAL |
 | `xdc_lint` | **0.3.0** 纯 Python 静态 XDC 检查(PIN_CONFLICT / 漏 IOSTANDARD / DUPLICATE_PORT / CLOCK_NO_PERIOD / 跨文件冲突),不需 Vivado |

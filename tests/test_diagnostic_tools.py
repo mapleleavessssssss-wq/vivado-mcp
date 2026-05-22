@@ -1058,17 +1058,26 @@ class TestSimDiagnose:
         assert "找不到 fileset" in result
 
     @pytest.mark.asyncio
-    async def test_no_logs_found(self):
-        """sim 目录存在但 glob 不到 xsim/*.log。"""
+    async def test_no_logs_triggers_scripts_only_fallback(self):
+        """sim 目录存在但 glob 不到 xsim/*.log → 0.3.15 走 scripts-only fallback。"""
         from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
 
+        # 第一次 execute = TAIL_SIM_LOGS(空)
+        # 第二次 execute = LAUNCH_SCRIPTS_AND_GLOB(也没 .bat,fallback 空走)
         session = AsyncMock()
         session.execute = AsyncMock(
-            return_value=_make_tcl_result(
-                "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
-                "VMCP_SIM:log_count=0\n"
-                "VMCP_SIM_DONE\n"
-            )
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_SIM:log_count=0\n"
+                    "VMCP_SIM_DONE\n"
+                ),
+                _make_tcl_result(
+                    "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_BAT:scripts_only=already_present\n"
+                    "VMCP_BAT_DONE\n"
+                ),
+            ]
         )
         ctx = _mock_context(session)
 
@@ -1080,7 +1089,10 @@ class TestSimDiagnose:
                 run_name="sim_1", session_id="default", ctx=ctx
             )
 
-        assert "未找到任何 xsim 日志文件" in result
+        # 走了 fallback 路径,有相关标签
+        assert "scripts_only" in result.lower() or "scripts-only" in result.lower()
+        # 调了两次:TAIL_SIM_LOGS + LAUNCH_SCRIPTS_AND_GLOB
+        assert session.execute.call_count == 2
 
     @pytest.mark.asyncio
     async def test_sim_path_skips_messagedb_queries(self):
@@ -1088,10 +1100,17 @@ class TestSimDiagnose:
         from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
 
         session = AsyncMock()
+        # 第一次 = TAIL_SIM_LOGS 空,第二次 = fallback LAUNCH_SCRIPTS_AND_GLOB 也空
         session.execute = AsyncMock(
-            return_value=_make_tcl_result(
-                "VMCP_SIM:sim_dir=/tmp\nVMCP_SIM:log_count=0\nVMCP_SIM_DONE\n"
-            )
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_SIM:sim_dir=/tmp\nVMCP_SIM:log_count=0\nVMCP_SIM_DONE\n"
+                ),
+                _make_tcl_result(
+                    "VMCP_BAT:sim_dir=/tmp\nVMCP_BAT:scripts_only=already_present\n"
+                    "VMCP_BAT_DONE\n"
+                ),
+            ]
         )
         ctx = _mock_context(session)
 
@@ -1103,5 +1122,153 @@ class TestSimDiagnose:
                 run_name="sim_1", session_id="default", ctx=ctx
             )
 
-        # 只一次 execute:TAIL_SIM_LOGS,没调 COUNT_WARNINGS / EXTRACT_ERRORS
-        assert session.execute.call_count == 1
+        # 两次 execute:TAIL_SIM_LOGS + LAUNCH_SCRIPTS_AND_GLOB,
+        # 没调 COUNT_WARNINGS / EXTRACT_ERRORS / 快照查询
+        assert session.execute.call_count == 2
+
+
+def _bat_run_ok(out_lines: list[str]) -> str:
+    """构造 RUN_BAT_STEP 协议:rc=0 + body 行。"""
+    body = "\n".join(f"VMCP_BAT_RUN_LINE:{ln}" for ln in out_lines)
+    return f"VMCP_BAT_RUN:rc=0\nVMCP_BAT_RUN_OUT_START\n{body}\nVMCP_BAT_RUN_OUT_END\n"
+
+
+def _bat_run_fail(rc: int, out_lines: list[str]) -> str:
+    body = "\n".join(f"VMCP_BAT_RUN_LINE:{ln}" for ln in out_lines)
+    return f"VMCP_BAT_RUN:rc={rc}\nVMCP_BAT_RUN_OUT_START\n{body}\nVMCP_BAT_RUN_OUT_END\n"
+
+
+class TestSimBatFallback:
+    """0.3.16:Vivado session 内 ``exec cmd /c <full>`` 跑 .bat。
+
+    返工自 0.3.15 — 那版用 Python subprocess,MCP 进程 PATH 不带 vivado/bin
+    导致 xvlog/xelab 假阳性。现在改走 Vivado session 内 exec,PATH 自带 vivado/bin。
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_bat_steps_succeed_means_wrapper_failed(self):
+        """compile + elaborate 都 rc=0 → "wrapper 失败而非脚本失败"结论。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                # 1. TAIL_SIM_LOGS:目录存在但无 *.log
+                _make_tcl_result(
+                    "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_SIM:log_count=0\n"
+                    "VMCP_SIM_DONE\n"
+                ),
+                # 2. LAUNCH_SCRIPTS_AND_GLOB:.bat 已存在,glob 出三步
+                _make_tcl_result(
+                    "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_BAT:scripts_only=already_present\n"
+                    "VMCP_BAT_FILE:compile|bat|C:/proj/proj.sim/sim_1/behav/xsim/compile.bat\n"
+                    "VMCP_BAT_FILE:elaborate|bat|C:/proj/proj.sim/sim_1/behav/xsim/elaborate.bat\n"
+                    "VMCP_BAT_FILE:simulate|bat|C:/proj/proj.sim/sim_1/behav/xsim/simulate.bat\n"
+                    "VMCP_BAT_DONE\n"
+                ),
+                # 3. RUN_BAT_STEP compile → rc=0
+                _make_tcl_result(_bat_run_ok(['"xvlog ..."', "Vivado Simulator 2019.1"])),
+                # 4. RUN_BAT_STEP elaborate → rc=0
+                _make_tcl_result(_bat_run_ok(['"xelab ..."', "Completed static elaboration"])),
+                # simulate 跳过,不会再 execute
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        assert "wrapper 失败" in result or "wrapper" in result
+        assert "compile" in result
+        assert "elaborate" in result
+        assert "simulate" in result  # 路径回带,但跳过
+        # session.execute 共 4 次:TAIL_SIM_LOGS + LAUNCH_SCRIPTS_AND_GLOB + 2 步 RUN_BAT_STEP
+        assert session.execute.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_compile_step_failure_surfaces_stderr(self):
+        """compile.bat rc != 0 → "真错就在 compile" + 展示 stderr。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_SIM:sim_dir=/tmp/proj.sim/sim_1\n"
+                    "VMCP_SIM:log_count=0\n"
+                    "VMCP_SIM_DONE\n"
+                ),
+                _make_tcl_result(
+                    "VMCP_BAT:sim_dir=/tmp/proj.sim/sim_1\n"
+                    "VMCP_BAT:scripts_only=ok\n"
+                    "VMCP_BAT_FILE:compile|sh|/tmp/proj.sim/sim_1/behav/xsim/compile.sh\n"
+                    "VMCP_BAT_FILE:elaborate|sh|/tmp/proj.sim/sim_1/behav/xsim/elaborate.sh\n"
+                    "VMCP_BAT_DONE\n"
+                ),
+                # compile → rc=1 + stderr
+                _make_tcl_result(
+                    _bat_run_fail(1, ["ERROR: cannot find module 'top.v'"])
+                ),
+                # elaborate **不该被调到**(遇错即停),如果调了就 raise
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        # 调用次数:TAIL + GLOB + compile RUN_BAT_STEP = 3(elaborate 跳过)
+        assert session.execute.call_count == 3
+        assert "cannot find module" in result
+        assert "compile" in result
+        # "真错很可能就在这一步" 结论
+        assert "真错" in result or "returncode=1" in result
+
+    @pytest.mark.asyncio
+    async def test_scripts_only_failed_no_bats_generated(self):
+        """launch_simulation -scripts_only 自己 catch 失败 → 没 .bat,fallback 不再
+        spawn 任何东西。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_SIM:log_count=0\n"
+                    "VMCP_SIM_DONE\n"
+                ),
+                _make_tcl_result(
+                    "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_BAT:scripts_only=triggering\n"
+                    "VMCP_BAT:scripts_only_failed=some xilinx internal error\n"
+                    "VMCP_BAT_DONE\n"
+                ),
+                # 不该调第 3 次,如果调了 side_effect StopIteration
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        # 只两次:TAIL + GLOB,没有任何 RUN_BAT_STEP
+        assert session.execute.call_count == 2
+        assert "未跑任何 .bat" in result or "failed:some xilinx" in result

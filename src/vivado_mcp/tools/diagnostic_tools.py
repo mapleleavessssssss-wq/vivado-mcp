@@ -12,13 +12,17 @@ from vivado_mcp.analysis.io_parser import parse_report_io
 from vivado_mcp.analysis.io_verifier import format_io_verification, verify_io_placement
 from vivado_mcp.analysis.verilog_compile_check import compile_check, format_compile_report
 from vivado_mcp.analysis.warning_parser import (
+    BatStepResult,
     WarningReport,
+    format_bat_steps_section,
     format_nonstandard_section,
     format_warning_report,
     group_warnings,
+    parse_bat_run_output,
     parse_critical_warnings,
     parse_diag_counts,
     parse_errors,
+    parse_launch_scripts_output,
     parse_sim_logs_output,
     parse_tail_runme_output,
     scan_nonstandard_errors,
@@ -42,7 +46,9 @@ from vivado_mcp.tcl_scripts import (
     COUNT_WARNINGS,
     EXTRACT_CRITICAL_WARNINGS,
     EXTRACT_ERRORS,
+    LAUNCH_SCRIPTS_AND_GLOB,
     LIST_PROJECT_XDC_FILES,
+    RUN_BAT_STEP,
     TAIL_RUNME_LOG,
     TAIL_SIM_LOGS,
 )
@@ -133,6 +139,108 @@ async def _scan_runme_nonstandard(
     return status, format_nonstandard_section(errs)
 
 
+async def _run_sim_bat_fallback(session, run_name: str, tail_n: int) -> str:
+    """xsim/*.log 缺失时:用 **Vivado session 内 exec** 跑 compile/elaborate.bat。
+
+    Vivado launch_simulation wrapper 在 spawn .bat 之前炸 → xsim/*.log 一个不剩,
+    TAIL_SIM_LOGS 拍空。这条路径自己接管:
+    1. 调 ``LAUNCH_SCRIPTS_AND_GLOB`` 触发 ``launch_simulation -scripts_only``,
+       glob 出 compile/elaborate/simulate .bat
+    2. 逐个 ``session.execute(RUN_BAT_STEP)`` —— **Vivado session 自己 exec**,
+       PATH 自带 vivado/bin + 完整路径绕开 Win 11 24H2
+       ``NoDefaultCurrentDirectoryInExePath`` 安全策略,这两个根因都被绕开
+    3. simulate 跳过(拉 xsim/GUI 阻塞),只回带路径
+
+    历史:0.3.15 用 Python subprocess(MCP 进程 spawn .bat),实测因为 MCP 进程
+    PATH 没 vivado/bin → xvlog/xelab not_recognized 假阳性误导诊断,返工。
+    """
+    try:
+        out = await session.execute(
+            LAUNCH_SCRIPTS_AND_GLOB.format(run_name=run_name), timeout=60.0
+        )
+    except Exception as e:
+        return f"[ERROR] 触发 launch_simulation -scripts_only 失败: {e}"
+
+    sim_dir, scripts_only_status, bat_files = parse_launch_scripts_output(out.output)
+
+    if scripts_only_status == "fileset_not_found":
+        return (
+            f"[ERROR] 找不到 fileset '{run_name}'。请确认 fileset 名(默认 sim_1)。"
+        )
+
+    if not bat_files:
+        return format_bat_steps_section([], scripts_only_status, sim_dir)
+
+    # compile → elaborate → simulate 顺序(simulate 跳过)
+    step_order = {"compile": 0, "elaborate": 1, "simulate": 2}
+    bat_files.sort(key=lambda x: (step_order.get(x[0], 99), x[2]))
+
+    results: list[BatStepResult] = []
+    stop_on_fail = False
+    for step, _ext, bat_path in bat_files:
+        if step == "simulate":
+            results.append(
+                BatStepResult(
+                    step=step,
+                    bat_path=bat_path,
+                    returncode=-1,
+                    stdout_tail="",
+                    stderr_tail=(
+                        "simulate 会启动 xsim/GUI 阻塞,fallback 不自动跑;"
+                        "前两步通过即可手动跑"
+                    ),
+                )
+            )
+            continue
+        if stop_on_fail:
+            results.append(
+                BatStepResult(
+                    step=step,
+                    bat_path=bat_path,
+                    returncode=-1,
+                    stdout_tail="",
+                    stderr_tail="前一步失败,跳过",
+                )
+            )
+            continue
+        # Vivado session 内 exec —— Tcl 模板里 bat_path 双引号包,正反斜杠都行
+        normalized = bat_path.replace("\\", "/")
+        try:
+            r = await session.execute(
+                RUN_BAT_STEP.format(bat_path=normalized), timeout=180.0
+            )
+        except Exception as e:
+            results.append(
+                BatStepResult(
+                    step=step,
+                    bat_path=bat_path,
+                    returncode=-3,
+                    stdout_tail="",
+                    stderr_tail=f"Tcl exec 调用失败: {e}",
+                )
+            )
+            stop_on_fail = True
+            continue
+
+        rc, output = parse_bat_run_output(r.output)
+        body_lines = output.splitlines()
+        tail = "\n".join(body_lines[-tail_n:])
+        results.append(
+            BatStepResult(
+                step=step,
+                bat_path=bat_path,
+                returncode=rc,
+                # 合并通道,stdout/stderr 不可分,放在 stderr_tail 让诊断段优先展示
+                stdout_tail="",
+                stderr_tail=tail,
+            )
+        )
+        if rc != 0:
+            stop_on_fail = True
+
+    return format_bat_steps_section(results, scripts_only_status, sim_dir)
+
+
 async def _diagnose_sim_run(session, run_name: str, tail_n: int) -> str:
     """诊断 simulation fileset(sim_*)失败:tail 所有 xsim 子日志 + 扫非标。
 
@@ -162,10 +270,15 @@ async def _diagnose_sim_run(session, run_name: str, tail_n: int) -> str:
         )
 
     if not logs:
+        # 0.3.15: launch_simulation wrapper 在 spawn .bat **之前**炸时,xsim/*.log
+        # 完全没生成。复刻用户绕过路径:跑 -scripts_only,再 MCP 进程逐个 spawn
+        # compile/elaborate.bat 抓 stderr,把 Vivado 吞掉的真错暴露出来。
+        fallback = await _run_sim_bat_fallback(session, run_name, tail_n)
         return (
             f"仿真目录: {sim_dir}\n"
-            f"未找到任何 xsim 日志文件(预期 {sim_dir}/*/xsim/*.log)。\n"
-            "可能仿真还未启动,或目录结构与预期不符。"
+            f"未找到 xsim 日志文件(预期 {sim_dir}/*/xsim/*.log) —— "
+            "launch_simulation 可能在 spawn .bat 之前就炸了,走 scripts-only fallback:\n\n"
+            f"{fallback}"
         )
 
     lines: list[str] = []

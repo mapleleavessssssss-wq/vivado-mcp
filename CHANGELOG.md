@@ -1,5 +1,82 @@
 # Changelog
 
+## [0.3.16] — 2026-05-22
+
+### 修复(0.3.15 实战定位的 3 个核心问题)
+
+- **Bug A:`get_property DIRECTORY` 在 sim fileset 上返回空 ⭐ 最严重** ——
+  0.3.14 和 0.3.15 的 `TAIL_SIM_LOGS` / `LAUNCH_SCRIPTS_AND_GLOB` 都依赖这个属性
+  取仿真目录,但 Vivado 2019.1 simulation fileset 的 DIRECTORY 属性**是空的**。
+  导致两版 sim 诊断**全部走错分支**(直接报 "找不到 fileset"),用户实战 6 小时
+  才定位。0.3.16 改用 `<proj_dir>/<proj_name>.sim/<sim_fs>` 命名约定推导。
+
+- **Bug B:0.3.15 fallback 方向走错,Python subprocess → Tcl exec 返工** ——
+  0.3.15 用 Python subprocess(MCP 进程 spawn .bat),实战发现 **MCP 进程 PATH
+  不带 vivado/bin** → 跑 compile.bat 时内部 `call xvlog` 报 "xvlog not_recognized"。
+  这是假阳性,真错是 Vivado wrapper 失败。0.3.16 改用 **Vivado session 内
+  `exec cmd /c <完整路径>`**:Vivado session PATH 自带 vivado/bin + 完整路径绕开
+  cwd-in-PATH 安全策略,两个根因都被绕开。新增 `RUN_BAT_STEP` Tcl 模板 +
+  `parse_bat_run_output` 解析(处理 `errorcode=CHILDSTATUS pid rc` /
+  `errorcode=NONE`(stderr+rc=0)等 Tcl exec 边界)。
+
+- **Bug C:Win 11 24H2+ `NoDefaultCurrentDirectoryInExePath` 真根因检测** ——
+  这是 launch_simulation 失败的**真正根因**:Win 11 24H2 默认开 = 1,Vivado 2019.1
+  内部 spawn `compile.bat`(无路径)被该策略 block,12 个 USF-XSim ERROR 全是
+  连锁反应。MCP 0.3.16 起 `start_session` 自动读 HKCU + HKLM 注册表,检测到 = 1
+  就在 banner 警告 + 给用户根治命令:
+  ```cmd
+  reg add "HKCU\Environment" /v NoDefaultCurrentDirectoryInExePath /d 0 /f
+  ```
+  注销/重登生效。**MCP 不自动改用户注册表**(less-is-more + 用户系统主权)。
+
+### Spec 文档
+
+- `vivado-quirks.md` case 2 增补:
+  - Win 11 24H2 真根因(顶在最显眼位置)
+  - 注册表根治命令
+  - 0.3.16 fallback 用 Tcl exec 而非 Python subprocess 的设计理由
+
+### 测试
+
+- 测试总数:428 → 436(+4 个 `parse_bat_run_output` + 3 个
+  `TestWinCurdirPolicyCheck` + 改 3 个 `TestSimBatFallback` 适配新协议)
+- ruff `All checks passed!`
+
+## [0.3.15] — 2026-05-22
+
+### 修复
+
+- **`launch_simulation` 失败但 `xsim/*.log` 全空时的盲区** —— 0.3.14 已会
+  glob 这些日志,但 0.3.13 实战又发现一个 case:Vivado wrapper 在生成
+  `compile.bat / elaborate.bat / simulate.bat` 之后、spawn 它们之前就崩,
+  xsim 工作目录里有 `.bat` 但**一个 `.log` 都没有**,0.3.14 sim 诊断 glob
+  拍空,只能输出"未找到任何 xsim 日志文件"。同时 `get_msg_config -count`
+  显示 12 个 ERROR 但 `-rules`/`-id` 拿不到具体内容(Vivado 2019.1 quirk)。
+
+  0.3.15 起 sim 诊断在 `xsim/*.log` 缺失时自动走 **scripts-only fallback**,
+  复刻用户已验证的绕过工作流:
+  1. Vivado 内 `launch_simulation -scripts_only` 触发脚本生成
+  2. MCP 进程自己 `cmd /c compile.bat` / `bash compile.sh` 等顺序跑,
+     遇错即停,捕获每步 returncode + stdout/stderr 尾
+  3. `simulate` 步骤跳过(会拉 xsim/GUI 阻塞),只回带脚本路径
+  4. compile/elaborate 全过 → 关键结论:"Vivado wrapper 失败而非 xvlog/xelab
+     本身失败,用户可用 -scripts_only + 外部 shell 工作流绕过"
+  5. 任一步失败 → 把 stderr 摘要呈现,把 Vivado 吞掉的真错(找不到模块、
+     语法错误等)暴露给 AI
+
+  PRD locked: `.trellis/tasks/05-22-05-22-launch-sim-bat-fallback/prd.md`
+
+### Spec 文档
+
+- `vivado-quirks.md` case 2 增补 scripts-only fallback 描述 + 用户手动绕过
+  工作流(`launch_simulation -scripts_only` + 外部 shell 跑 `.bat`)
+
+### 测试
+
+- 新增 8 个测试:`parse_launch_scripts_output` 4 个、`format_bat_steps_section`
+  5 个、`TestSimBatFallback`(end-to-end mock subprocess)3 个。测试总数
+  420 → 436(实际 428,小修了重复的 0.3.14 `test_no_logs_found`)。
+
 ## [0.3.14] — 2026-05-22
 
 ### 修复(0.3.13 实战发现的 5 个诊断盲区集中补)

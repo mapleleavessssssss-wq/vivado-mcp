@@ -14,15 +14,19 @@ from __future__ import annotations
 import pathlib
 
 from vivado_mcp.analysis.warning_parser import (
+    BatStepResult,
     CriticalWarning,
     NonStandardError,
     WarningGroup,
     WarningReport,
+    format_bat_steps_section,
     format_nonstandard_section,
     format_warning_report,
     group_warnings,
+    parse_bat_run_output,
     parse_critical_warnings,
     parse_diag_counts,
+    parse_launch_scripts_output,
     parse_pre_bitstream,
     parse_sim_logs_output,
     parse_tail_runme_output,
@@ -660,3 +664,166 @@ class TestParseSimLogsOutput:
         assert len(errs) == 1
         assert errs[0].line_number == 42
         assert errs[0].keyword == "not_recognized_cmd_zh"
+
+
+# ====================================================================== #
+#  parse_launch_scripts_output / format_bat_steps_section
+#  (0.3.15:launch_simulation -scripts_only fallback)
+# ====================================================================== #
+
+
+class TestParseLaunchScriptsOutput:
+    """LAUNCH_SCRIPTS_AND_GLOB 协议解析。"""
+
+    def test_already_present_with_three_bats(self):
+        raw = (
+            "VMCP_BAT:sim_dir=C:/p/p.sim/sim_1\n"
+            "VMCP_BAT:scripts_only=already_present\n"
+            "VMCP_BAT_FILE:compile|bat|C:/p/p.sim/sim_1/behav/xsim/compile.bat\n"
+            "VMCP_BAT_FILE:elaborate|bat|C:/p/p.sim/sim_1/behav/xsim/elaborate.bat\n"
+            "VMCP_BAT_FILE:simulate|bat|C:/p/p.sim/sim_1/behav/xsim/simulate.bat\n"
+            "VMCP_BAT_DONE\n"
+        )
+        sim_dir, status, files = parse_launch_scripts_output(raw)
+        assert sim_dir == "C:/p/p.sim/sim_1"
+        assert status == "already_present"
+        assert len(files) == 3
+        assert files[0] == ("compile", "bat", "C:/p/p.sim/sim_1/behav/xsim/compile.bat")
+
+    def test_scripts_only_failed_carries_reason(self):
+        raw = (
+            "VMCP_BAT:sim_dir=/x\n"
+            "VMCP_BAT:scripts_only=triggering\n"
+            "VMCP_BAT:scripts_only_failed=xilinx internal error\n"
+            "VMCP_BAT_DONE\n"
+        )
+        sim_dir, status, files = parse_launch_scripts_output(raw)
+        assert sim_dir == "/x"
+        assert status == "failed:xilinx internal error"
+        assert files == []
+
+    def test_fileset_not_found(self):
+        raw = "VMCP_BAT:error=fileset_not_found\nVMCP_BAT_DONE\n"
+        sim_dir, status, files = parse_launch_scripts_output(raw)
+        assert sim_dir == ""
+        assert status == "fileset_not_found"
+        assert files == []
+
+    def test_dir_missing(self):
+        raw = (
+            "VMCP_BAT:sim_dir=/missing\n"
+            "VMCP_BAT:dir_missing=1\n"
+            "VMCP_BAT_DONE\n"
+        )
+        sim_dir, status, files = parse_launch_scripts_output(raw)
+        assert sim_dir == "/missing"
+        assert status == "dir_missing"
+
+    def test_malformed_bat_file_lines_ignored(self):
+        """少 | 分隔 / 字段空的行不抛异常,直接跳过。"""
+        raw = (
+            "VMCP_BAT:sim_dir=/x\n"
+            "VMCP_BAT:scripts_only=ok\n"
+            "VMCP_BAT_FILE:compile_only_one_pipe\n"
+            "VMCP_BAT_FILE:|bat|/x/empty_step.bat\n"
+            "VMCP_BAT_FILE:compile|bat|/x/ok.bat\n"
+            "VMCP_BAT_DONE\n"
+        )
+        _, _, files = parse_launch_scripts_output(raw)
+        assert files == [("compile", "bat", "/x/ok.bat")]
+
+
+class TestFormatBatStepsSection:
+    """诊断段渲染。"""
+
+    def test_all_steps_pass_means_wrapper_failure(self):
+        results = [
+            BatStepResult("compile", "/x/compile.bat", 0, "ok", ""),
+            BatStepResult("elaborate", "/x/elaborate.bat", 0, "ok", ""),
+            BatStepResult(
+                "simulate", "/x/simulate.bat", -1, "", "skipped"
+            ),
+        ]
+        out = format_bat_steps_section(results, "already_present", "/x")
+        assert "wrapper 失败" in out
+        assert "/x/compile.bat" in out
+        assert "/x/elaborate.bat" in out
+
+    def test_compile_failure_shows_stderr_and_real_error_hint(self):
+        results = [
+            BatStepResult(
+                "compile", "/x/compile.bat", 1, "", "ERROR: foo missing"
+            ),
+        ]
+        out = format_bat_steps_section(results, "ok", "/x")
+        assert "ERROR: foo missing" in out
+        assert "真错" in out or "returncode=1" in out
+
+    def test_no_results_returns_clean_empty_message(self):
+        out = format_bat_steps_section([], "already_present", "/x")
+        assert "未跑任何 .bat" in out
+
+    def test_timeout_marker(self):
+        results = [
+            BatStepResult("compile", "/x/c.bat", -2, "", "超时(>120s)"),
+        ]
+        out = format_bat_steps_section(results, "ok", "/x")
+        assert "超时" in out
+
+    def test_spawn_failure_marker(self):
+        results = [
+            BatStepResult(
+                "compile", "/x/c.bat", -3, "", "spawn 失败: [WinError 2]"
+            ),
+        ]
+        out = format_bat_steps_section(results, "ok", "/x")
+        assert "spawn 失败" in out
+
+
+class TestParseBatRunOutput:
+    """RUN_BAT_STEP 协议(0.3.16)解析。"""
+
+    def test_rc0_with_body(self):
+        raw = (
+            "VMCP_BAT_RUN:rc=0\n"
+            "VMCP_BAT_RUN_OUT_START\n"
+            "VMCP_BAT_RUN_LINE:line1\n"
+            "VMCP_BAT_RUN_LINE:line2\n"
+            "VMCP_BAT_RUN_OUT_END\n"
+        )
+        rc, out = parse_bat_run_output(raw)
+        assert rc == 0
+        assert out == "line1\nline2"
+
+    def test_rc_nonzero(self):
+        raw = (
+            "VMCP_BAT_RUN:rc=7\n"
+            "VMCP_BAT_RUN_OUT_START\n"
+            "VMCP_BAT_RUN_LINE:ERROR: boom\n"
+            "VMCP_BAT_RUN_OUT_END\n"
+        )
+        rc, out = parse_bat_run_output(raw)
+        assert rc == 7
+        assert "boom" in out
+
+    def test_missing_rc_returns_minus_one(self):
+        """协议解析失败兜底:rc=-1。"""
+        raw = "garbage\nVMCP_BAT_RUN_LINE:nope\n"
+        rc, out = parse_bat_run_output(raw)
+        assert rc == -1
+        # OUT_START 没看到 → body 不会被收
+        assert out == ""
+
+    def test_lines_outside_body_ignored(self):
+        """VMCP_BAT_RUN_LINE: 出现在 OUT_START 之前的不计入 body。"""
+        raw = (
+            "VMCP_BAT_RUN_LINE:ghost\n"
+            "VMCP_BAT_RUN:rc=0\n"
+            "VMCP_BAT_RUN_OUT_START\n"
+            "VMCP_BAT_RUN_LINE:real\n"
+            "VMCP_BAT_RUN_OUT_END\n"
+            "VMCP_BAT_RUN_LINE:also ghost\n"
+        )
+        rc, out = parse_bat_run_output(raw)
+        assert rc == 0
+        assert out == "real"

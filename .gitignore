@@ -55,6 +55,9 @@ usage_statistics_webtalk.*
 # Vivado GUI TCP server 运行时 PID/Port 快照
 vivado_pid*.str
 
+# Vivado xvlog / xelab 调用产生的 protobuf log
+*.pb
+
 # 本地编辑器/工具配置目录(各机器自定义,不入库)
 .claude/
 .trellis/

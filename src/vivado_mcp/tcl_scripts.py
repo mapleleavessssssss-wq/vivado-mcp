@@ -416,7 +416,10 @@ set __sim_fs [get_filesets -quiet {run_name}]
 if {{$__sim_fs eq ""}} {{
     puts "VMCP_SIM:error=fileset_not_found"
 }} else {{
-    set __sim_dir [get_property DIRECTORY $__sim_fs]
+    # Vivado 2019.1 sim fileset 的 DIRECTORY 属性是空的,只能按 layout 约定推:
+    # <proj_dir>/<proj_name>.sim/<sim_fs>。这是 Vivado 默认 layout,不可改。
+    set __proj [current_project]
+    set __sim_dir "[get_property DIRECTORY $__proj]/[get_property NAME $__proj].sim/$__sim_fs"
     puts "VMCP_SIM:sim_dir=$__sim_dir"
     if {{[file isdirectory $__sim_dir]}} {{
         set __logs [glob -nocomplain "$__sim_dir/*/xsim/*.log"]
@@ -446,6 +449,98 @@ if {{$__sim_fs eq ""}} {{
     }}
 }}
 puts "VMCP_SIM_DONE"
+"""
+
+
+# --------------------------------------------------------------------------- #
+#  -scripts_only fallback:launch_simulation 在生成 .bat **之后**、spawn 之前
+#  炸时,xsim/*.log 一个都不生成,TAIL_SIM_LOGS 完全拍空。本脚本:
+#    1. 如 .bat 集合还没生成,触发 launch_simulation -scripts_only
+#    2. glob 出 compile/elaborate/simulate 三步的 .bat / .sh 路径
+#  Python 那边拿到列表后,MCP 进程自己 spawn 这几个脚本,捕获 stderr,
+#  把 Vivado wrapper 吞掉的真错误暴露出来。
+#  格式:
+#    VMCP_BAT:sim_dir=<path>
+#    VMCP_BAT:scripts_only=already_present / ok / triggering
+#    VMCP_BAT:scripts_only_failed=<err>     (catch 到 launch_simulation 异常)
+#    VMCP_BAT:error=fileset_not_found / dir_missing=1
+#    VMCP_BAT_FILE:<step>|<ext>|<path>      (step ∈ compile/elaborate/simulate)
+#    VMCP_BAT_DONE
+# --------------------------------------------------------------------------- #
+
+LAUNCH_SCRIPTS_AND_GLOB = """\
+set __sim_fs [get_filesets -quiet {run_name}]
+if {{$__sim_fs eq ""}} {{
+    puts "VMCP_BAT:error=fileset_not_found"
+}} else {{
+    # 同 TAIL_SIM_LOGS:DIRECTORY 属性在 sim fileset 上空,按 layout 约定推。
+    set __proj [current_project]
+    set __sim_dir "[get_property DIRECTORY $__proj]/[get_property NAME $__proj].sim/$__sim_fs"
+    puts "VMCP_BAT:sim_dir=$__sim_dir"
+    if {{[file isdirectory $__sim_dir]}} {{
+        set __existing [glob -nocomplain "$__sim_dir/*/compile.bat" "$__sim_dir/*/compile.sh"]
+        if {{[llength $__existing] == 0}} {{
+            puts "VMCP_BAT:scripts_only=triggering"
+            if {{[catch {{launch_simulation -scripts_only -simset $__sim_fs}} __err]}} {{
+                puts "VMCP_BAT:scripts_only_failed=$__err"
+            }} else {{
+                puts "VMCP_BAT:scripts_only=ok"
+            }}
+        }} else {{
+            puts "VMCP_BAT:scripts_only=already_present"
+        }}
+        foreach __pat {{compile elaborate simulate}} {{
+            foreach __ext {{bat sh}} {{
+                set __gp "$__sim_dir/*/$__pat.$__ext"
+                foreach __f [glob -nocomplain $__gp] {{
+                    puts "VMCP_BAT_FILE:$__pat|$__ext|$__f"
+                }}
+            }}
+        }}
+    }} else {{
+        puts "VMCP_BAT:dir_missing=1"
+    }}
+}}
+puts "VMCP_BAT_DONE"
+"""
+
+
+# --------------------------------------------------------------------------- #
+#  在 **Vivado session 内** exec 单步 .bat。理由:
+#    - Vivado 自己 spawn .bat 时不传完整路径,Win 11 24H2 默认开启
+#      NoDefaultCurrentDirectoryInExePath 导致 'compile.bat' not recognized
+#    - MCP 进程的 PATH 不含 vivado/bin,Python subprocess 跑 .bat 也会 xvlog
+#      not recognized,假阳性误导诊断
+#    - **Vivado session 内** PATH 含 vivado/bin,exec cmd /c <完整路径> 既绕开
+#      cwd-in-PATH 安全策略,又能让 .bat 内 call xvlog/xelab 找到
+#  edge case:Tcl exec 在子进程写过 stderr 时即使 rc=0 也会 catch 抛,要看
+#  errorcode 是不是 CHILDSTATUS 才算真失败。
+#  格式:
+#    VMCP_BAT_RUN:rc=<int>
+#    VMCP_BAT_RUN_OUT_START
+#    VMCP_BAT_RUN_LINE:<文本>     (合并 stdout+stderr,逐行)
+#    VMCP_BAT_RUN_OUT_END
+# --------------------------------------------------------------------------- #
+
+RUN_BAT_STEP = """\
+set __bat "{bat_path}"
+set __out ""
+set __rc 0
+if {{[catch {{exec cmd /c $__bat}} __out __opt]}} {{
+    set __ec [dict get $__opt -errorcode]
+    if {{[llength $__ec] >= 3 && [lindex $__ec 0] eq "CHILDSTATUS"}} {{
+        set __rc [lindex $__ec 2]
+    }} else {{
+        # rc=0 但子进程写过 stderr,Tcl exec 也抛 error,errorcode=NONE
+        set __rc 0
+    }}
+}}
+puts "VMCP_BAT_RUN:rc=$__rc"
+puts "VMCP_BAT_RUN_OUT_START"
+foreach __l [split $__out "\\n"] {{
+    puts "VMCP_BAT_RUN_LINE:$__l"
+}}
+puts "VMCP_BAT_RUN_OUT_END"
 """
 
 
