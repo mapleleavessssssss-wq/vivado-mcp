@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.3.18] — 2026-05-23
+
+### 修复(0.3.17 实战暴露的 sim 工具链可用性问题)
+
+- **Bug-1:中文 Windows stdio mode 输出乱码 ⭐** —— `run_tcl` / `report_*`
+  返回的路径含中文时全是 `���` 或 `锟斤拷锟斤拷锟斤拷`。根因:Vivado 子进程 stdout 在
+  中文 Win 默认 CP936(GBK)编码,但 `session.py` 4 处 decode 强制
+  `raw.decode("utf-8", errors="replace")` 把 GBK 字节全 replace 成 U+FFFD。
+  修:新增 `vivado/tcl_utils.py::decode_vivado_output(raw)` —— UTF-8 严格 decode +
+  含 U+FFFD 时 fallback `mbcs`(Windows 系统 code page);`session.py` 4 处全部
+  改走新 helper。**关键认知**:fallback 不是兜底,是和 Vivado stdout 实际编码
+  对齐的完整解;hex 双向 transport 在没具体未解 case 前属预防性重构,违反
+  less-is-more,本版本不做。
+- **Bug-2:GUI session 中文路径范围扩展(quirks 文档化) ⭐** —— 0.3.13 quirks
+  §1 只覆盖"工程根目录中文 → 综合 elaborate 崩 TclStackFree"。0.3.17 实战
+  补充:**GUI session 内 `cd D:/项目/...` / `open_project D:/项目/xxx.xpr`
+  同样触发 TclStackFree**,session 直接挂掉,范围不限于综合阶段。Vivado 2019.1
+  C++ 层 bug 无法从 MCP 修,但 `_check_ascii_paths` 警告文本扩了 GUI 范围
+  + quirks §1 扩"影响范围"段。
+
+### 知识库沉淀(用户 0.3.17 会话踩过的 9 项 sim 坑)
+
+`.trellis/spec/backend/vivado-quirks.md` 新增/扩段:
+
+- **§5 重命名为"Tcl 命令替换 + filter 表达式陷阱"**,新增子段:
+  - §5.2 `puts "[X]"` 命令替换(Note-6) → 改 `puts {[X]}`
+  - §5.3 `=~ filter` 中 `[N]` 单字符是字面非 glob 字符类(Note-5) → 不要转义
+- **新增 §8 XSim 仿真 Tcl 写法陷阱**,7 个 sub-section:
+  - §8.1 `add_wave` / `get_objects` 拒 escaped id → 必须 `current_scope` + short name
+  - §8.2 `if-generate` 命名块不是 scope → 内部 reg 无法 add_wave(0.3.17 实战
+    中 `decim_cnt` / `strobe_pipe` / `align_reg` / `valid_d` 4 个 reg 全因此弃)
+  - §8.3 `add_wave_group` ⭐⭐⭐ 必须 `-into $g`(最高频踩坑)
+  - §8.4 `remove_wave` 只认 `[get_waves *]`,`-all` / `*` / `-of_objects` 都不工作
+  - §8.5 `xsim -tclbatch` 在 EOF 不自动 quit,**必须显式 `quit`**
+  - §8.6 `get_scopes` 不支持多 path 参数
+  - §8.7 `size > 1` filter 对 escaped id 总线对象无效
+- **新增 §9 stdio mode 中文输出乱码(0.3.18 修复)** 说明 + 为什么不上 hex transport
+
+### 自动注入(让 AI 调 `run_tcl` 时主动看见 sim 坑)
+
+`tools/tcl_tools.py::run_tcl` docstring 末尾增 "XSim 仿真常见坑摘要" 段,精选
+4 个最高频 (§8.3 add_wave_group / §8.1 escaped id / §8.4 remove_wave / §8.5
+xsim quit) + 1 个高频混淆点(§5.1 `[N]` 命令替换)。MCP 客户端在工具签名注入
+时会读 docstring,AI 每次拿到 `run_tcl` 描述都能看到。
+
+### Less-is-more 拒绝声明
+
+`spec/backend/quality-guidelines.md §1.4 拒绝案例表` 新增一行:wave 类 helper
+(`find_scope` / `add_signals_to_group` / `clear_wave_config` / `source_tcl_file`
+4 个提议)**全部拒**。等价用法一行 `run_tcl` 即可,已落进 docstring + quirks。
+
+### 测试
+
+- 测试总数:437 → 446(+9 `test_session_encoding.py` decode fallback 覆盖
+  UTF-8 / GBK / mbcs / 非法字节 / robustness;+1 `test_session.py` 锁住 GUI
+  范围扩展的警告文本断言)
+- ruff `All checks passed!`
+
 ## [0.3.17] — 2026-05-22
 
 ### 修复(0.3.16 实测发现的 3 个 sim 诊断漏洞)

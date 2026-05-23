@@ -22,7 +22,7 @@ async def run_tcl(
     timeout: int = 120,
     ctx: Context = None,
 ) -> str:
-    """执行任意 Vivado Tcl 命令。支持所有 Vivado Tcl API。
+    r"""执行任意 Vivado Tcl 命令。支持所有 Vivado Tcl API。
 
     这是最通用的工具，可以执行任何 Vivado Tcl 命令，包括：
 
@@ -38,6 +38,39 @@ async def run_tcl(
     支持多行脚本（用换行符分隔）。
 
     **路径含特殊字符时请用 safe_tcl 而非 run_tcl**，避免 Tcl 解析错误。
+
+    **XSim 仿真常见坑摘要**（0.3.17 实战沉淀,完整版见 vivado-quirks.md §8）:
+
+    - **`add_wave_group` 必须配 `-into $g`**,否则信号全跑到顶层,group 是空的:
+
+      ```tcl
+      set g [add_wave_group sig_grp]
+      add_wave -into $g /tb/clk     ;# ✓ 进 group
+      add_wave /tb/rst              ;# ✗ 跑到顶层
+      ```
+
+    - **`add_wave` / `get_objects` 拒 escaped id**,必须先 `current_scope` 切到目标
+      scope 再用 short name:
+
+      ```tcl
+      # ✗ add_wave {\u_dut/sig}
+      current_scope /tb/u_dut       ;# ✓ 切上下文
+      add_wave sig
+      ```
+
+    - **清空波形只认 `remove_wave [get_waves *]`**,`-all` / `*` / `-of_objects` 都
+      不工作(XSim 2019.1 bug)
+
+    - **`xsim -tclbatch` 文件必须显式 `quit`**,EOF 不自动退出,会卡死 CI
+
+    - **`if-generate` 命名块不是 scope** —— 内部 reg 无 add_wave 寻址路径
+
+    - **`[N]` / `[X]` 在 Tcl 字符串里会触发命令替换**,用 `{}` 包字面路径:
+
+      ```tcl
+      # ✗ add_wave /tb/gen_ch[0].u/sig    invalid command "0"
+      add_wave {/tb/gen_ch[0].u/sig}
+      ```
 
     Args:
         command: Tcl 命令文本（支持多行）。

@@ -136,8 +136,10 @@ def _check_ascii_paths(vivado_path: str | None) -> str:
         "\n⚠  警告:检测到路径含非 ASCII 字符:\n"
         + "\n".join(f"   {p}" for p in non_ascii_paths)
         + "\n   Vivado 2019.x 在中文路径下可能触发 TclStackFree 崩溃(0.3.13 实战见过)。"
+        "\n   范围:综合 .runs/ .sim/ 输出目录 + GUI session 内 cd/open_project"
+        " 同样会触发(0.3.17 实战补充)。"
         "\n   建议工程目录搬到纯 ASCII(如 C:/vivado_work/)。"
-        "\n   源文件中文 OK,但 .runs/ .sim/ 等输出目录必须 ASCII。"
+        "\n   源文件中文 OK,但工程根目录 / 输出目录必须 ASCII。"
     )
 
 

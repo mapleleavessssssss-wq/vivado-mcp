@@ -8,8 +8,10 @@
 精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **25 个工具 + 5 个智能 Hook** 控制 Xilinx Vivado EDA——少即是多。
 
 > **0.3 系列新增了什么**:
+> - **中文 Windows stdio mode 输出对齐(0.3.18)** ⭐:0.3.17 及之前 `run_tcl` 在中文 Win 上返回的路径含中文时会变 `锟斤拷` / `���`(Vivado stdout 默认 CP936/GBK,但 session.py 强制 UTF-8 decode)。新增 `decode_vivado_output()` —— UTF-8 严格 decode + 含 U+FFFD 时 fallback `mbcs`(系统 code page),全链路对齐。**仅影响 tcl/stdio 模式**,GUI mode TCP UTF-8 协议本来就 OK
+> - **XSim 仿真坑摘要自动注入 run_tcl docstring(0.3.18)**:0.3.17 用户实战踩了一遍 XSim 的 9 个 Tcl 写法坑(`add_wave_group` 必须 `-into $g` / escaped id 必须 `current_scope` 切上下文 / `remove_wave` 只认 `[get_waves *]` / `xsim -tclbatch` 必须显式 `quit` 等)。这些坑的精简摘要直接塞到 `run_tcl` docstring 末尾 —— AI 每次拿到工具描述就能看到,不用等踩了再问
 > - **仿真失败自动剥洋葱(0.3.16)**:`launch_simulation` 失败 + xsim/*.log 全空时(Win 11 24H2 默认安全策略 + Vivado 2019.1 spawn bug 的经典坑),`get_critical_warnings(run_name='sim_1')` 自动 `-scripts_only` 触发 .bat 生成,在 Vivado session 内顺序 `exec` compile/elaborate.bat 抓真错,直接告诉你"是 wrapper 失败还是 RTL 失败" + 给一行 `reg add` 根治命令
-> - **环境陷阱启动自检(0.3.14 / 0.3.16)**:`start_session` 检测中文路径(2019.x TclStackFree)+ Win 11 24H2 `NoDefaultCurrentDirectoryInExePath`=1 + 注册表策略,踩坑前先给警告
+> - **环境陷阱启动自检(0.3.14 / 0.3.16 / 0.3.18)**:`start_session` 检测中文路径(2019.x TclStackFree,**0.3.18 扩警告:GUI session 内 cd/open_project 中文路径同样触发**)+ Win 11 24H2 `NoDefaultCurrentDirectoryInExePath`=1 + 注册表策略,踩坑前先给警告
 > - **时序违例自动定位(0.3.9)**:`get_timing_report` 违例时自动跑 `report_timing -max_paths 10`,嗅探 5 种模式(CDC / HIGH_FANOUT / LONG_COMBO / IO_UNREGISTERED / UNKNOWN)并给出具体 Tcl 修复命令,不再让你对着时序日志发呆
 > - **CW 修复效果可视化(0.3.9)**:`get_critical_warnings(compare_with_last=True)` 对比上次快照,报告"已消除 N 条 / 新出现 N 条 / 仍存在 N 条",让"改 XDC 有没有改到点子上"直接有数
 > - **长任务可视化**:`get_run_progress` 让 10-30 分钟的综合/实现不再是黑盒

@@ -8,6 +8,7 @@
 """
 
 import re
+import sys
 import uuid
 from dataclasses import dataclass
 
@@ -170,6 +171,40 @@ def clean_output(raw: str) -> str:
     text = _VIVADO_PROMPT_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def decode_vivado_output(raw: bytes) -> str:
+    """解码 Vivado 子进程 stdout/stderr 字节流。
+
+    Vivado 在 Windows 中文系统 stdout 默认是系统 ANSI（CP936/GBK），
+    `raw.decode("utf-8", errors="replace")` 会让中文输出大面积变成
+    `�`（U+FFFD）—— 这是 0.3.18 修复前的乱码根因。
+
+    策略（双层 fallback）：
+    1. 先 UTF-8 严格 decode；若成功且**不含 U+FFFD**，直接返回
+    2. UTF-8 失败 或 含 U+FFFD → fallback 到系统 ANSI
+       - Windows：`mbcs`（系统 code page，中文系统 = CP936）
+       - 非 Windows：兜底 `utf-8` with `errors="replace"`
+         （Linux/Mac 上 Vivado 一般就是 UTF-8，这条分支几乎不触发）
+
+    Args:
+        raw: 原始字节流（Vivado 子进程 stdout/stderr 一行或一段）。
+
+    Returns:
+        正确解码的字符串。绝对不会抛 UnicodeDecodeError。
+    """
+    try:
+        text = raw.decode("utf-8")
+        if "�" not in text:
+            return text
+    except UnicodeDecodeError:
+        pass
+    if sys.platform == "win32":
+        try:
+            return raw.decode("mbcs")
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return raw.decode("utf-8", errors="replace")
 
 
 # --------------------------------------------------------------------------- #

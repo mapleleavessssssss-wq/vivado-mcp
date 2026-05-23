@@ -18,6 +18,7 @@ from vivado_mcp.vivado.base_session import BaseSession, SessionState
 from vivado_mcp.vivado.tcl_utils import (
     TclResult,
     clean_output,
+    decode_vivado_output,
     generate_sentinel,
     make_sentinel_pattern,
     wrap_command,
@@ -111,7 +112,7 @@ class SubprocessSession(BaseSession):
                 raw = await self._process.stderr.readline()
                 if not raw:
                     break
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                line = decode_vivado_output(raw).rstrip("\r\n")
                 if line:
                     self._stderr_buffer.append(line)
         except asyncio.CancelledError:
@@ -155,16 +156,18 @@ class SubprocessSession(BaseSession):
                     stderr_out = ""
                     if self._process.stderr:
                         try:
-                            stderr_out = (await asyncio.wait_for(
-                                self._process.stderr.read(), timeout=2.0
-                            )).decode("utf-8", errors="replace")
+                            stderr_out = decode_vivado_output(
+                                await asyncio.wait_for(
+                                    self._process.stderr.read(), timeout=2.0
+                                )
+                            )
                         except asyncio.TimeoutError:
                             pass
                     raise RuntimeError(
                         f"Vivado 进程意外退出。stderr: {stderr_out}"
                     )
 
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                line = decode_vivado_output(raw).rstrip("\r\n")
                 m = pattern.search(line)
                 if m:
                     # 找到 sentinel，启动完成
@@ -258,7 +261,7 @@ class SubprocessSession(BaseSession):
                         f"Vivado 进程意外终止（会话 '{self.session_id}'）。"
                     )
 
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                line = decode_vivado_output(raw).rstrip("\r\n")
 
                 m = pattern.search(line)
                 if m:

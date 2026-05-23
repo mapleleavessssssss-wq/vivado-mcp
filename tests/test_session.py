@@ -92,6 +92,19 @@ class TestAsciiPathCheck:
         monkeypatch.chdir(tmp_path)
         assert _check_ascii_paths(None) == ""
 
+    def test_warning_mentions_gui_session_scope_extension(self):
+        """0.3.18 锁:警告必须告知 GUI session cd/open 中文路径也会炸。
+
+        0.3.17 实战发现:旧警告只覆盖综合 .runs/.sim/ 输出目录,但 GUI
+        session 内 cd/open_project 中文路径同样触发 TclStackFree。
+        """
+        from vivado_mcp.tools.session_tools import _check_ascii_paths
+        warn = _check_ascii_paths("D:/项目/Vivado/2019.1/bin/vivado.bat")
+        # GUI session 范围扩展提示必须存在
+        assert "GUI session" in warn or "open_project" in warn
+        # 仍保留原有综合输出目录提示
+        assert ".runs/" in warn or "输出目录" in warn
+
 
 class TestWinCurdirPolicyCheck:
     """0.3.16:Win 11 24H2+ NoDefaultCurrentDirectoryInExePath 检测。"""
