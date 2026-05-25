@@ -8,6 +8,9 @@
 精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **25 个工具 + 5 个智能 Hook** 控制 Xilinx Vivado EDA——少即是多。
 
 > **0.3 系列新增了什么**:
+> - **list_sessions 不再"无中生有"(0.3.21)** ⭐:0.3.19 加的"主动探测外部 Vivado"在装了 VMware / Hyper-V 虚拟网卡的机器上会**偶发误报**——端口 10000 上其实是虚拟网卡服务凑巧回了类 JSON 的数据,被错认成 Vivado。本版给握手加**随机 token**(`puts VMCP_PROBE_<uuid>`),服务端必须把 token 原样回弹才算真 Vivado——假阳性归零
+> - **Vivado 报错时自动多送一句"清理指南"(0.3.20)** ⭐:wave 类命令(`open_wave_database` / `add_wave` / `log_wave` 等)失败时,Vivado GUI 会留下**孤儿 simulation tab + 几百 MB 内存浪费**。本版在错误输出末尾自动追加可复制的 `close_sim` / `close_wave_config` 清理脚本片段,AI 不用主动查 quirks;同时 `run_tcl` 工具描述里塞进 4 条 XSim 写脚本静默踩坑(如 `set_property RADIX` 必须小写 `dec` 不能大写 `DEC`)。**契约**:原始 Vivado 输出**不改写,只追加**
+> - **手动开的 Vivado GUI 现在能"接力"(0.3.19)** ⭐:你自己跑 `vivado -mode gui`(`vivado-mcp install` 已注入 init.tcl 让它自动开 TCP server),之后从 AI 调 `start_session(mode="gui")` **不会再 spawn 第二个 GUI 孤儿**,而是直接 attach 到你那台——端口冲突 + 800 MB 内存浪费的老坑没了。`list_sessions` 也会把你手动开的列为 `<external@端口>`,并注明"stop_session 无权关闭,请在 GUI 内手动 exit"
 > - **中文 Windows stdio mode 输出对齐(0.3.18)** ⭐:0.3.17 及之前 `run_tcl` 在中文 Win 上返回的路径含中文时会变 `锟斤拷` / `���`(Vivado stdout 默认 CP936/GBK,但 session.py 强制 UTF-8 decode)。新增 `decode_vivado_output()` —— UTF-8 严格 decode + 含 U+FFFD 时 fallback `mbcs`(系统 code page),全链路对齐。**仅影响 tcl/stdio 模式**,GUI mode TCP UTF-8 协议本来就 OK
 > - **XSim 仿真坑摘要自动注入 run_tcl docstring(0.3.18)**:0.3.17 用户实战踩了一遍 XSim 的 9 个 Tcl 写法坑(`add_wave_group` 必须 `-into $g` / escaped id 必须 `current_scope` 切上下文 / `remove_wave` 只认 `[get_waves *]` / `xsim -tclbatch` 必须显式 `quit` 等)。这些坑的精简摘要直接塞到 `run_tcl` docstring 末尾 —— AI 每次拿到工具描述就能看到,不用等踩了再问
 > - **仿真失败自动剥洋葱(0.3.16)**:`launch_simulation` 失败 + xsim/*.log 全空时(Win 11 24H2 默认安全策略 + Vivado 2019.1 spawn bug 的经典坑),`get_critical_warnings(run_name='sim_1')` 自动 `-scripts_only` 触发 .bat 生成,在 Vivado session 内顺序 `exec` compile/elaborate.bat 抓真错,直接告诉你"是 wrapper 失败还是 RTL 失败" + 给一行 `reg add` 根治命令
@@ -112,16 +115,21 @@ pip install -e ".[dev]"
 
 | mode | 效果 | 适合 |
 |---|---|---|
-| `"gui"` (默认) | MCP 自动 spawn `vivado -mode gui`，你能看到 Vivado 图标 | 交互开发、实时观察波形/原理图 |
+| `"gui"` (默认) | **先 probe 端口**(0.3.19+):已有 vmcp server 直接 attach,没有才 spawn `vivado -mode gui` | 交互开发、实时观察波形/原理图;**支持复用你手动开的 GUI**(只要装过 `vivado-mcp install`) |
 | `"tcl"` | `vivado -mode tcl` 无头子进程 | CI、批处理、不需要 GUI |
-| `"attach"` | 连接到你已手动打开的 Vivado GUI | 想在 GUI 里手动捣鼓 + AI 辅助 |
+| `"attach"` | 只 attach,不 spawn(端口无 server 时直接报错) | 严格保证不会启新 GUI 进程的场景 |
 
 ```
 用户: 启动 GUI 会话
-AI: [调用 start_session(mode="gui")] → 桌面弹出 Vivado 窗口
+AI: [调用 start_session(mode="gui")]
+    → 端口空 → spawn 新 Vivado;端口已有 → attach 到现有 GUI(0.3.19+)
+    
+用户: 我刚自己手动开了 Vivado GUI,直接接管
+AI: [调用 list_sessions]   → 看到 <external@9999>(你手动开的)
+    [调用 start_session(mode="gui")]   → 自动 attach,不会再开第二个 GUI
 
 用户: 批处理跑 10 个项目
-AI: [调用 start_session(mode="tcl")] → 无 GUI，跑得更快
+AI: [调用 start_session(mode="tcl")] → 无 GUI,跑得更快
 ```
 
 ## 工具列表
