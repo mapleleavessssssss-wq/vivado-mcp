@@ -226,15 +226,21 @@ class TestSafeExecuteDiagHint:
 
     def test_looks_like_run_failure_synth(self):
         from vivado_mcp.server import _looks_like_run_failure
-        assert _looks_like_run_failure("synth_design ERROR foo")
-        assert _looks_like_run_failure("ERROR: launch_simulation failed")
-        assert _looks_like_run_failure("Common 17-39 failed due to earlier errors")
+        assert _looks_like_run_failure("synth_design ERROR foo", "")
+        assert _looks_like_run_failure("ERROR: launch_simulation failed", "")
+        assert _looks_like_run_failure(
+            "Common 17-39 failed due to earlier errors", ""
+        )
+        # 0.3.20:命令文本也能命中(haystack = command + output)
+        assert _looks_like_run_failure("nothing", "launch_runs synth_1")
 
     def test_looks_like_run_failure_negative(self):
         from vivado_mcp.server import _looks_like_run_failure
-        assert not _looks_like_run_failure("ERROR: get_property failed: no such object")
-        assert not _looks_like_run_failure("")
-        assert not _looks_like_run_failure("INFO: all good")
+        assert not _looks_like_run_failure(
+            "ERROR: get_property failed: no such object", ""
+        )
+        assert not _looks_like_run_failure("", "")
+        assert not _looks_like_run_failure("INFO: all good", "puts 3.3")
 
     @pytest.mark.asyncio
     async def test_safe_execute_appends_hint_on_run_failure(self):
@@ -289,3 +295,130 @@ class TestSafeExecuteDiagHint:
         )
         result = await _safe_execute(session, "get_property foo bar", 30.0, "run_tcl")
         assert "get_critical_warnings" not in result
+
+
+class TestQuirkHintsA1A2:
+    """0.3.20 W hints:A1 open_wave_config 误报 + A2 wave 失败状态泄漏。"""
+
+    def test_open_wave_spurious_trigger_match(self):
+        from vivado_mcp.server import _looks_like_open_wave_spurious
+        out = "ERROR: [Common 17-39] 'open_wave_config' failed due to earlier errors."
+        assert _looks_like_open_wave_spurious(out, "open_wave_database foo.wdb")
+        # 不含该关键串 → 不命中
+        assert not _looks_like_open_wave_spurious("ERROR: other failure", "any cmd")
+
+    def test_wave_failure_cleanup_trigger_match(self):
+        from vivado_mcp.server import _looks_like_wave_failure_needs_cleanup
+        # wave 类命令 + err
+        assert _looks_like_wave_failure_needs_cleanup(
+            "ERROR: bad",
+            "open_wave_database foo.wdb",
+        )
+        assert _looks_like_wave_failure_needs_cleanup(
+            "'open_wave_config' failed",
+            "add_wave /tb/clk",
+        )
+        # 非 wave 类命令即使 err 也不触发 cleanup 提示
+        assert not _looks_like_wave_failure_needs_cleanup(
+            "ERROR: synth_design failed",
+            "synth_design",
+        )
+        # wave 类命令但无 err 不触发
+        assert not _looks_like_wave_failure_needs_cleanup(
+            "info: ok",
+            "open_wave_database foo.wdb",
+        )
+
+    @pytest.mark.asyncio
+    async def test_safe_execute_appends_a1_a2_hints_on_open_wave_spurious(self):
+        from unittest.mock import AsyncMock
+
+        from vivado_mcp.server import _safe_execute
+        from vivado_mcp.vivado.tcl_utils import TclResult
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=TclResult(
+                output=(
+                    "ERROR: [Common 17-39] 'open_wave_config' failed "
+                    "due to earlier errors."
+                ),
+                return_code=1,
+                is_error=True,
+            )
+        )
+        result = await _safe_execute(
+            session, "open_wave_database C:/path/x.wdb", 30.0, "run_tcl"
+        )
+        # A1 hint 关键标记:current_sim + current_wave_config + get_scopes
+        assert "current_sim" in result
+        assert "current_wave_config" in result
+        assert "get_scopes" in result
+        # A2 hint 关键标记:close_sim 清理片段 + stop_session 重启兜底
+        assert "close_sim" in result
+        assert "stop_session" in result
+        # 同时也触发 A2(wave 类命令 + err)
+        assert "close_wave_config" in result
+
+    @pytest.mark.asyncio
+    async def test_safe_execute_no_hint_on_open_wave_success(self):
+        from unittest.mock import AsyncMock
+
+        from vivado_mcp.server import _safe_execute
+        from vivado_mcp.vivado.tcl_utils import TclResult
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=TclResult(
+                output="", return_code=0, is_error=False
+            )
+        )
+        result = await _safe_execute(
+            session, "open_wave_database C:/path/x.wdb", 30.0, "run_tcl"
+        )
+        assert "current_sim" not in result
+        assert "close_sim" not in result
+
+    @pytest.mark.asyncio
+    async def test_safe_execute_does_not_rewrite_original_err(self):
+        """W 模式核心契约:原始 Vivado 输出永远不改写,只追加。"""
+        from unittest.mock import AsyncMock
+
+        from vivado_mcp.server import _safe_execute
+        from vivado_mcp.vivado.tcl_utils import TclResult
+
+        original = (
+            "ERROR: [Common 17-39] 'open_wave_config' failed due to earlier errors."
+        )
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=TclResult(
+                output=original, return_code=1, is_error=True
+            )
+        )
+        result = await _safe_execute(
+            session, "open_wave_database foo.wdb", 30.0, "run_tcl"
+        )
+        # 原 err 字符串必须完整保留在返回里
+        assert original in result
+
+
+class TestAsciiPathScopeAnnotation:
+    """0.3.20:_check_ascii_paths 警告文本含命令范围说明,避免狼来了。"""
+
+    def test_warning_lists_affected_write_commands(self):
+        from vivado_mcp.tools.session_tools import _check_ascii_paths
+        warn = _check_ascii_paths("D:/项目/Vivado/2019.1/bin/vivado.bat")
+        # 写入类命令明确列出
+        assert "create_project" in warn
+        assert "synth_design" in warn or "launch_runs" in warn
+        assert "launch_simulation" in warn
+
+    def test_warning_lists_safe_readonly_commands(self):
+        from vivado_mcp.tools.session_tools import _check_ascii_paths
+        warn = _check_ascii_paths("D:/项目/Vivado/2019.1/bin/vivado.bat")
+        # 只读 op 明确不踩,可忽略
+        assert "open_wave_database" in warn
+        assert "report_" in warn or "report_*" in warn or "report" in warn
+        # 必须有"可忽略"的明确语义
+        assert "可忽略" in warn or "不踩" in warn or "不受影响" in warn

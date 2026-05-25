@@ -140,6 +140,12 @@ def _check_ascii_paths(vivado_path: str | None) -> str:
         " 同样会触发(0.3.17 实战补充)。"
         "\n   建议工程目录搬到纯 ASCII(如 C:/vivado_work/)。"
         "\n   源文件中文 OK,但工程根目录 / 输出目录必须 ASCII。"
+        "\n   ─── 受影响命令(0.3.20 实战澄清)───"
+        "\n   ✗ 会踩:create_project / synth_design / launch_runs / "
+        "launch_simulation / open_project / cd 到中文目录"
+        "\n   ✓ 不踩(可忽略此警告):open_wave_database / get_* / report_* / "
+        "list_* / current_* 等纯读取/查询命令,以及在已打开的 GUI session 里跑"
+        "上述只读 op"
     )
 
 

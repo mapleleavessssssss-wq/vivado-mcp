@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.3.20] — 2026-05-25
+
+### 修复 + 知识库沉淀(XSim 实战 10 项坑收纳 — W+ 路线)
+
+> **设计哲学**:less-is-more 反对加 facade 工具,但**不**反对"把固定信息硬塞给
+> AI"。本版本走 W+ 模式:能在 err 触发的坑走 `_safe_execute` 末尾追加 hint(AI
+> 必看);写脚本前要知道的进 `run_tcl` tool description(每次调用都加载);用户
+> 操作约束进项目根 PITFALLS.md;完整背景留 vivado-quirks.md 作设计文档。
+
+#### A 类(MCP 主动 W hint)
+
+- **A1:`open_wave_database` 在裸 Vivado GUI 里报 `'open_wave_config' failed`
+  误报** —— rc=0 但 stderr 输出 err,wdb 实际加载成功。`_safe_execute` 检测到这
+  条 err 末尾追加 verify 三连(`current_sim` / `current_wave_config` /
+  `get_scopes /*`),AI 不需主动查 quirks。**不改写** 原始 Vivado 输出(透传契约
+  保住),只追加。
+- **A2:wave 操作失败留下孤儿 sim handle + GUI tab** —— 多次重试 → 多个 simulation_N
+  + 多个 tab + 800MB 内存浪费。任何 wave 类命令(`open_wave_database` / `add_wave` /
+  `log_wave` / `open_wave_config` / `current_wave_config`)出 err 时自动追加复制粘
+  贴的清理片段(while close_sim + close_wave_config) + stop_session 重启兜底。
+- **A4:中文 cwd 警告对只读 op 是狼来了** —— `_check_ascii_paths` 警告文本末尾追
+  加"受影响命令"段:`create_project` / `synth_design` / `launch_runs` /
+  `launch_simulation` 等会写 .runs/.sim/.cache 的命令踩;`open_wave_database` /
+  `get_*` / `report_*` / `list_*` 只读 op 不受影响。**零代码逻辑改动,纯文案**。
+
+#### B 类(进 `run_tcl` tool description,AI 每次调用必看)
+
+- **B1:`-filter "name =~ {...[$var]...}"` 污染后续 `set_property` 静默失败** ——
+  `[$var]` 触发 Tcl 命令替换,get_scopes 返回对了但 set_property RADIX 静默无效。
+  必须改 foreach + regexp 自己过滤。
+- **B2:`set_property RADIX` value 大小写敏感** —— `DEC` 静默退回 default,只
+  `dec` 生效。Vivado 大部分 property 不敏感,这条反直觉。
+- **B3:`wave_design_object` 无 Analog 显示样式属性** —— Tcl 物理上没接口,只
+  GUI 右键手点。
+- **B4:`add_wave -radix` vs `set_property RADIX` 值集对照表** —— signed
+  decimal 叫 `dec` 不叫 `signed`,从 ModelSim 迁过来的脚本会踩。
+
+#### C 类(进项目根 PITFALLS.md,给用户看)
+
+- **C1:Analog 波形显示样式只能 GUI 手点**(B3 的用户侧操作约束)
+- **C2:wave window 截图必须 `Win+Shift+S` 自截**
+
+#### 现有 quirks 标注 W hint 自动覆盖
+
+- §6(runme.log tail) → 顶上加"已在 `get_critical_warnings` 自动应用"指针
+- §7(sim 多次失败重启) → 顶上加"已在 `_safe_execute` W hint 自动附 cleanup"指针
+
+### 内部架构变化
+
+- `server.py::_DIAG_HINT` 单条模式扩成 `_QUIRK_HINTS` 关键词字典 + `_append_quirk_hints()`
+  通用追加函数。每条 hint = `(触发函数, hint 文本)`,触发函数签名
+  `(output, command) -> bool`。新 hint 加一行就行。
+- `_looks_like_run_failure` 改两参数签名 `(output, command)`,haystack 含命令文本
+  让 `launch_runs` 等命令名也能触发(原只看 output)。
+- `_safe_execute` 失败路径从"单一 hint 拼接"改成"按 quirk 字典追加 N 段"。
+
+### Updated Files
+
+- `src/vivado_mcp/server.py`(_QUIRK_HINTS 字典 + _append_quirk_hints + A1/A2 触发)
+- `src/vivado_mcp/tools/session_tools.py`(_check_ascii_paths 文案加范围段)
+- `src/vivado_mcp/tools/tcl_tools.py`(run_tcl docstring 加 B1-B4 精简提示)
+- `.trellis/spec/backend/vivado-quirks.md`(§5.4 / §6 顶 W 指针 / §7 顶 W 指针 /
+  §8.8 / §8.9 / §8.10 / §10 / §11)
+- `PITFALLS.md`(新文件,C1/C2 用户操作约束)
+- `tests/test_session.py`(扩 TestQuirkHintsA1A2 + TestAsciiPathScopeAnnotation 共 7 项)
+
+### Acceptance
+
+- 466 测试全过(本版新增 7 项)
+- ruff 0 警告
+- W 模式契约:**不改写** 原始 Vivado 输出,只追加(回归测试覆盖)
+
+---
+
 ## [0.3.19] — 2026-05-25
 
 ### 修复(session 注册表与 attach 语义实战 bug)
@@ -53,7 +127,7 @@
 - `src/vivado_mcp/vivado/base_session.py`(status_dict 暴露 port + attached_external)
 - `tests/test_probe_then_attach.py`(新文件,12 项隔离回归测试)
 - `tests/test_session.py`(`test_list_empty` 改用 `probe_external=False`)
-- `.trellis/spec/backend/tcl-protocol-guidelines.md`(增 §6 端口池 + attach 语义)
+- `.trellis/spec/backend/tcl-protocol-guidelines.md`(增 §7 端口池 + attach 语义)
 
 ---
 

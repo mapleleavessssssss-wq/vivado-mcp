@@ -72,6 +72,34 @@ async def run_tcl(
       add_wave {/tb/gen_ch[0].u/sig}
       ```
 
+    **set_property / radix 写脚本陷阱**(0.3.20 实战沉淀,无 err 静默踩):
+
+    - **`-filter "name =~ {...[$var]...}"` 会污染后续 `set_property` 静默失败**。
+      `[$var]` 触发 Tcl 命令替换,虽然 get_scopes 内部 fallback 仍返回正确对象,
+      但污染后续 wave property 路径,`set_property RADIX dec $w` 静默不生效。
+      改用 `foreach + regexp` 自己过滤,绕开 filter 字符串里的 `[$var]`。
+
+    - **`set_property RADIX` value 大小写敏感**(大多数 Vivado property 是大小写
+      不敏感的,这条是反直觉的例外):
+      ```tcl
+      set_property RADIX dec $w   ;# ✓ RADIX=dec
+      set_property RADIX DEC $w   ;# ✗ 静默退回 RADIX=default,不报错
+      ```
+
+    - **`add_wave -radix` 和 `set_property RADIX` 接受的 value 集合不一致**:
+      ```
+      add_wave -radix : default | dec | bin | oct | hex | unsigned | ascii | smag
+      set_property RADIX: dec | hex(其他实测未通过;大写一律不接受)
+      ```
+      signed decimal 在 XSim 叫 `dec`,**不是** `signed`(从 ModelSim/QuestaSim
+      带过来的命名习惯会踩)。
+
+    - **`wave_design_object` 没有 wave_style / display_style / analog_wave 属性**。
+      Vivado 2019.1 XSim 的 Analog 显示模式**无 Tcl 接口**,只能 GUI 右键 wave →
+      Waveform Style → Analog 逐路手点。`list_property $w` 全集只有 CLASS / COLOR /
+      DESIGN_OBJECT / DISPLAY_NAME / FULL_NAME / HEIGHT / IS_HEIGHT_DEFAULT /
+      IS_REVERSED / NAME_STYLE / RADIX / WAVE_CONFIG。
+
     Args:
         command: Tcl 命令文本（支持多行）。
         session_id: 目标会话 ID，默认 "default"。

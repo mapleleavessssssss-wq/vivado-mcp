@@ -88,21 +88,56 @@ def _require_session(ctx, session_id: str) -> VivadoSession | None:
     return _get_manager(ctx).get(session_id)
 
 
-_DIAG_HINT = (
+# --------------------------------------------------------------------------- #
+#  W 模式 quirk hints:在 _safe_execute 返回前匹配关键词追加固定提示
+#
+#  哲学:不改写 Vivado 原始输出(透传契约),只在末尾追加"看到 X 时该怎么办"。
+#  AI 在 run_tcl 返回里必然看到这段 hint,不需要主动查 quirks。
+#
+#  每条 hint = (keyword 子串 | 触发条件 callable, hint 文本)
+#  触发条件二选一:简单关键词字符串 / 复杂条件用 callable(output, command) -> bool
+#  同一次返回可触发多条 hint(按 _QUIRK_HINTS 顺序追加,各加一段)。
+# --------------------------------------------------------------------------- #
+
+
+# 0.3.14:run/sim 失败时引导去 get_critical_warnings 兜底诊断
+_HINT_RUN_FAILURE = (
     "\n\n提示: Tcl 命令失败时,综合/实现真错可能不在 Vivado messageDb"
     "(如中文路径触发的 TclStackFree),仿真真错在 <proj>.sim/<sim_fs>/*/xsim/*.log。"
     "调 get_critical_warnings(run_name='synth_1' / 'impl_1' / 'sim_1') 兜底诊断。"
 )
 
 
-def _looks_like_run_failure(output: str) -> bool:
-    """粗判输出是否暗示 run / 仿真失败(用于决定是否拼诊断 hint)。
+# 0.3.20 A1:open_wave_database 报这条 err 多数情况是误报,wdb 实际已加载
+_HINT_OPEN_WAVE_SPURIOUS = (
+    "\n\n⚠ 已知 XSim 误报模式:'open_wave_config failed' 这条 err 多数情况下"
+    "**不影响 wdb 实际加载**(裸 Vivado 无 sim project 时常发)。立即跑下面三条 verify:"
+    "\n  run_tcl \"current_sim\"          → 应返回 simulation_N(非空)"
+    "\n  run_tcl \"current_wave_config\"  → 应返回 .wcfg 名"
+    "\n  run_tcl \"get_scopes /*\"        → 应列出 hierarchy"
+    "\n三条都有效值 = wdb 已加载,忽略上面 err;否则才是真失败。"
+)
+
+
+# 0.3.20 A2:wave 操作失败可能留下孤儿 sim handle + GUI tab,重试前必须清理
+_HINT_WAVE_STATE_CLEANUP = (
+    "\n\n⚠ wave 操作失败可能在 GUI 留下孤儿 sim handle + tab(重试 3 次 → 3 个孤儿)。"
+    "重试前先清理:"
+    "\n  run_tcl \"while {[catch {current_sim} __c] == 0 && \\$__c ne {}} "
+    "{ close_sim -force }; catch {close_wave_config}\""
+    "\n清理后仍失败 → stop_session → start_session 重启 vivado 进程(参考 quirks §7)。"
+)
+
+
+def _looks_like_run_failure(output: str, command: str) -> bool:
+    """粗判输出是否暗示 run / 仿真失败 → 触发 _HINT_RUN_FAILURE。
 
     保守判断:命中其一即认为该展示 hint。避免对纯查询的 ERROR(如 get_property
     on nonexistent)误展示 —— 但即使误展示也只是多一行文字,不破坏功能。
     """
     if not output:
         return False
+    haystack = command + "\n" + output
     markers = (
         "failed due to earlier errors",
         "launch_simulation",
@@ -113,7 +148,60 @@ def _looks_like_run_failure(output: str) -> bool:
         "route_design",
         "write_bitstream",
     )
-    return any(m in output for m in markers)
+    return any(m in haystack for m in markers)
+
+
+def _looks_like_open_wave_spurious(output: str, command: str) -> bool:
+    """A1:open_wave_config failed due to earlier errors → 误报 verify hint。"""
+    return "'open_wave_config' failed due to earlier errors" in output
+
+
+def _looks_like_wave_failure_needs_cleanup(output: str, command: str) -> bool:
+    """A2:任何 open_wave_database / wave 类操作失败都建议清理。
+
+    触发条件:命令含 open_wave_database / add_wave / log_wave / close_sim 等
+    wave/sim 相关,且输出含 fail / error 关键词。
+    """
+    cmd_markers = (
+        "open_wave_database",
+        "open_wave_config",
+        "add_wave",
+        "log_wave",
+        "current_wave_config",
+    )
+    if not any(m in command for m in cmd_markers):
+        return False
+    err_markers = (
+        "'open_wave_config' failed",
+        "failed due to earlier errors",
+        "ERROR:",
+    )
+    return any(m in output for m in err_markers)
+
+
+# (触发函数, hint 文本)。按顺序匹配,命中的都追加。
+_QUIRK_HINTS: tuple[tuple, ...] = (
+    (_looks_like_run_failure, _HINT_RUN_FAILURE),
+    (_looks_like_open_wave_spurious, _HINT_OPEN_WAVE_SPURIOUS),
+    (_looks_like_wave_failure_needs_cleanup, _HINT_WAVE_STATE_CLEANUP),
+)
+
+
+def _append_quirk_hints(summary: str, command: str) -> str:
+    """根据返回输出 + 原命令匹配关键词,追加已知 quirk hint。
+
+    所有 hint 在原 summary 末尾按 _QUIRK_HINTS 顺序追加。一条命中追加一段,
+    多条命中追加多段(各自独立,不互相依赖)。
+    """
+    additions = []
+    for trigger, hint in _QUIRK_HINTS:
+        try:
+            if trigger(summary, command):
+                additions.append(hint)
+        except Exception as e:
+            # hint 触发函数有 bug 时降级:打 warn 不让本次调用失败
+            logger.warning("quirk hint 触发函数异常: %s", e)
+    return summary + "".join(additions)
 
 
 async def _safe_execute(
@@ -124,14 +212,14 @@ async def _safe_execute(
 ) -> str:
     """安全执行 Tcl 命令，异常时返回错误字符串而非抛出。
 
-    失败响应里如果命令模式涉及 run / 仿真,追加一条诊断 hint(0.3.14:0.3.13
-    实战发现 AI 拿到 'failed due to earlier errors' 无法定位真错的痛点)。
+    失败响应在末尾追加已知 quirk hint(W 模式):AI 在 run_tcl 返回里必然看到
+    "这条 err 怎么办" 的固定指引,不需要主动查 quirks 文档。
     """
     try:
         result = await session.execute(tcl, timeout=timeout)
         summary = result.summary
-        if result.is_error and _looks_like_run_failure(tcl + "\n" + result.output):
-            summary += _DIAG_HINT
+        if result.is_error:
+            summary = _append_quirk_hints(summary, tcl)
         return summary
     except Exception as e:
         return f"[ERROR] {error_label}: {e}"
