@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.3.19] — 2026-05-25
+
+### 修复(session 注册表与 attach 语义实战 bug)
+
+- **Bug:`list_sessions` 漏报手动启动的 Vivado GUI + `start_session(mode="gui")`
+  错误地把命令路由到原 GUI ⭐⭐** —— 用户手动开了 Vivado GUI(`vivado-mcp install`
+  已注入 init.tcl,开机自动跑 TCP server),不 stop,从 MCP 调:
+  1. `list_sessions` 报"无活跃会话"(只看 `_sessions` dict)
+  2. `start_session(mode="gui")` 返回 "attach=False,端口 9999",看似 spawn 成功
+  3. 后续 `run_tcl` 命令**实际生效在用户原 GUI**,新 spawn 的 vivado.exe 监听
+     在 fallback 端口 10000 上,变成 ~800MB 内存的孤儿进程
+
+  **根因(Python 端 + Tcl 端都是"先成功的赢"+ 无关联机制)**:
+  - `vivado_mcp_server.tcl::start` 端口池 fallback(原 GUI 占 9999,新进程 bind
+    到 10000)
+  - `gui_session.py::start` 也从 9999 起试连,**第一个握手通过的就赢** → 永远
+    连到原 GUI
+  - `mode` property 直接返回 `"attach" if self._attach_only else "gui"`,字段语义
+    是"用户请求的模式",不反映"实际连到外部还是 spawn 的进程"
+  - `SessionManager.list_sessions` 只列 `self._sessions.values()`,完全看不见
+    用户手动启动的 GUI
+
+  **修复(`vivado/gui_session.py` + `vivado/session_manager.py`)**:
+  1. **probe-then-attach**:`start(mode="gui")` 先 probe `port_preference`,握手
+     通过 → 直接 attach 不 spawn,标 `_attached_external=True`。从根上消除
+     "spawn 出孤儿" 副作用
+  2. **`mode` property 改为反映实际行为**:`attach_only OR attached_external`
+     都报 `"attach"`,banner 明示 "attach 到现有 GUI(端口 N)... stop_session
+     不会关闭这个 GUI"
+  3. **`stop()` 跳过外部 attach 进程**:`not self._attach_only and not
+     self._attached_external` 时才走优雅 exit + taskkill
+  4. **`list_sessions(probe_external=True)` 主动 probe `9999..10003`**:命中的
+     端口列为 `owner="external"` + `mode="external"` + `session_id="<external@N>"`,
+     note 注明"未由 MCP 启动 / stop_session 无权关闭"
+  5. **`status_dict` 暴露 `port` + `attached_external`**:让 list_sessions /
+     调试时一眼看出命令落到哪
+  6. 新增 `probe_vmcp_server(host, port, timeout)` 同步 helper(用于
+     `list_sessions`,绕开 event loop);async 路径仍走 `_handshake()`
+
+  **验证**:`tests/test_probe_then_attach.py` 12 项隔离测试(全部用 OS 分配的
+  ephemeral port,绝不撞 9999),覆盖 probe 正常 / 端口空 / 协议错 / 超时 /
+  oversize length / GuiSession attach 路径 / stop 不杀外部进程 / spawn fallback /
+  list_sessions external entry / probe_external=False / 已管理端口去重。
+
+### Updated Files
+
+- `src/vivado_mcp/vivado/gui_session.py`(probe_vmcp_server + _try_attach_existing +
+  _attached_external + mode 语义修复 + stop 守卫)
+- `src/vivado_mcp/vivado/session_manager.py`(list_sessions probe_external 参数
+  + _EXTERNAL_PROBE_PORTS 配置)
+- `src/vivado_mcp/vivado/base_session.py`(status_dict 暴露 port + attached_external)
+- `tests/test_probe_then_attach.py`(新文件,12 项隔离回归测试)
+- `tests/test_session.py`(`test_list_empty` 改用 `probe_external=False`)
+- `.trellis/spec/backend/tcl-protocol-guidelines.md`(增 §6 端口池 + attach 语义)
+
+---
+
 ## [0.3.18] — 2026-05-23
 
 ### 修复(0.3.17 实战暴露的 sim 工具链可用性问题)

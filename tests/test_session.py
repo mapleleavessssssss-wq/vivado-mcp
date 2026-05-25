@@ -51,8 +51,13 @@ class TestSessionManager:
         assert session_manager.get("nonexistent") is None
 
     def test_list_empty(self, session_manager: SessionManager):
-        """空管理器列表为空。"""
-        assert session_manager.list_sessions() == []
+        """空管理器列表为空(关闭外部 probe,只看 MCP 自己管的)。
+
+        0.3.19 起 ``list_sessions()`` 默认会 probe 9999..10003 发现用户手动
+        启动 + init.tcl 注入的外部 GUI,本机若真有 Vivado 跑会让本断言失败。
+        显式 ``probe_external=False`` 关掉网络探测,只验证字典层逻辑。
+        """
+        assert session_manager.list_sessions(probe_external=False) == []
 
     def test_default_vivado_path(self, session_manager: SessionManager):
         """默认路径正确存储。"""

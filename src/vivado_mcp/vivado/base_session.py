@@ -76,7 +76,7 @@ class BaseSession(ABC):
 
     def status_dict(self) -> dict:
         """返回会话状态信息字典。"""
-        return {
+        d = {
             "session_id": self.session_id,
             "mode": self.mode,
             "state": self._state.value,
@@ -84,3 +84,11 @@ class BaseSession(ABC):
             "is_alive": self.is_alive,
             "uptime_seconds": round(self.uptime_seconds, 1),
         }
+        # 可选字段:GUI session 暴露端口和 external attach 标志,让 list_sessions
+        # / 调试时一眼看出命令会落到哪个 Vivado 实例
+        port = getattr(self, "connected_port", None)
+        if port is not None:
+            d["port"] = port
+        if getattr(self, "attached_external", False):
+            d["attached_external"] = True
+        return d

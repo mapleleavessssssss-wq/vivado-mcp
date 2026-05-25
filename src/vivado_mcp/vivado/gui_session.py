@@ -19,6 +19,7 @@ import importlib.resources
 import json
 import logging
 import os
+import socket
 import time
 from pathlib import Path
 
@@ -33,9 +34,57 @@ _PORT_POOL_SIZE = 5
 # 默认最大响应大小（10MB）
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
+# 握手响应合理上限(超过这个值 = 端口上是别的协议,把 ASCII 当 length 解释)
+_HANDSHAKE_MAX_RESP = 8192
+
 # 进程退出兜底:记录所有临时 tcl 脚本,强杀 MCP 时也会被 atexit 清掉
 # 避免 /tmp/tmp*.tcl 堆积。正常路径 stop() 会主动 unlink 并从此集合移除。
 _TMP_SCRIPTS: set[str] = set()
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
+    """同步阻塞收满 n 字节,失败返回 None。"""
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except (OSError, socket.timeout):
+            return None
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
+    """同步探测 host:port 是否在跑 vivado-mcp 的 length-prefix TCP server。
+
+    用 ``puts VMCP_HANDSHAKE_ACK`` 发起握手 —— 这是只读探测,Vivado 那侧只是
+    在 captured_buf 加一行,无副作用。用于 ``list_sessions`` 主动发现用户手动
+    启动的 GUI(init.tcl 注入后会自动开 server)。
+
+    Returns:
+        True 表示成功握手(对面是同协议 server);False 表示连不上 / 协议不匹配。
+    """
+    payload = b"puts VMCP_HANDSHAKE_ACK"
+    header = len(payload).to_bytes(4, "big")
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(header + payload)
+            hdr = _recv_exact(s, 4)
+            if hdr is None:
+                return False
+            resp_len = int.from_bytes(hdr, "big")
+            if resp_len <= 0 or resp_len > _HANDSHAKE_MAX_RESP:
+                return False
+            body = _recv_exact(s, resp_len)
+            if body is None:
+                return False
+            obj = json.loads(body.decode("utf-8"))
+            return isinstance(obj, dict) and "rc" in obj and "output" in obj
+    except (OSError, socket.timeout, json.JSONDecodeError, UnicodeDecodeError):
+        return False
 
 
 def _cleanup_tmp_scripts_atexit() -> None:
@@ -95,6 +144,10 @@ class GuiSession(BaseSession):
         super().__init__(vivado_path=vivado_path, session_id=session_id)
         self._port_preference = port
         self._attach_only = attach_only
+        # probe-then-attach 命中外部 GUI(用户手动启动 + init.tcl 已注入)时为 True
+        # 与 _attach_only 区别:_attach_only 是用户显式请求,_attached_external
+        # 是 mode="gui" 时的隐式 attach。两者对 mode/stop 行为意义相同。
+        self._attached_external: bool = False
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -104,7 +157,21 @@ class GuiSession(BaseSession):
 
     @property
     def mode(self) -> str:
-        return "attach" if self._attach_only else "gui"
+        # 实际行为而非用户请求:外部 attach(显式 attach_only 或 probe 命中)
+        # 都报 "attach",让上层(AI / list_sessions)能直接看出命令落到哪
+        if self._attach_only or self._attached_external:
+            return "attach"
+        return "gui"
+
+    @property
+    def connected_port(self) -> int | None:
+        """已连接的 TCP 端口(尚未连接为 None)。"""
+        return self._connected_port
+
+    @property
+    def attached_external(self) -> bool:
+        """是否 attach 到了非 MCP spawn 的 Vivado(用户手动启动 + init.tcl)。"""
+        return self._attached_external
 
     @property
     def is_alive(self) -> bool:
@@ -114,6 +181,44 @@ class GuiSession(BaseSession):
             return False
         # StreamWriter.is_closing() 反映 socket 状态
         return not self._writer.is_closing()
+
+    async def _try_attach_existing(
+        self,
+        port: int,
+        timeout: float = 3.0,
+    ) -> bool:
+        """非 attach 模式下,试探 port 上是否已有 vivado-mcp server。
+
+        命中(连得上 + 握手通过)→ reader/writer/_connected_port 就绪,设
+        ``_attached_external=True``,返回 True。
+        失败 → 释放半开连接,返回 False。
+
+        修复 0.3.19 Bug:防止用户已装 init.tcl 且手动开了 GUI 时,MCP
+        spawn 一份新 Vivado,但 Python 端"先连上 9999 谁就赢"的逻辑
+        把客户端连到原 GUI,新 spawn 出来的进程变成孤儿。
+        """
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=timeout,
+            )
+        except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
+            return False
+
+        ok = await self._handshake(reader, writer)
+        if not ok:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return False
+
+        self._reader = reader
+        self._writer = writer
+        self._connected_port = port
+        self._attached_external = True
+        return True
 
     async def start(self, timeout: float = 120.0) -> str:
         """启动 Vivado GUI（或 attach 已有实例），建立 TCP 连接。"""
@@ -125,6 +230,29 @@ class GuiSession(BaseSession):
             "启动 GUI 会话 '%s' (attach=%s, port_pref=%d)",
             self.session_id, self._attach_only, self._port_preference,
         )
+
+        # ---- 0. 非 attach 模式:先 probe 首选端口,若已有 server 则直接 attach ----
+        # 避免和用户手动启动的 GUI 抢端口最后 spawn 出孤儿(0.3.19 Bug)
+        if not self._attach_only:
+            if await self._try_attach_existing(self._port_preference, timeout=3.0):
+                self._state = SessionState.READY
+                self._start_time = time.time()
+                msg = (
+                    f"GUI 会话就绪(attach 到现有 GUI):端口 "
+                    f"{self._connected_port}。"
+                    "检测到该端口已有 vivado-mcp server,跳过 spawn 直接接管。"
+                    "可能是你手动启动并装过 init.tcl 的 Vivado。"
+                    "stop_session 不会关闭这个 GUI。"
+                )
+                logger.info(
+                    "会话 '%s' attach 到外部 GUI(端口 %d),跳过 spawn",
+                    self.session_id, self._connected_port,
+                )
+                return msg
+            logger.info(
+                "端口 %d 无 vivado-mcp server,走 spawn 新 GUI 路径",
+                self._port_preference,
+            )
 
         # ---- 1. 如果非 attach 模式，spawn Vivado GUI ----
         if not self._attach_only:
@@ -365,9 +493,10 @@ class GuiSession(BaseSession):
         logger.info("正在关闭 GUI 会话 '%s'...", self.session_id)
 
         # 步骤 1:尝试优雅退出 —— 发 Tcl `exit`,Vivado 自己清 pid/journal
-        # attach 模式下是用户开的 Vivado,不主动 exit
+        # attach 模式 OR probe-then-attach 命中外部 GUI 时,都是用户的 Vivado,不主动 exit
         if (
             not self._attach_only
+            and not self._attached_external
             and self._writer is not None
             and self._state in (SessionState.READY, SessionState.BUSY)
         ):
@@ -396,7 +525,12 @@ class GuiSession(BaseSession):
             self._reader = None
 
         # 步骤 3:确保进程真退出。Windows 用 taskkill /T 递归杀树
-        if self._proc is not None and not self._attach_only:
+        # 外部 attach(显式 attach_only 或 probe 命中)不杀进程
+        if (
+            self._proc is not None
+            and not self._attach_only
+            and not self._attached_external
+        ):
             if self._proc.returncode is None:
                 # 先给 Vivado 一点时间自己退(响应 Tcl exit)
                 try:
