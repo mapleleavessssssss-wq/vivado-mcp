@@ -21,6 +21,7 @@ import logging
 import os
 import socket
 import time
+import uuid
 from pathlib import Path
 
 from vivado_mcp.vivado.base_session import BaseSession, SessionState
@@ -59,14 +60,21 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
 def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
     """同步探测 host:port 是否在跑 vivado-mcp 的 length-prefix TCP server。
 
-    用 ``puts VMCP_HANDSHAKE_ACK`` 发起握手 —— 这是只读探测,Vivado 那侧只是
-    在 captured_buf 加一行,无副作用。用于 ``list_sessions`` 主动发现用户手动
-    启动的 GUI(init.tcl 注入后会自动开 server)。
+    用 ``puts VMCP_PROBE_<uuid>`` 发起握手 —— vmcp 服务端会把 token 反射到
+    响应 output(走 captured_buf 路径),probe 验响应 output 含该 uuid 才算
+    vmcp 兼容。无副作用、只读探测。
+
+    0.3.21 修:加 magic token 验证。0.3.19 实测中曾观察到 VMware vNIC 虚拟
+    接口 listener 在某种 Windows 多接口/firewall race 下被错判为 vmcp server
+    (PID 6408 绑 192.168.159.1:10000)。仅验"响应是 dict + 有 rc/output 字段"
+    挡不住此类假阳性,必须验响应**内容**包含本次探测的随机 token。
 
     Returns:
-        True 表示成功握手(对面是同协议 server);False 表示连不上 / 协议不匹配。
+        True 表示成功握手且响应 output 含 magic token(对面是同协议 server);
+        False 表示连不上 / 协议不匹配 / 响应 output 缺 magic。
     """
-    payload = b"puts VMCP_HANDSHAKE_ACK"
+    token = "VMCP_PROBE_" + uuid.uuid4().hex[:16]
+    payload = f"puts {token}".encode("utf-8")
     header = len(payload).to_bytes(4, "big")
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
@@ -82,7 +90,10 @@ def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
             if body is None:
                 return False
             obj = json.loads(body.decode("utf-8"))
-            return isinstance(obj, dict) and "rc" in obj and "output" in obj
+            if not (isinstance(obj, dict) and "rc" in obj and "output" in obj):
+                return False
+            # magic token 反射校验:挡掉 echo-type / 非 vmcp 服务的假阳性
+            return token in str(obj.get("output", ""))
     except (OSError, socket.timeout, json.JSONDecodeError, UnicodeDecodeError):
         return False
 

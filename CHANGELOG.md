@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.21] — 2026-05-25
+
+### 修复(0.3.19 probe 假阳性 — 现场实测发现)
+
+- **`probe_vmcp_server` 加 magic token 反射验证** — 0.3.19 实测中
+  `list_sessions()` 间歇报 `<external@10000>`,但本机**无任何 Vivado GUI 在
+  跑**。排查发现 port 10000 被 VMware/Hyper-V vNIC 上的 PID 6408 监听(绑
+  192.168.159.1,不是 Vivado);Windows 多接口 weak host model + firewall race
+  下被 127.0.0.1 偶发连通,旧 probe 只验响应是 `dict + 含 rc/output 字段`,
+  挡不住巧合性回类 JSON 的服务,假阳性。修法:probe payload 改
+  `puts VMCP_PROBE_<uuid16>`,vmcp 服务端 captured_puts 会反射 token 到响应
+  output,probe 验响应 output 含该 uuid 才判 True。uuid 撞不上,假阳性归零。
+- 测试新增 2 项(`tests/test_probe_then_attach.py`):
+  `test_returns_false_when_output_lacks_magic_token`(合法 JSON 但 output 不含
+  token 时挡掉)+ `test_returns_false_when_output_missing`(缺 output 字段挡
+  掉)。468/468 pytest 全过(原 466 + 新 2),ruff clean。
+- **协议兼容**:服务端 `vivado_mcp_server.tcl` **零改动**(captured_puts 早就
+  把 puts 输出反射进 output);旧 MCP client 升级到 0.3.21 即可,旧 server 实例
+  无需重启 / 重 source。
+
 ## [0.3.20] — 2026-05-25
 
 ### 修复 + 知识库沉淀(XSim 实战 10 项坑收纳 — W+ 路线)

@@ -159,6 +159,31 @@ class TestProbeVmcpServer:
         finally:
             stop.set()
 
+    def test_returns_false_when_output_lacks_magic_token(self):
+        """0.3.21 修复回归:server 回合法 JSON 但 output 不含本次探测 token →
+        视为非 vmcp 服务(如 VMware vNIC 上某个偶发回 JSON 的服务),False。
+        """
+        def echo_unrelated_handler(_: bytes) -> bytes:
+            # 不 echo 输入,固定回别的内容 —— 模拟非 vmcp 但格式相近的服务
+            resp = json.dumps({"rc": 0, "output": "some unrelated payload"}).encode("utf-8")
+            return resp
+        port, stop, _ = _serve_length_prefix(echo_unrelated_handler)
+        try:
+            assert probe_vmcp_server("127.0.0.1", port, timeout=0.3) is False
+        finally:
+            stop.set()
+
+    def test_returns_false_when_output_missing(self):
+        """server 回 dict 但缺 output 字段 → False。"""
+        def missing_output_handler(_: bytes) -> bytes:
+            resp = json.dumps({"rc": 0}).encode("utf-8")
+            return resp
+        port, stop, _ = _serve_length_prefix(missing_output_handler)
+        try:
+            assert probe_vmcp_server("127.0.0.1", port, timeout=0.3) is False
+        finally:
+            stop.set()
+
 
 # --------------------------------------------------------------------------- #
 #  GuiSession.start():probe-then-attach
