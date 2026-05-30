@@ -68,6 +68,78 @@ class TestSessionManager:
         with pytest.raises(ValueError, match="session_id"):
             session_manager.get("invalid;id")
 
+    async def test_gui_default_passes_port_zero_to_session(
+        self, session_manager: SessionManager, monkeypatch
+    ):
+        """B 方案多开语义:mode='gui' 不传 port 时 manager 把 port=0 透传给 GuiSession。
+
+        port=0 = auto-alloc 独立新实例(连开两次 = 两个独立 GUI)。这里 mock
+        GuiSession 的构造 + start,只验证透传的 port 参数,不起真 Vivado。
+        """
+        from vivado_mcp.vivado import session_manager as sm_mod
+
+        captured: dict[str, int] = {}
+
+        class _FakeSession:
+            mode = "gui"
+            connected_port = None
+            pid = None
+
+            def __init__(self, *, vivado_path, session_id, port, attach_only):
+                captured["port"] = port
+                captured["attach_only"] = attach_only
+
+            async def start(self, timeout):
+                return "fake banner"
+
+            @property
+            def is_alive(self):
+                return True
+
+            def status_dict(self):
+                return {"mode": "gui", "state": "ready"}
+
+        monkeypatch.setattr(sm_mod, "GuiSession", _FakeSession)
+
+        await session_manager.start_session(session_id="multi", mode="gui")
+        assert captured["port"] == 0, "默认 gui 应透传 port=0 走 auto-alloc 独立实例"
+        assert captured["attach_only"] is False
+
+    async def test_port_map_records_and_clears(
+        self, session_manager: SessionManager, monkeypatch
+    ):
+        """start_session 成功后 _port_map 记 (port, pid);stop 后清掉。"""
+        from vivado_mcp.vivado import session_manager as sm_mod
+
+        class _FakeSession:
+            mode = "gui"
+            connected_port = 54321
+            pid = 9090
+
+            def __init__(self, *, vivado_path, session_id, port, attach_only):
+                pass
+
+            async def start(self, timeout):
+                return "banner"
+
+            async def stop(self):
+                return None
+
+            @property
+            def is_alive(self):
+                return True
+
+            def status_dict(self):
+                return {"mode": "gui", "state": "ready"}
+
+        monkeypatch.setattr(sm_mod, "GuiSession", _FakeSession)
+
+        await session_manager.start_session(session_id="rec", mode="gui")
+        assert session_manager._port_map["rec"] == (54321, 9090)
+
+        await session_manager.stop_session("rec")
+        assert "rec" not in session_manager._port_map
+
 
 class TestAsciiPathCheck:
     """_check_ascii_paths:Vivado 2019.x 中文路径预警。"""

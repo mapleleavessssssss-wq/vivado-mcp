@@ -4,14 +4,18 @@
 ##   请求:  [4 字节 big-endian 长度][UTF-8 编码的 Tcl 命令]
 ##   响应:  [4 字节 big-endian 长度][UTF-8 编码的 JSON：{"rc":<int>,"output":"<string>"}]
 ##
-## 端口池：9999..10003（支持同一台机器多个 Vivado GUI 实例）
+## 端口策略（B 方案 / 端口精确化）：
+##   - 若 Python 注入了 `set ::VMCP_PORT_PREF <port>`，绑这个**确切端口**，绑不上就退出
+##     （绝不静默滑到别人的端口 → 杜绝"新 Vivado 监听在没人连的端口=孤儿"）。
+##     Python 端在 spawn 前已用 socket.bind(("",0)) 抢一个空闲端口号再释放注入进来。
+##   - 若 VMCP_PORT_PREF 未定义（老 install 的 init.tcl 手动启动 / launch_runs 子进程），
+##     fallback DEFAULT_PORT=9999 单端口绑 —— 保证外部 attach / list_sessions probe 不被破坏。
 ## 端口占用守卫：catch socket 失败后静默退出（launch_runs 子进程用同一 init.tcl 不会冲突）
 ## Tcl 8.5 兼容（Vivado 2019.1 使用 Tcl 8.5）
 
 namespace eval ::vmcp {
-    # 默认端口起点；可被注入前的 `set ::VMCP_PORT_PREF <port>` 覆盖
+    # 默认端口；可被注入前的 `set ::VMCP_PORT_PREF <port>` 覆盖为确切目标端口
     variable DEFAULT_PORT 9999
-    variable POOL_SIZE 5
     variable active_port 0
     variable server_sock {}
 
@@ -170,30 +174,28 @@ proc ::vmcp::on_accept {chan addr port} {
     fileevent $chan readable [list ::vmcp::on_readable $chan]
 }
 
-## 尝试端口池，找到第一个可用的就启动 server
-## 端口首选值来自 ::VMCP_PORT_PREF（注入脚本可覆盖），否则用 DEFAULT_PORT
-## 池大小 POOL_SIZE，依次尝试 pref..pref+POOL_SIZE-1
+## 绑**确切端口**启动 server，绑不上就退出（B 方案 / 端口精确化）。
+## 端口来自 ::VMCP_PORT_PREF（Python spawn 前注入的确切空闲端口）；
+## 未注入时 fallback DEFAULT_PORT=9999 单端口绑（老 install / launch_runs 子进程）。
+## 不再做"池滑动"——占用即退，绝不静默滑到别人的端口造成孤儿。
 proc ::vmcp::start {} {
     variable DEFAULT_PORT
-    variable POOL_SIZE
     variable active_port
     variable server_sock
 
-    set pref $DEFAULT_PORT
+    set port $DEFAULT_PORT
     if {[info exists ::VMCP_PORT_PREF]} {
-        set pref $::VMCP_PORT_PREF
+        set port $::VMCP_PORT_PREF
     }
-    set port_max [expr {$pref + $POOL_SIZE - 1}]
 
-    for {set p $pref} {$p <= $port_max} {incr p} {
-        if {[catch {socket -server ::vmcp::on_accept $p} sock] == 0} {
-            set server_sock $sock
-            set active_port $p
-            puts "vivado-mcp server ready on port $p"
-            return $p
-        }
+    if {[catch {socket -server ::vmcp::on_accept $port} sock] == 0} {
+        set server_sock $sock
+        set active_port $port
+        puts "vivado-mcp server ready on port $port"
+        return $port
     }
-    # 端口池全部占用：静默退出（常见于 launch_runs 子进程场景）
+    # 端口被占用：静默退出（launch_runs 子进程场景），绝不滑到别人端口
+    puts "vivado-mcp: port $port busy, exiting (not sliding to another port)"
     return 0
 }
 

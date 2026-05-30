@@ -555,6 +555,104 @@ puts "VMCP_BAT_RUN_OUT_END"
 """
 
 
+# --------------------------------------------------------------------------- #
+#  波形(wave)工具 Tcl 片段(0.3.2x)
+# --------------------------------------------------------------------------- #
+
+# 解析当前 wcfg 的磁盘路径。
+#   - 没有当前 wave_config           → VMCP_WCFG:none
+#   - 有 wave_config 但 FILE_PATH 空 → VMCP_WCFG:unsaved(从未存盘,改 XML 无目标)
+#   - 有磁盘路径                     → VMCP_WCFG:path=<绝对路径>
+# 无 Python 占位符,直接用单花括号。
+# ★磁盘路径属性是 FILE_PATH(实测 Vivado 2019.1,list_property 全集:CLASS
+#   DISPLAY_LIMIT FILE_PATH HAS_SAMPLES HAS_TIME NAME NEEDS_SAVE)。**不是**
+#   FILE_NAME —— 那个属性不存在,get_property FILE_NAME 会报 [Common 17-54]。
+RESOLVE_WCFG_PATH = """\
+set __wc [current_wave_config]
+if {[llength $__wc] == 0} {
+    puts "VMCP_WCFG:none"
+} else {
+    set __f [get_property FILE_PATH $__wc]
+    if {$__f eq ""} {
+        puts "VMCP_WCFG:unsaved"
+    } else {
+        puts "VMCP_WCFG:path=$__f"
+    }
+}
+"""
+
+# 重载 wcfg:close -force 后再 open。占位符 {wcfg_path}(已转正斜杠)。
+#   - close 漏 -force → [Wavedata 42-26](内存 wave_config 脏,拒绝丢弃)
+#   - 同名 wcfg 已 open 时直接 open → [Wavedata 42-52](重复打开),故必须先 close
+# close_wave_config 不接受 wcfg 名参数(关的是 current),所以无名直接 close。
+RELOAD_WCFG = """\
+if {{[catch {{close_wave_config -force}} __e]}} {{
+    puts "VMCP_RELOAD_ERR:close|$__e"
+}} else {{
+    if {{[catch {{open_wave_config {wcfg_path}}} __e2]}} {{
+        puts "VMCP_RELOAD_ERR:open|$__e2"
+    }} else {{
+        puts "VMCP_RELOAD_OK:{wcfg_path}"
+    }}
+}}
+"""
+
+# 把一批 wave 对象设为 Analog 显示。占位符:
+#   {signals_block} —— Python 生成的 `lappend __sigs {<信号>}` 行(每信号一行)
+#   {amin} {amax}   —— AnalogMin / AnalogMax(数字字面量)
+#   {interp}        —— AnalogInterpolation 值(LINEAR / HOLD)
+#   {height}        —— set_property HEIGHT(存盘后叫 CellHeight)
+#
+# ★信号→wave 对象解析(实测 Vivado 2019.1,两个静默坑):
+#   1. get_waves <pattern> 只匹配 DISPLAY_NAME(如 y0[15:0])/glob,**不匹配全路径**
+#      /tb/y0;直接传全路径 → 返回空。故先按 DESIGN_OBJECT(=全路径)/FULL_NAME/
+#      DISPLAY_NAME 精确匹配 get_waves *,再退回 get_waves glob。
+#   2. set_wave_prop 对空对象 **rc=0 静默接受**(不报错!),所以必须先判空再 set,
+#      否则"信号没 add"会伪装成成功。
+#   wave 属性无 get 接口(get_wave_prop 不存在、report_wave_props 不可捕获),无法
+#   Tcl 读回校验 WaveformStyle;工具固定写已验证的 STYLE_ANALOG 值,渲染靠人眼确认。
+# 输出:
+#   VMCP_ANALOG:sig=<信号>|found=0          —— 解析不到 wave 对象(信号没 add 进波形)
+#   VMCP_ANALOG:sig=<信号>|set_err=<msg>    —— set_wave_prop 抛错
+#   VMCP_ANALOG:sig=<信号>|ok=<resolved>    —— 设置成功,resolved 为命中的全路径
+#   VMCP_ANALOG_DONE
+SET_ANALOG_PROPS = """\
+set __sigs [list]
+{signals_block}
+foreach __s $__sigs {{
+    set __w ""
+    foreach __cand [get_waves -quiet *] {{
+        if {{$__s eq [get_property DESIGN_OBJECT $__cand]
+             || $__s eq [get_property FULL_NAME $__cand]
+             || $__s eq [get_property DISPLAY_NAME $__cand]}} {{
+            set __w $__cand
+            break
+        }}
+    }}
+    if {{$__w eq ""}} {{
+        set __g [get_waves -quiet $__s]
+        if {{[llength $__g] > 0}} {{ set __w [lindex $__g 0] }}
+    }}
+    if {{$__w eq ""}} {{
+        puts "VMCP_ANALOG:sig=$__s|found=0"
+        continue
+    }}
+    if {{[catch {{
+        set_wave_prop WaveformStyle STYLE_ANALOG $__w
+        set_wave_prop AnalogMin {amin} $__w
+        set_wave_prop AnalogMax {amax} $__w
+        set_wave_prop AnalogInterpolation {interp} $__w
+        set_property HEIGHT {height} $__w
+    }} __serr]}} {{
+        puts "VMCP_ANALOG:sig=$__s|set_err=$__serr"
+        continue
+    }}
+    puts "VMCP_ANALOG:sig=$__s|ok=[get_property DESIGN_OBJECT $__w]"
+}}
+puts "VMCP_ANALOG_DONE"
+"""
+
+
 CHECK_PRE_BITSTREAM = """\
 set __impl [get_runs {impl_run}]
 set __status [get_property STATUS $__impl]

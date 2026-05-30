@@ -5,28 +5,36 @@
 >
 > 这里列的是 **MCP 物理上无法替你做** 的事 —— 不是 bug,不是设计缺陷,是 Vivado
 > 本身的限制或 OS 边界,需要你**手动**操作。
+>
+> 例外:标了 **勘误** 的条目(如 C1)是过去误判"做不到"、现已订正成"能做 + 正确
+> 配方"的历史记录,保留是为了纠正还在流传的老笔记。
 
 ---
 
-## C1. XSim Analog 波形显示样式 — 只能 GUI 手动逐路点
+## C1. XSim Analog 波形样式 — 可纯 Tcl 渲染(早期文档误判已订正)
 
-**触发**:你让 AI 把某些波形(比如 ADC 输出、DAC 输入、滤波器响应)显示成 Analog
-样式(模拟波形,可看趋势),而不是 Digital(0/1 阶梯)。
+> **勘误**:本条早期写"只能 GUI 手点、MCP 物理上做不到",**是错的**。analog
+> 纯 Tcl 完全可做,已不属于"MCP 做不到"那一类。本条保留作勘误 + 正确配方,免得
+> 老笔记还在误导。
 
-**为什么 MCP 做不到**:Vivado 2019.1 XSim 的 `wave_design_object` **完全没有**
-`wave_style` / `display_style` / `analog_wave` 之类的属性 —— `list_property $w`
-全集没这字段,**Tcl 物理上没有接口**(详见 `.trellis/spec/backend/vivado-quirks.md`
-§8.9)。
+**触发**:你让 AI 把某些波形(ADC 输出、DAC 输入、滤波器响应)显示成 Analog
+样式(模拟波形看趋势),而不是 Digital(0/1 阶梯)。
 
-**怎么手动操作**:
-1. AI 把信号 `add_wave` 到 wave window
-2. 你在 wave window 里:
-   - 右键单条波形 → **Waveform Style** → **Analog**
-   - 或 Ctrl 多选几条 → 一起右键改样式
-3. N 路波形要点 N 次(无法批量)
+**真根因**:WaveformStyle 属性不在 `set_property` / `list_property` 全集里(所以
+看不到、误以为无接口),要用专用命令 `set_wave_prop`;且当年值写成裸 `ANALOG`,
+Vivado 收下不报错但渲染器不认,静默不渲染。**正确值必须带 `STYLE_` 前缀**
+(详见 `.trellis/spec/backend/vivado-quirks.md` §8.9):
 
-**别让 AI 浪费时间**:如果 AI 跟你说"我帮你写 Tcl 自动改 Analog",**停下来**告诉它
-看 quirks §8.9 —— 它会一直找不到属性,一直试错。
+```tcl
+set w [get_waves /tb/adc_out]
+set_wave_prop WaveformStyle STYLE_ANALOG $w   ;# ★ 裸 ANALOG 静默吞值不渲染
+set_wave_prop AnalogMin -2048 $w              ;# 贴数据:太宽压平,太窄削顶
+set_wave_prop AnalogMax  2047 $w
+set_wave_prop AnalogInterpolation LINEAR $w
+set_property HEIGHT 80 $w                      ;# 存为 CellHeight
+```
+
+**关键坑**:重载 wcfg 会冲掉 analog,**先定好 zoom 再实时上 analog**。
 
 ---
 

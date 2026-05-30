@@ -72,6 +72,14 @@ async def run_tcl(
       add_wave {/tb/gen_ch[0].u/sig}
       ```
 
+    - **marker 复位 = 磁盘 wcfg 干净时重载**。marker 存在 .wcfg 的
+      `<wave_markers><marker time="..fs"/></wave_markers>`,清掉/复位用一行:
+
+      ```tcl
+      close_wave_config -force          ;# 丢内存里的脏 marker
+      open_wave_config C:/path/wave.wcfg ;# 从干净磁盘文件重载
+      ```
+
     **set_property / radix 写脚本陷阱**(0.3.20 实战沉淀,无 err 静默踩):
 
     - **`-filter "name =~ {...[$var]...}"` 会污染后续 `set_property` 静默失败**。
@@ -94,11 +102,30 @@ async def run_tcl(
       signed decimal 在 XSim 叫 `dec`,**不是** `signed`(从 ModelSim/QuestaSim
       带过来的命名习惯会踩)。
 
-    - **`wave_design_object` 没有 wave_style / display_style / analog_wave 属性**。
-      Vivado 2019.1 XSim 的 Analog 显示模式**无 Tcl 接口**,只能 GUI 右键 wave →
-      Waveform Style → Analog 逐路手点。`list_property $w` 全集只有 CLASS / COLOR /
-      DESIGN_OBJECT / DISPLAY_NAME / FULL_NAME / HEIGHT / IS_HEIGHT_DEFAULT /
-      IS_REVERSED / NAME_STYLE / RADIX / WAVE_CONFIG。
+    - **Analog 波形可纯 Tcl 渲染(早期文档误判"无 Tcl 接口"的真根因)**。
+      WaveformStyle 不在 `list_property $w` / `set_property` 全集里,要用专用命令
+      `set_wave_prop`。当年踩坑是因为值写成了裸 `ANALOG`——Vivado 收下不报错但
+      渲染器不认,只改属性值不渲染(静默接受陷阱)。**正确值必须带 `STYLE_` 前缀**,
+      且信号寻址有两个静默坑(实测 2019.1):
+
+      ```tcl
+      # ★ get_waves 按"显示名"(如 y0[15:0])/glob 匹配,传全路径 /tb/y0 返回空!
+      #   且 set_wave_prop 对空对象 rc=0 静默接受 → 信号没 add 会伪装成功,务必先判空。
+      set w [get_waves -quiet y0*]   ;# 用显示名/glob;或遍历 get_waves * 按 DESIGN_OBJECT 全路径过滤
+      if {[llength $w]} {
+        set_wave_prop WaveformStyle STYLE_ANALOG $w  ;# ★ 裸 ANALOG 静默吞值不渲染
+        set_wave_prop AnalogMin -2048 $w             ;# 贴数据范围:太宽压平,太窄削顶
+        set_wave_prop AnalogMax  2047 $w
+        set_wave_prop AnalogInterpolation LINEAR $w
+        set_property HEIGHT 80 $w                     ;# 存为 CellHeight
+      }
+      ```
+
+      - **无法 Tcl 读回**:`get_wave_prop` 不存在、`report_wave_props` 输出不可捕获,
+        设完只能人眼确认渲染(MCP `set_wave_analog` 工具已封装寻址 + STYLE_ 前缀)。
+      - **重载冲掉 analog**:先定好 zoom 再实时上 analog,别先改 analog 再 open_wave_config。
+      - **wcfg 磁盘路径属性是 `FILE_PATH`**(不是 FILE_NAME,后者报 [Common 17-54]):
+        `get_property FILE_PATH [current_wave_config]`(MCP `set_wave_zoom` 改 zoom_setting 用此)。
 
     Args:
         command: Tcl 命令文本（支持多行）。

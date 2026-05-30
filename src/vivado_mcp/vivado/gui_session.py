@@ -29,9 +29,6 @@ from vivado_mcp.vivado.tcl_utils import TclResult, clean_output
 
 logger = logging.getLogger(__name__)
 
-# 端口池大小（从 port_preference 起连续 N 个）
-_PORT_POOL_SIZE = 5
-
 # 默认最大响应大小（10MB）
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
@@ -149,10 +146,15 @@ class GuiSession(BaseSession):
         self,
         vivado_path: str,
         session_id: str = "default",
-        port: int = 9999,
+        port: int = 0,
         attach_only: bool = False,
     ):
         super().__init__(vivado_path=vivado_path, session_id=session_id)
+        # 端口意图哨兵(B 方案):
+        #   port == 0 = 未指定 → auto-alloc 一个空闲端口 spawn 全新独立实例,**跳过 probe**
+        #               (多开正解:连开两次 = 两个独立 GUI,不会被 probe 抢成 attach)
+        #   port  > 0 = 显式目标端口 → 先 probe→命中则 attach,否则 spawn 并绑该确切端口
+        # attach 模式下 port 始终是要连的显式端口(attach 本就需知道连哪)。
         self._port_preference = port
         self._attach_only = attach_only
         # probe-then-attach 命中外部 GUI(用户手动启动 + init.tcl 已注入)时为 True
@@ -160,6 +162,11 @@ class GuiSession(BaseSession):
         # 是 mode="gui" 时的隐式 attach。两者对 mode/stop 行为意义相同。
         self._attached_external: bool = False
         self._proc: asyncio.subprocess.Process | None = None
+        # auto-alloc 出来的确切端口(port==0 路径);显式端口路径下保持 None。
+        self._allocated_port: int | None = None
+        # spawn 的 vivado pid,供 stop() 在 self._proc 引用丢失时按 pid 精杀。
+        # attach / 命中外部 GUI 路径本就不 spawn,_pid 保持 None,被 stop 双守卫挡住。
+        self._pid: int | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connected_port: int | None = None
@@ -183,6 +190,34 @@ class GuiSession(BaseSession):
     def attached_external(self) -> bool:
         """是否 attach 到了非 MCP spawn 的 Vivado(用户手动启动 + init.tcl)。"""
         return self._attached_external
+
+    @property
+    def pid(self) -> int | None:
+        """本 session spawn 的 vivado 进程 pid(attach / 外部命中路径为 None)。"""
+        return self._pid
+
+    def status_dict(self) -> dict:
+        """在基类字段上补 pid,便于 list_sessions / 诊断区分自己 spawn 的实例。"""
+        d = super().status_dict()
+        if self._pid is not None:
+            d["pid"] = self._pid
+        return d
+
+    @staticmethod
+    def _alloc_free_port() -> int:
+        """bind(("127.0.0.1", 0)) 抢一个 OS 分配的空闲端口号,立即释放后返回。
+
+        留一个极小的 TOCTOU 竞争窗口(取号→释放→tcl server 真正 bind 之间别的
+        进程可能抢走),但这是**可观测失败**:tcl server 绑不上会退出 + Python 连
+        该端口超时报错,不会像旧池逻辑那样静默串台连到别人的端口。
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
 
     @property
     def is_alive(self) -> bool:
@@ -242,9 +277,11 @@ class GuiSession(BaseSession):
             self.session_id, self._attach_only, self._port_preference,
         )
 
-        # ---- 0. 非 attach 模式:先 probe 首选端口,若已有 server 则直接 attach ----
-        # 避免和用户手动启动的 GUI 抢端口最后 spawn 出孤儿(0.3.19 Bug)
-        if not self._attach_only:
+        # ---- 0. 非 attach + 显式端口(port>0):先 probe,命中则直接 attach ----
+        # 避免和用户手动启动的 GUI 抢端口最后 spawn 出孤儿(0.3.19 Bug,§6 第1条)。
+        # port==0(未指定)= 明确要"独立新实例",**跳过 probe**,否则第2个实例会被
+        # attach 到第1个。两种意图都成立靠这个哨兵区分。
+        if not self._attach_only and self._port_preference > 0:
             if await self._try_attach_existing(self._port_preference, timeout=3.0):
                 self._state = SessionState.READY
                 self._start_time = time.time()
@@ -265,8 +302,20 @@ class GuiSession(BaseSession):
                 self._port_preference,
             )
 
-        # ---- 1. 如果非 attach 模式，spawn Vivado GUI ----
+        # ---- 1. 如果非 attach 模式，spawn Vivado GUI(绑确切端口) ----
         if not self._attach_only:
+            # 确定要注入给新 vivado 的**确切目标端口**:
+            #   port>0 → 用这个显式端口;port==0 → auto-alloc 一个空闲端口(独立实例)
+            if self._port_preference > 0:
+                target_port = self._port_preference
+            else:
+                self._allocated_port = self._alloc_free_port()
+                target_port = self._allocated_port
+                logger.info(
+                    "会话 '%s' 未指定端口,auto-alloc 空闲端口 %d 启动独立实例",
+                    self.session_id, target_port,
+                )
+
             try:
                 script_path = _locate_server_script()
             except FileNotFoundError as e:
@@ -275,13 +324,13 @@ class GuiSession(BaseSession):
 
             try:
                 # 关键：-source 临时注入 tcl server（即使用户没跑 install 也能工作）
-                # 通过 -source 传入 tcl 脚本，并在之前 `-tclargs` 或 env 传端口偏好
-                # 但 -source 本身不支持参数，我们直接写一个临时脚本设置 PORT_PREF
+                # 注入 VMCP_PORT_PREF = 确切端口,tcl server 绑这个端口否则退出
+                # (不再池滑动 → 杜绝新 vivado 监听在没人连的端口=孤儿)
                 import tempfile
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".tcl", delete=False, encoding="utf-8"
                 ) as tmp:
-                    tmp.write(f"set ::VMCP_PORT_PREF {self._port_preference}\n")
+                    tmp.write(f"set ::VMCP_PORT_PREF {target_port}\n")
                     tmp.write(f'source "{script_path.as_posix()}"\n')
                     tmp_script = tmp.name
                 self._tmp_script = tmp_script
@@ -297,61 +346,64 @@ class GuiSession(BaseSession):
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
+                # 记下 pid:stop() 在 self._proc 引用因故丢失时仍能按 pid 精杀
+                self._pid = self._proc.pid
                 logger.info(
-                    "已 spawn Vivado GUI (pid=%s), 等待 TCP server 就绪...",
-                    self._proc.pid,
+                    "已 spawn Vivado GUI (pid=%s, 目标端口=%d), 等待 TCP server 就绪...",
+                    self._proc.pid, target_port,
                 )
             except (OSError, FileNotFoundError) as e:
                 self._state = SessionState.ERROR
                 raise RuntimeError(f"启动 Vivado GUI 失败: {e}") from e
 
-        # ---- 2. 轮询端口池直到连上 ----
-        # 严格从 preference 开始连续 N 个，避免连上其他产品的 server（如 SynthPilot）
-        ports_to_try = [
-            self._port_preference + i for i in range(_PORT_POOL_SIZE)
-        ]
+        # ---- 2. 只连那一个确切端口,轮询直到新 vivado 起完 ----
+        # 不再扫端口池:连别人的端口正是 0.3.19 串台的根因。
+        #   spawn 路径 → 连 auto-alloc / 显式注入的确切端口
+        #   attach 路径 → 连用户给的显式端口
+        target_port = (
+            self._allocated_port
+            if self._allocated_port is not None
+            else self._port_preference
+        )
 
         deadline = time.time() + timeout
         connect_err: Exception | None = None
         while time.time() < deadline:
-            for port in ports_to_try:
-                try:
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection("127.0.0.1", port),
-                        timeout=2.0,
-                    )
-                except (ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
-                    connect_err = e
-                    continue
-
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection("127.0.0.1", target_port),
+                    timeout=2.0,
+                )
+            except (ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
+                # 新 vivado 还没起完 → 等下一轮重试同一个确切端口
+                connect_err = e
+            else:
                 # 连上后必须握手验证：确认对面说的是我们的 length-prefix 协议
                 # （避免连到 SynthPilot 等其他产品的 server 上）
                 handshake_ok = await self._handshake(reader, writer)
-                if not handshake_ok:
-                    logger.debug(
-                        "端口 %d 握手失败（可能是其他产品的 server），跳过",
-                        port,
+                if handshake_ok:
+                    self._reader = reader
+                    self._writer = writer
+                    self._connected_port = target_port
+                    self._state = SessionState.READY
+                    self._start_time = time.time()
+                    msg = (
+                        f"GUI 会话就绪：attach={self._attach_only}，"
+                        f"端口 {target_port}"
                     )
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                    continue
-
-                self._reader = reader
-                self._writer = writer
-                self._connected_port = port
-                self._state = SessionState.READY
-                self._start_time = time.time()
-                msg = (
-                    f"GUI 会话就绪：attach={self._attach_only}，"
-                    f"端口 {port}"
+                    logger.info(msg)
+                    return msg
+                logger.debug(
+                    "端口 %d 握手失败（可能是其他产品的 server），重试",
+                    target_port,
                 )
-                logger.info(msg)
-                return msg
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
-            # 本轮端口池全部失败，进程还活吗
+            # 进程还活吗
             if self._proc is not None and self._proc.returncode is not None:
                 self._state = SessionState.ERROR
                 raise RuntimeError(
@@ -362,8 +414,8 @@ class GuiSession(BaseSession):
         # 超时
         self._state = SessionState.ERROR
         raise RuntimeError(
-            f"连接 Vivado GUI 超时（{timeout}s，端口池 {ports_to_try}）。"
-            f"最后一次错误: {connect_err}"
+            f"连接 Vivado GUI 超时（{timeout}s，确切端口 {target_port}）。"
+            f"该端口可能被其他进程抢占,请重试。最后一次错误: {connect_err}"
         )
 
     async def _handshake(
@@ -543,6 +595,9 @@ class GuiSession(BaseSession):
             and not self._attached_external
         ):
             if self._proc.returncode is None:
+                # taskkill 用记录的 self._pid(spawn 时存),即使 self._proc 引用因故
+                # 丢失也能按确切 pid 精杀;正常情况 self._pid == self._proc.pid。
+                kill_pid = self._pid if self._pid is not None else self._proc.pid
                 # 先给 Vivado 一点时间自己退(响应 Tcl exit)
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5.0)
@@ -550,9 +605,9 @@ class GuiSession(BaseSession):
                     # 没退,强杀
                     try:
                         if sys.platform == "win32":
-                            # 关键:/T 递归杀进程树,捕获 cmd.exe 下的 vivado.exe
+                            # 关键:/T 递归杀进程树,捕获 cmd.exe(vivado.bat)下的 vivado.exe
                             subprocess.run(
-                                ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
+                                ["taskkill", "/F", "/T", "/PID", str(kill_pid)],
                                 capture_output=True,
                                 timeout=timeout,
                             )
@@ -563,7 +618,7 @@ class GuiSession(BaseSession):
                     except asyncio.TimeoutError:
                         logger.warning(
                             "Vivado 进程 PID=%s 未在 %ss 内退出,可能成为孤儿进程",
-                            self._proc.pid, timeout,
+                            kill_pid, timeout,
                         )
                     except Exception as e:
                         logger.warning("强杀 Vivado 进程异常: %s", e)

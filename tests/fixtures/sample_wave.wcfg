@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<wave_config>
+   <wave_config_version>10</wave_config_version>
+   <WVObjectSize size="3" />
+   <wvobject type="logic" fp_name="/tb/clk">
+      <obj_property name="ElementShortName">clk</obj_property>
+   </wvobject>
+   <wvobject type="logic" fp_name="/tb/u_dut/复位信号">
+      <obj_property name="ElementShortName">复位信号</obj_property>
+   </wvobject>
+   <zoom_setting>
+      <ZoomStartTime time="990000000fs"></ZoomStartTime>
+      <ZoomEndTime time="1042000000fs"></ZoomEndTime>
+   </zoom_setting>
+   <wave_markers>
+      <marker time="1000000000fs" name="标记A" />
+   </wave_markers>
+</wave_config>

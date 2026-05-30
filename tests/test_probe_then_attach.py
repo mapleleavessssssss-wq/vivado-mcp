@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import threading
@@ -238,20 +239,201 @@ class TestGuiSessionProbeThenAttach:
             stop.set()
 
     async def test_falls_through_to_spawn_when_no_existing_server(self, monkeypatch):
-        """端口无监听 → 走 spawn 路径(但因为 vivado_path 是 fake,会失败抛错)。
+        """显式端口但无监听 → 走 spawn 路径(因为 vivado_path 是 fake,会失败抛错)。
 
         关键是要验证 _try_attach_existing 失败后走到 spawn,而不是直接 return。
         """
         port = _find_unused_port()
         sess = GuiSession(
             vivado_path="/this/does/not/exist/vivado",
-            port=port,
+            port=port,  # 显式 port>0
             attach_only=False,
         )
         with pytest.raises(Exception):
             # spawn 路径会因为 vivado 不存在而失败 —— 但说明确实走了 spawn
             await sess.start(timeout=3.0)
         assert sess.attached_external is False
+
+    async def test_unspecified_port_auto_allocs_and_skips_probe(self):
+        """B 方案核心:port=0(未指定)= 要独立新实例,**不**去 attach 现有 server。
+
+        哪怕某 ephemeral 端口上正跑着一个 vmcp server,port=0 路径也不该 probe 它
+        attach 上去(证明"要独立新实例"意图不会被 probe 抢成 attach)。port=0 会
+        auto-alloc 空闲端口 → spawn(fake vivado 会失败抛错),关键断言 attached_external
+        始终 False。
+        """
+        # 起一个 fake vmcp server 占着某个 ephemeral 端口(模拟"已有第1个实例")
+        port, stop, _ = _serve_length_prefix(_vmcp_handler)
+        try:
+            sess = GuiSession(
+                vivado_path="/this/does/not/exist/vivado",
+                session_id="auto-alloc",
+                port=0,  # 哨兵:未指定 → 独立新实例,跳过 probe
+                attach_only=False,
+            )
+            with pytest.raises(Exception):
+                # 跳过 probe → auto-alloc → spawn(fake vivado 不存在 → 抛错)
+                await sess.start(timeout=3.0)
+            # 绝不能 attach 到那个现成的 server
+            assert sess.attached_external is False, (
+                "port=0 要独立新实例,绝不该被 probe 抢成 attach 到现有 server"
+            )
+            assert sess.mode == "gui"
+            # 证明确实 auto-alloc 了一个端口(且不是那个已占用的 server 端口)
+            assert sess._allocated_port is not None
+            assert sess._allocated_port != port
+        finally:
+            stop.set()
+
+    async def test_spawn_binds_exact_injected_port(self, monkeypatch):
+        """防回归到池滑动:写进临时 tcl 的 VMCP_PORT_PREF 必须等于 Python 选定的确切端口。
+
+        显式端口路径(port>0,无现存 server)→ spawn 应把**该确切端口**注入 tcl,
+        不再注入"池起点"。这里 mock subprocess 拦下写好的临时脚本内容校验。
+        """
+        explicit_port = _find_unused_port()
+        captured: dict[str, str] = {}
+
+        async def fake_exec(*args, **kwargs):
+            # 此时临时 tcl 脚本已写好,读出内容校验注入端口
+            sess_tmp = sess._tmp_script
+            with open(sess_tmp, encoding="utf-8") as f:
+                captured["tcl"] = f.read()
+
+            # 返回一个 fake proc,returncode=None(假装活着),让连接循环超时退出
+            class _FakeProc:
+                pid = 4242
+                returncode = None
+
+                async def wait(self):
+                    return 0
+
+            return _FakeProc()
+
+        monkeypatch.setattr(
+            "asyncio.create_subprocess_exec", fake_exec
+        )
+
+        sess = GuiSession(
+            vivado_path="/fake/vivado",
+            session_id="exact-port",
+            port=explicit_port,
+            attach_only=False,
+        )
+        # 连不上(没真 server)→ 超时抛错,但 spawn 已发生、tcl 已写
+        with pytest.raises(Exception):
+            await sess.start(timeout=1.0)
+
+        assert "tcl" in captured, "spawn 应已写临时 tcl 脚本"
+        assert f"set ::VMCP_PORT_PREF {explicit_port}" in captured["tcl"], (
+            "必须注入确切显式端口,不能是池起点或别的值"
+        )
+        assert sess.pid == 4242, "spawn 时应记下 vivado pid"
+
+    async def test_spawn_auto_alloc_injects_allocated_port(self, monkeypatch):
+        """port=0 路径:注入 tcl 的 VMCP_PORT_PREF 必须等于 auto-alloc 出的确切端口。"""
+        captured: dict[str, str] = {}
+
+        async def fake_exec(*args, **kwargs):
+            with open(sess._tmp_script, encoding="utf-8") as f:
+                captured["tcl"] = f.read()
+
+            class _FakeProc:
+                pid = 777
+                returncode = None
+
+                async def wait(self):
+                    return 0
+
+            return _FakeProc()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+
+        sess = GuiSession(
+            vivado_path="/fake/vivado",
+            session_id="auto-alloc-inject",
+            port=0,
+            attach_only=False,
+        )
+        with pytest.raises(Exception):
+            await sess.start(timeout=1.0)
+
+        assert sess._allocated_port is not None
+        assert f"set ::VMCP_PORT_PREF {sess._allocated_port}" in captured["tcl"]
+
+    async def test_stop_kills_by_recorded_pid(self, monkeypatch):
+        """spawn 路径记下 pid;stop 在双守卫通过时按该 pid 调 taskkill(Win)/proc.kill(Unix)。"""
+        import sys
+
+        recorded_pid = 31337
+
+        async def fake_exec(*args, **kwargs):
+            class _FakeProc:
+                pid = recorded_pid
+                returncode = None
+
+                async def wait(self):
+                    # 永远不自己退,逼 stop 走强杀分支
+                    raise asyncio.TimeoutError
+
+            return _FakeProc()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+
+        sess = GuiSession(
+            vivado_path="/fake/vivado",
+            session_id="kill-by-pid",
+            port=_find_unused_port(),
+            attach_only=False,
+        )
+        # 连不上 → start 超时抛错,但 self._proc / self._pid 已就绪
+        with pytest.raises(Exception):
+            await sess.start(timeout=1.0)
+        assert sess.pid == recorded_pid
+
+        # 让 stop 进入强杀分支:state 置成 READY 以触发双守卫内逻辑
+        # (这里不需要真连接,只验 taskkill/kill 用对了 pid)
+        kill_calls: list[list[str]] = []
+        killed = {"flag": False}
+
+        if sys.platform == "win32":
+            import subprocess as subprocess_mod
+
+            def fake_run(cmd, *a, **kw):
+                kill_calls.append(cmd)
+                return None
+
+            monkeypatch.setattr(subprocess_mod, "run", fake_run)
+        # Unix 路径 proc.kill 由我们的 fake proc 在下面注入
+
+        # 重新构造一个 fake proc 给 stop 用(start 里的已被消费)
+        class _StopProc:
+            pid = recorded_pid
+            returncode = None
+
+            async def wait(self):
+                # 第一次(等优雅退)超时,触发强杀;强杀后标记已死
+                if killed["flag"]:
+                    return 0
+                raise asyncio.TimeoutError
+
+            def kill(self):
+                killed["flag"] = True
+
+        stop_proc = _StopProc()
+        sess._proc = stop_proc
+        sess._writer = None  # 跳过优雅 exit 的 TCP 发送
+        from vivado_mcp.vivado.base_session import SessionState
+        sess._state = SessionState.READY
+
+        await sess.stop(timeout=1.0)
+
+        if sys.platform == "win32":
+            assert kill_calls, "Windows 应调用 taskkill"
+            assert str(recorded_pid) in kill_calls[0], "taskkill 必须用记录的 pid"
+            assert "/T" in kill_calls[0], "必须保留 /T 递归杀进程树"
+        else:
+            assert killed["flag"] is True, "Unix 应调用 proc.kill"
 
 
 # --------------------------------------------------------------------------- #
@@ -314,7 +496,6 @@ class TestListSessionsExternal:
                 attach_only=False,
             )
             # 跑一次 start 让它真的连上 + 标 attached_external(走 probe-then-attach)
-            import asyncio
             asyncio.run(sess.start(timeout=5.0))
             session_manager._sessions["already-managed"] = sess
 

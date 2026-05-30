@@ -420,3 +420,4 @@ import vivado_mcp.tools.ip_tools  # noqa: E402, F401
 import vivado_mcp.tools.report_tools  # noqa: E402, F401
 import vivado_mcp.tools.session_tools  # noqa: E402, F401
 import vivado_mcp.tools.tcl_tools  # noqa: E402, F401
+import vivado_mcp.tools.wave_tools  # noqa: E402, F401

@@ -168,12 +168,20 @@ async def start_session(
     - ``"attach"`` — 连接到用户已手动打开的 Vivado GUI（需先运行 ``vivado-mcp install``
       让 init.tcl 自动开启 TCP server）。
 
-    每个 session_id 对应一个独立的 Vivado 实例，支持多会话并行。
+    每个 session_id 对应一个独立的会话句柄；同 session_id 再次调用会复用现有会话
+    (会话模式自动复用)。**多开独立 GUI 实例**见下方 ``port`` 说明。
 
     Args:
         session_id: 会话标识符，默认 "default"。
         mode: ``"gui"`` / ``"tcl"`` / ``"attach"``，默认 ``"gui"``。
-        port: attach 模式的首选 TCP 端口，默认 9999。
+        port: TCP 端口语义(B 方案):
+            - ``gui`` 默认 ``9999``：先 probe 9999，命中现有 vmcp server 则直接复用/
+              attach(单 GUI 自动复用，也避免抢端口产生孤儿)；无则 spawn 并绑 9999。
+            - **多开独立实例**：传 ``port=0`` 自动分配一个空闲端口启动全新实例(零手动
+              配端口、跳过 probe)，或给不同端口的显式值。注意:不传 port 时即便换
+              session_id 也会 probe/attach 到 9999 的同一个 GUI(不会自动多开)，要独立
+              实例就传 ``port=0`` 或显式不同端口。
+            - ``attach`` 模式：要连接的现有 GUI 的显式端口(默认 9999)。
         vivado_path: 可选，自定义 Vivado 可执行文件路径。留空则自动检测。
         timeout: 启动超时秒数，GUI 模式建议 120+。默认 120。
     """

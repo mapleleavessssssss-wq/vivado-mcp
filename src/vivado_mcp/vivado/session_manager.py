@@ -52,6 +52,10 @@ class SessionManager:
         """
         self._default_vivado_path = vivado_path
         self._sessions: dict[str, BaseSession] = {}
+        # session_id → (port, pid) 轻量映射,供诊断 / stop 按 pid 兜底清理。
+        # 主清理路径仍是 GuiSession 自持 pid + 自洽 stop;这里只做"self._proc
+        # 引用失联时仍知道该清哪个端口/进程"的二级记录。
+        self._port_map: dict[str, tuple[int | None, int | None]] = {}
 
     @property
     def default_vivado_path(self) -> str:
@@ -74,7 +78,7 @@ class SessionManager:
         vivado_path: str | None = None,
         timeout: float = 120.0,
         mode: str = "gui",
-        port: int = 9999,
+        port: int = 0,
     ) -> tuple[BaseSession, str]:
         """启动新会话或返回已有会话。
 
@@ -83,7 +87,12 @@ class SessionManager:
             vivado_path: 可选的自定义 Vivado 路径（覆盖默认值）。
             timeout: 启动超时秒数（GUI 模式建议 120s+）。
             mode: 会话模式，``"gui"`` / ``"tcl"`` / ``"attach"``。
-            port: attach 模式首选端口（默认 9999）。
+            port: 端口哨兵(B 方案)。
+                - gui 模式 port==0(默认)= auto-alloc 空闲端口启动**全新独立实例**,
+                  跳过 probe(多开正解);port>0 = 先 probe 该端口命中则 attach,
+                  否则 spawn 并绑该确切端口。
+                - attach 模式 port 是要连的显式端口(attach 本就需知道连哪;
+                  传 0 会去连 0 端口失败,attach 调用方应显式给端口)。
 
         Returns:
             (会话实例, 启动横幅/状态消息) 元组。
@@ -122,6 +131,11 @@ class SessionManager:
 
         banner = await session.start(timeout=timeout)
         self._sessions[session_id] = session
+        # 记一份 (port, pid) 二级映射供诊断 / stop 兜底(从 session 读,不另算)
+        self._port_map[session_id] = (
+            getattr(session, "connected_port", None),
+            getattr(session, "pid", None),
+        )
 
         return session, banner
 
@@ -150,6 +164,7 @@ class SessionManager:
             操作结果描述。
         """
         session = self._sessions.pop(session_id, None)
+        self._port_map.pop(session_id, None)
         if not session:
             return f"会话 '{session_id}' 不存在。"
 
@@ -161,6 +176,7 @@ class SessionManager:
         session_ids = list(self._sessions.keys())
         for sid in session_ids:
             session = self._sessions.pop(sid, None)
+            self._port_map.pop(sid, None)
             if session:
                 try:
                     await session.stop()
@@ -229,4 +245,5 @@ class SessionManager:
         ]
         for sid in dead:
             del self._sessions[sid]
+            self._port_map.pop(sid, None)
         return dead
