@@ -250,6 +250,68 @@ class TestGetCriticalWarnings:
         )
         assert "[ERROR]" in result
 
+    @pytest.mark.asyncio
+    async def test_count_tcl_error_passes_through_raw_error(self):
+        """计数命令 Tcl 报错(如无项目打开)→ 透传原始错误,不误报"未找到 runme.log"。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result(
+                "ERROR: [Common 17-53] User Exception: No open project.",
+                return_code=1,
+            )
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="impl_1", session_id="default", ctx=ctx
+            )
+
+        assert "[ERROR]" in result
+        assert "Common 17-53" in result
+        # 不能给出误导性的"去跑 run"指引
+        assert "未找到 runme.log" not in result
+
+    @pytest.mark.asyncio
+    async def test_tail_n_out_of_range_rejected(self):
+        """tail_n 超出 1~500 被拦截(对齐 get_run_progress 的 tail_lines 校验)。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        ctx = _mock_context(None)
+        for bad in (0, -5, 501):
+            result = await get_critical_warnings(
+                run_name="impl_1", tail_n=bad, session_id="default", ctx=ctx
+            )
+            assert "[ERROR]" in result
+            assert "tail_n" in result
+
+    @pytest.mark.asyncio
+    async def test_tail_n_boundary_values_accepted(self):
+        """tail_n=1 / 500 边界值放行(走到正常计数流程)。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        for ok in (1, 500):
+            session = AsyncMock()
+            session.execute = AsyncMock(
+                return_value=_make_tcl_result(
+                    "VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"
+                )
+            )
+            ctx = _mock_context(session)
+            with patch(
+                "vivado_mcp.tools.diagnostic_tools._require_session",
+                return_value=session,
+            ):
+                result = await get_critical_warnings(
+                    run_name="synth_1", tail_n=ok, session_id="default", ctx=ctx
+                )
+            assert "tail_n 必须" not in result
+
 
 # ====================================================================== #
 #  get_critical_warnings 的 compare_with_last 差分功能
@@ -556,11 +618,15 @@ class TestVerifyIoPlacement:
 # ====================================================================== #
 
 
+# B4: QUERY_FILESET_OVERRIDES 的"无覆盖"标准输出
+_EMPTY_OVERRIDES = "VMCP_FS_OVERRIDE:generic=\nVMCP_FS_OVERRIDE:verilog_define="
+
+
 class TestLaunchAndWaitDiag:
     """测试 _launch_and_wait 中的自动诊断逻辑。
 
-    D5 重写后的流程：reset+launch → poll STATUS/PROGRESS → open_run → 诊断。
-    mock 需要按这个顺序提供返回值。
+    D5 重写后的流程：overrides 查询(B4) → reset+launch → poll STATUS/PROGRESS
+    → open_run → 诊断。mock 需要按这个顺序提供返回值。
     """
 
     @pytest.mark.asyncio
@@ -571,15 +637,17 @@ class TestLaunchAndWaitDiag:
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
-                # 1. reset_run + launch_runs
+                # 1. QUERY_FILESET_OVERRIDES (B4)
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                # 2. reset_run + launch_runs
                 _make_tcl_result("Synthesis launched"),
-                # 2. 第一次 poll：已 Complete
+                # 3. 第一次 poll：已 Complete
                 _make_tcl_result(
                     "VMCP_POLL|synth_design Complete!|100%|00:05:30"
                 ),
-                # 3. open_run（自动）
+                # 4. open_run（自动）
                 _make_tcl_result(""),
-                # 4. COUNT_WARNINGS 诊断
+                # 5. COUNT_WARNINGS 诊断
                 _make_tcl_result(
                     "VMCP_DIAG:errors=0,critical_warnings=16,warnings=3"
                 ),
@@ -603,15 +671,17 @@ class TestLaunchAndWaitDiag:
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
-                # 1. launch
+                # 1. QUERY_FILESET_OVERRIDES (B4)
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                # 2. launch
                 _make_tcl_result("Implementation launched"),
-                # 2. poll 已完成
+                # 3. poll 已完成
                 _make_tcl_result(
                     "VMCP_POLL|route_design Complete!|100%|00:10:00"
                 ),
-                # 3. open_run
+                # 4. open_run
                 _make_tcl_result(""),
-                # 4. 诊断
+                # 5. 诊断
                 _make_tcl_result(
                     "VMCP_DIAG:errors=0,critical_warnings=0,warnings=5"
                 ),
@@ -626,6 +696,138 @@ class TestLaunchAndWaitDiag:
 
         assert "CRITICAL WARNING" not in result
         assert "critical_warnings=0" in result
+
+    @pytest.mark.asyncio
+    async def test_applied_overrides_shown(self):
+        """B4: generic / verilog_define 有值时原样进结果,空值明示「(无)」。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_FS_OVERRIDE:generic=WIDTH=8 DEPTH=16\n"
+                    "VMCP_FS_OVERRIDE:verilog_define="
+                ),
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
+                _make_tcl_result(""),
+                _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+        )
+
+        assert "applied_generic: WIDTH=8 DEPTH=16" in result
+        assert "applied_verilog_define: (无)" in result
+        # 审计 P2:generic 有值时行尾追加 quirk 提醒(显示有值 ≠ 实际生效)
+        assert "不保证综合实际生效" in result
+        assert "bound to:" in result
+
+    @pytest.mark.asyncio
+    async def test_no_quirk_note_when_generic_empty(self):
+        """B4: generic 为 (无) 时不追加 quirk 提醒(提醒只针对「显示有值」场景)。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
+                _make_tcl_result(""),
+                _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+        )
+
+        assert "applied_generic: (无)" in result
+        assert "不保证综合实际生效" not in result
+
+    @pytest.mark.asyncio
+    async def test_overrides_query_error_degraded(self):
+        """B4: overrides 查询 Tcl 报错时降级为 [DEGRADED],不阻塞主流程。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result("ERROR: no such fileset sources_1", return_code=1),
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
+                _make_tcl_result(""),
+                _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+        )
+
+        assert "[DEGRADED]" in result
+        assert "generic/verilog_define" in result
+        assert "no such fileset" in result
+        # 主流程不受影响
+        assert "综合结果" in result
+
+    @pytest.mark.asyncio
+    async def test_diag_count_error_degraded(self):
+        """诊断计数命令 Tcl 报错时输出 [DEGRADED],不打 errors=-1 误导 AI。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
+                _make_tcl_result(""),
+                # 诊断计数:Tcl 报错(如项目被关掉)
+                _make_tcl_result("ERROR: [Common 17-53] No open project", return_code=1),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+        )
+
+        assert "[DEGRADED] 诊断计数不可用" in result
+        assert "Common 17-53" in result
+        assert "errors=-1" not in result
+
+    @pytest.mark.asyncio
+    async def test_diag_count_sentinel_missing_degraded(self):
+        """诊断输出无 VMCP_DIAG 标记(-1 哨兵)时输出 [DEGRADED] 而非负数。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
+                _make_tcl_result(""),
+                # rc=0 但输出没有 VMCP_DIAG 行 → parse 返回 (-1,-1,-1)
+                _make_tcl_result("some unrelated output"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+        )
+
+        assert "[DEGRADED] 诊断计数不可用" in result
+        assert "errors=-1" not in result
 
 
 # ====================================================================== #
@@ -693,6 +895,189 @@ class TestGenerateBitstreamSafety:
         # force=True 跳过 CHECK_PRE_BITSTREAM,调用序列 = launch + poll + 查目录
         assert session.execute.call_count == 3
         assert "/project/impl_1" in result
+        # 没有降级发生,不该出现 DEGRADED
+        assert "[DEGRADED]" not in result
+
+    @pytest.mark.asyncio
+    async def test_precheck_tcl_error_appends_degraded(self):
+        """安全检查 Tcl 报错(run 不存在/日志不可读)→ 放行但成功返回带 [DEGRADED]。"""
+        from vivado_mcp.tools.flow_tools import generate_bitstream
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                # 1. CHECK_PRE_BITSTREAM:Tcl 报错
+                _make_tcl_result(
+                    "ERROR: [Common 17-53] No open project", return_code=1
+                ),
+                # 2. launch_runs
+                _make_tcl_result("launched"),
+                # 3. poll 完成
+                _make_tcl_result("VMCP_POLL|write_bitstream Complete!|100%|00:05:00"),
+                # 4. 查比特流目录
+                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await generate_bitstream(
+                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+            )
+
+        assert "比特流生成结果" in result
+        assert "[DEGRADED] 前置 CW 安全检查未能执行" in result
+        assert "Common 17-53" in result
+        assert "未经 CRITICAL WARNING 门禁" in result
+
+    @pytest.mark.asyncio
+    async def test_precheck_sentinel_missing_appends_degraded(self):
+        """安全检查输出无 VMCP_PRE_BIT 标记(cw_count=-1 哨兵)→ 同样显式 [DEGRADED]。"""
+        from vivado_mcp.tools.flow_tools import generate_bitstream
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                # 1. CHECK_PRE_BITSTREAM:rc=0 但没有 VMCP_PRE_BIT 行
+                _make_tcl_result("garbage output without marker"),
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|write_bitstream Complete!|100%|00:05:00"),
+                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await generate_bitstream(
+                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+            )
+
+        assert "[DEGRADED] 前置 CW 安全检查未能执行" in result
+        assert "VMCP_PRE_BIT" in result
+
+    @pytest.mark.asyncio
+    async def test_precheck_exception_appends_degraded(self):
+        """安全检查 execute 抛异常(如超时)→ 放行但成功返回带 [DEGRADED] + 原因。"""
+        from vivado_mcp.tools.flow_tools import generate_bitstream
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                TimeoutError("命令执行超时（30.0s）"),
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|write_bitstream Complete!|100%|00:05:00"),
+                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await generate_bitstream(
+                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+            )
+
+        assert "[DEGRADED] 前置 CW 安全检查失败" in result
+        assert "超时" in result
+
+    @pytest.mark.asyncio
+    async def test_precheck_clean_no_degraded(self):
+        """安全检查正常(cw=0)时放行且无 [DEGRADED](负例)。"""
+        from vivado_mcp.tools.flow_tools import generate_bitstream
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_PRE_BIT:status=route_design Complete,critical_warnings=0\n"
+                    "VMCP_PRE_BIT_DONE"
+                ),
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|write_bitstream Complete!|100%|00:05:00"),
+                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await generate_bitstream(
+                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+            )
+
+        assert "比特流生成结果" in result
+        assert "[DEGRADED]" not in result
+
+
+# ====================================================================== #
+#  program_device 参数校验测试
+# ====================================================================== #
+
+
+class TestProgramDeviceValidation:
+    """program_device 的 target / hw_server_url 轻量校验。"""
+
+    def _make_bit(self, tmp_path):
+        bit = tmp_path / "top.bit"
+        bit.write_bytes(b"\x00fake bitstream")
+        return str(bit)
+
+    @pytest.mark.asyncio
+    async def test_invalid_target_rejected(self, tmp_path):
+        """target 含空格/Tcl 特殊字符 → 清晰报错,不碰 session。"""
+        from vivado_mcp.tools.flow_tools import program_device
+
+        session = AsyncMock()
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await program_device(
+                bitstream_path=self._make_bit(tmp_path),
+                target="bad target;exec",
+                ctx=ctx,
+            )
+
+        assert "[ERROR]" in result
+        assert "target" in result
+        # 审计 P3:报错文案是黑名单口吻(与黑名单实现对齐),不再宣称白名单
+        assert "不允许空白" in result
+        session.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_hw_server_url_rejected(self, tmp_path):
+        """hw_server_url 空串 → 清晰报错。"""
+        from vivado_mcp.tools.flow_tools import program_device
+
+        session = AsyncMock()
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await program_device(
+                bitstream_path=self._make_bit(tmp_path),
+                hw_server_url="",
+                ctx=ctx,
+            )
+
+        assert "[ERROR]" in result
+        assert "hw_server_url" in result
+        session.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_default_params_pass_validation(self, tmp_path):
+        """默认 target='*' + localhost:3121 合法,正常走到 Tcl 执行。"""
+        from vivado_mcp.tools.flow_tools import program_device
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result("编程完成: xc7a35t_0")
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await program_device(
+                bitstream_path=self._make_bit(tmp_path), ctx=ctx
+            )
+
+        assert "编程完成" in result
+        session.execute.assert_awaited_once()
 
 
 # ====================================================================== #
@@ -1015,7 +1400,13 @@ class TestSimDiagnose:
         )
 
         session = AsyncMock()
-        session.execute = AsyncMock(return_value=_make_tcl_result(sim_out))
+        # 审计修复后:guard 提前 → logs 非空也会查一次 target_simulator
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(sim_out),
+                _make_tcl_result("VMCP_TARGET_SIM:XSim"),
+            ]
+        )
         ctx = _mock_context(session)
 
         with patch(
@@ -1032,6 +1423,10 @@ class TestSimDiagnose:
         assert "not_recognized_cmd_zh" in result
         # R4: 状态污染提示
         assert "stop_session" in result or "重启" in result
+        # XSim 时不出现陈旧日志头部注记
+        assert "陈旧" not in result
+        # 两次 execute:TAIL_SIM_LOGS + QUERY_TARGET_SIMULATOR
+        assert session.execute.call_count == 2
 
     @pytest.mark.asyncio
     async def test_fileset_not_found(self):
@@ -1062,8 +1457,8 @@ class TestSimDiagnose:
         """sim 目录存在但 glob 不到 xsim/*.log → 0.3.15 走 scripts-only fallback。"""
         from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
 
-        # 第一次 execute = TAIL_SIM_LOGS(空)
-        # 第二次 execute = LAUNCH_SCRIPTS_AND_GLOB(也没 .bat,fallback 空走)
+        # 顺序:TAIL_SIM_LOGS(空) → QUERY_TARGET_SIMULATOR(XSim) →
+        #       LAUNCH_SCRIPTS_AND_GLOB(也没 .bat,fallback 空走)
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
@@ -1072,6 +1467,7 @@ class TestSimDiagnose:
                     "VMCP_SIM:log_count=0\n"
                     "VMCP_SIM_DONE\n"
                 ),
+                _make_tcl_result("VMCP_TARGET_SIM:XSim"),
                 _make_tcl_result(
                     "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
                     "VMCP_BAT:scripts_only=already_present\n"
@@ -1091,8 +1487,139 @@ class TestSimDiagnose:
 
         # 走了 fallback 路径,有相关标签
         assert "scripts_only" in result.lower() or "scripts-only" in result.lower()
-        # 调了两次:TAIL_SIM_LOGS + LAUNCH_SCRIPTS_AND_GLOB
+        # 调了三次:TAIL_SIM_LOGS + QUERY_TARGET_SIMULATOR + LAUNCH_SCRIPTS_AND_GLOB
+        assert session.execute.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_third_party_simulator_guard(self):
+        """target_simulator 非 XSim 时:日志拍空是预期,返回指引而不是误导诊断。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_SIM:log_count=0\n"
+                    "VMCP_SIM_DONE\n"
+                ),
+                _make_tcl_result("VMCP_TARGET_SIM:Questa"),
+                # 不该有第三次调用(不走 bat fallback)
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        assert "Questa" in result
+        assert "compile_simlib" in result
+        assert "questa" in result  # 日志子目录指引用小写
+        # 不能给出 "spawn .bat 之前就炸了" 这种 XSim 专属误导结论
+        assert "spawn .bat" not in result
         assert session.execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_third_party_simulator_stale_xsim_logs_flagged(self):
+        """审计 P2:切到第三方仿真器后 */xsim/ 残留旧日志 → guard 不能被绕过,
+        报告头部必须注明这是陈旧 XSim 日志并指向真日志目录。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        sim_out = (
+            "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+            "VMCP_SIM:log_count=1\n"
+            "VMCP_SIM_LOG_START:C:/proj/proj.sim/sim_1/behav/xsim/xvlog.log\n"
+            "VMCP_SIM_LOG_LINE:1|old xsim run output\n"
+            "VMCP_SIM_LOG_END:C:/proj/proj.sim/sim_1/behav/xsim/xvlog.log\n"
+            "VMCP_SIM_DONE\n"
+        )
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(sim_out),
+                _make_tcl_result("VMCP_TARGET_SIM:Questa"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        # 头部注记:陈旧 XSim 日志 + 当前仿真器 + 真日志目录(小写)
+        assert "陈旧" in result
+        assert "target_simulator=Questa" in result
+        assert "/questa/" in result
+        # 日志本身仍展示(透传),但已被标注
+        assert "xvlog.log" in result
+        assert session.execute.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_target_simulator_no_marker_logs_warning(self, caplog):
+        """审计 P3:输出无 VMCP_TARGET_SIM 标记的第三条降级路径要留 warning 痕迹。"""
+        import logging
+
+        from vivado_mcp.tools.diagnostic_tools import _get_target_simulator
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result("some unrelated output without marker")
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await _get_target_simulator(session)
+
+        assert result is None
+        messages = [rec.getMessage() for rec in caplog.records]
+        # 降级原因要点名标记缺失,且带输出前 200 字片段
+        assert any(
+            "VMCP_TARGET_SIM" in m and "unrelated output" in m for m in messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_simulator_query_error_still_falls_back(self):
+        """target_simulator 查询出错 → 按 XSim 继续 fallback(降级不阻断诊断)。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_SIM:log_count=0\n"
+                    "VMCP_SIM_DONE\n"
+                ),
+                _make_tcl_result("VMCP_TARGET_SIM:error=no current project"),
+                _make_tcl_result(
+                    "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_BAT:scripts_only=already_present\n"
+                    "VMCP_BAT_DONE\n"
+                ),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        # 查询失败按 XSim 继续走 fallback,共 3 次 execute
+        assert session.execute.call_count == 3
+        assert "scripts" in result.lower()
 
     @pytest.mark.asyncio
     async def test_sim_path_skips_messagedb_queries(self):
@@ -1100,12 +1627,13 @@ class TestSimDiagnose:
         from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
 
         session = AsyncMock()
-        # 第一次 = TAIL_SIM_LOGS 空,第二次 = fallback LAUNCH_SCRIPTS_AND_GLOB 也空
+        # TAIL_SIM_LOGS 空 → target_simulator → fallback LAUNCH_SCRIPTS_AND_GLOB 也空
         session.execute = AsyncMock(
             side_effect=[
                 _make_tcl_result(
                     "VMCP_SIM:sim_dir=/tmp\nVMCP_SIM:log_count=0\nVMCP_SIM_DONE\n"
                 ),
+                _make_tcl_result("VMCP_TARGET_SIM:XSim"),
                 _make_tcl_result(
                     "VMCP_BAT:sim_dir=/tmp\nVMCP_BAT:scripts_only=already_present\n"
                     "VMCP_BAT_DONE\n"
@@ -1122,9 +1650,9 @@ class TestSimDiagnose:
                 run_name="sim_1", session_id="default", ctx=ctx
             )
 
-        # 两次 execute:TAIL_SIM_LOGS + LAUNCH_SCRIPTS_AND_GLOB,
+        # 三次 execute:TAIL_SIM_LOGS + QUERY_TARGET_SIMULATOR + LAUNCH_SCRIPTS_AND_GLOB,
         # 没调 COUNT_WARNINGS / EXTRACT_ERRORS / 快照查询
-        assert session.execute.call_count == 2
+        assert session.execute.call_count == 3
 
 
 def _bat_run_ok(out_lines: list[str]) -> str:
@@ -1159,7 +1687,9 @@ class TestSimBatFallback:
                     "VMCP_SIM:log_count=0\n"
                     "VMCP_SIM_DONE\n"
                 ),
-                # 2. LAUNCH_SCRIPTS_AND_GLOB:.bat 已存在,glob 出三步
+                # 2. QUERY_TARGET_SIMULATOR:XSim → 继续 fallback
+                _make_tcl_result("VMCP_TARGET_SIM:XSim"),
+                # 3. LAUNCH_SCRIPTS_AND_GLOB:.bat 已存在,glob 出三步
                 _make_tcl_result(
                     "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
                     "VMCP_BAT:scripts_only=already_present\n"
@@ -1168,9 +1698,9 @@ class TestSimBatFallback:
                     "VMCP_BAT_FILE:simulate|bat|C:/proj/proj.sim/sim_1/behav/xsim/simulate.bat\n"
                     "VMCP_BAT_DONE\n"
                 ),
-                # 3. RUN_BAT_STEP compile → rc=0
+                # 4. RUN_BAT_STEP compile → rc=0
                 _make_tcl_result(_bat_run_ok(['"xvlog ..."', "Vivado Simulator 2019.1"])),
-                # 4. RUN_BAT_STEP elaborate → rc=0
+                # 5. RUN_BAT_STEP elaborate → rc=0
                 _make_tcl_result(_bat_run_ok(['"xelab ..."', "Completed static elaboration"])),
                 # simulate 跳过,不会再 execute
             ]
@@ -1189,8 +1719,9 @@ class TestSimBatFallback:
         assert "compile" in result
         assert "elaborate" in result
         assert "simulate" in result  # 路径回带,但跳过
-        # session.execute 共 4 次:TAIL_SIM_LOGS + LAUNCH_SCRIPTS_AND_GLOB + 2 步 RUN_BAT_STEP
-        assert session.execute.call_count == 4
+        # session.execute 共 5 次:TAIL_SIM_LOGS + QUERY_TARGET_SIMULATOR +
+        # LAUNCH_SCRIPTS_AND_GLOB + 2 步 RUN_BAT_STEP
+        assert session.execute.call_count == 5
 
     @pytest.mark.asyncio
     async def test_compile_step_failure_surfaces_stderr(self):
@@ -1205,6 +1736,7 @@ class TestSimBatFallback:
                     "VMCP_SIM:log_count=0\n"
                     "VMCP_SIM_DONE\n"
                 ),
+                _make_tcl_result("VMCP_TARGET_SIM:XSim"),
                 _make_tcl_result(
                     "VMCP_BAT:sim_dir=/tmp/proj.sim/sim_1\n"
                     "VMCP_BAT:scripts_only=ok\n"
@@ -1229,8 +1761,8 @@ class TestSimBatFallback:
                 run_name="sim_1", session_id="default", ctx=ctx
             )
 
-        # 调用次数:TAIL + GLOB + compile RUN_BAT_STEP = 3(elaborate 跳过)
-        assert session.execute.call_count == 3
+        # 调用次数:TAIL + TARGET_SIM + GLOB + compile RUN_BAT_STEP = 4(elaborate 跳过)
+        assert session.execute.call_count == 4
         assert "cannot find module" in result
         assert "compile" in result
         # "真错很可能就在这一步" 结论
@@ -1250,13 +1782,14 @@ class TestSimBatFallback:
                     "VMCP_SIM:log_count=0\n"
                     "VMCP_SIM_DONE\n"
                 ),
+                _make_tcl_result("VMCP_TARGET_SIM:XSim"),
                 _make_tcl_result(
                     "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
                     "VMCP_BAT:scripts_only=triggering\n"
                     "VMCP_BAT:scripts_only_failed=some xilinx internal error\n"
                     "VMCP_BAT_DONE\n"
                 ),
-                # 不该调第 3 次,如果调了 side_effect StopIteration
+                # 不该调第 4 次,如果调了 side_effect StopIteration
             ]
         )
         ctx = _mock_context(session)
@@ -1269,6 +1802,6 @@ class TestSimBatFallback:
                 run_name="sim_1", session_id="default", ctx=ctx
             )
 
-        # 只两次:TAIL + GLOB,没有任何 RUN_BAT_STEP
-        assert session.execute.call_count == 2
+        # 三次:TAIL + TARGET_SIM + GLOB,没有任何 RUN_BAT_STEP
+        assert session.execute.call_count == 3
         assert "未跑任何 .bat" in result or "failed:some xilinx" in result

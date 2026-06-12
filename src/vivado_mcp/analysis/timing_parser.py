@@ -79,6 +79,13 @@ class TimingSummary:
     failing_endpoints: int  # setup failing endpoints
     total_endpoints: int  # setup total endpoints
     timing_met: bool  # wns >= 0 and whs >= 0
+    # 解析状态:
+    #   "ok"             — 正常解析出数值,timing_met 可信
+    #   "no_timing_data" — 摘要行为 NA(设计无时序约束/无可分析端点)
+    #   "unrecognized"   — 表头/数据行格式不识别(全零占位)
+    # 非 "ok" 时数值全零、timing_met 取保守值 False,消费方必须先看本字段,
+    # 绝不能把"没解析到数据"当成 PASS。
+    parse_status: str = "ok"
 
 
 @dataclass(frozen=True)
@@ -135,6 +142,19 @@ class TimingReport:
 # ====================================================================== #
 
 
+def _degraded_summary(status: str) -> TimingSummary:
+    """构造无数据/格式不识别时的占位摘要。
+
+    timing_met 取保守值 False(绝不能默认 PASS),真实状态由 parse_status
+    标明;消费方应先看 parse_status,非 "ok" 时不要直接当 FAIL 用。
+    """
+    return TimingSummary(
+        wns=0.0, tns=0.0, whs=0.0, ths=0.0,
+        failing_endpoints=0, total_endpoints=0,
+        timing_met=False, parse_status=status,
+    )
+
+
 def _parse_summary_table(text: str) -> TimingSummary:
     """从 Design Timing Summary 表格解析摘要行。
 
@@ -143,7 +163,9 @@ def _parse_summary_table(text: str) -> TimingSummary:
     2. 跳过紧随其后的 ``-------`` 分隔行
     3. 解析下一行的 8 个数值字段
 
-    如果找不到表头或数据行，返回全零的默认摘要。
+    找不到表头/数据行 → parse_status="unrecognized";
+    数据行是 NA(无约束设计) → parse_status="no_timing_data"。
+    两种情况都不抛异常、不默认 PASS。
     """
     lines = text.splitlines()
 
@@ -155,10 +177,7 @@ def _parse_summary_table(text: str) -> TimingSummary:
             break
 
     if header_idx is None:
-        return TimingSummary(
-            wns=0.0, tns=0.0, whs=0.0, ths=0.0,
-            failing_endpoints=0, total_endpoints=0, timing_met=True,
-        )
+        return _degraded_summary("unrecognized")
 
     # 跳过分隔线（一行或多行 -------），找到第一行数据
     data_line: str | None = None
@@ -169,25 +188,28 @@ def _parse_summary_table(text: str) -> TimingSummary:
             break
 
     if data_line is None:
-        return TimingSummary(
-            wns=0.0, tns=0.0, whs=0.0, ths=0.0,
-            failing_endpoints=0, total_endpoints=0, timing_met=True,
-        )
+        return _degraded_summary("unrecognized")
 
     tokens = data_line.split()
     if len(tokens) < 8:
-        return TimingSummary(
-            wns=0.0, tns=0.0, whs=0.0, ths=0.0,
-            failing_endpoints=0, total_endpoints=0, timing_met=True,
-        )
+        return _degraded_summary("unrecognized")
 
-    wns = float(tokens[0])
-    tns = float(tokens[1])
-    failing_setup = int(tokens[2])
-    total_setup = int(tokens[3])
-    whs = float(tokens[4])
-    ths = float(tokens[5])
-    # tokens[6] = THS Failing, tokens[7] = THS Total（暂不单独存储）
+    # 无时序约束/无 setup 端点的设计,Vivado 打印 'NA NA NA ...':
+    # 按"无数据"处理,不能 float('NA') 抛异常,更不能默认 PASS
+    if any(t.upper() == "NA" for t in tokens[:8]):
+        return _degraded_summary("no_timing_data")
+
+    try:
+        wns = float(tokens[0])
+        tns = float(tokens[1])
+        failing_setup = int(tokens[2])
+        total_setup = int(tokens[3])
+        whs = float(tokens[4])
+        ths = float(tokens[5])
+        # tokens[6] = THS Failing, tokens[7] = THS Total（暂不单独存储）
+    except ValueError:
+        # 数据行 token 不是数值(未知格式变体):显式标记格式不识别,不抛异常
+        return _degraded_summary("unrecognized")
 
     return TimingSummary(
         wns=wns,
@@ -373,7 +395,9 @@ def parse_timing_summary(raw_text: str) -> TimingReport:
     返回:
         TimingReport —— 包含 summary（TimingSummary）和 paths（TimingPath 列表）。
 
-    空输入或无法识别的格式不会抛异常，而是返回全零的默认报告。
+    空输入或无法识别的格式不会抛异常:summary.parse_status 会标为
+    "unrecognized"(格式不识别)或 "no_timing_data"(摘要为 NA,常见于
+    无时序约束的设计),数值全零、timing_met=False,不会伪装成 PASS。
     """
     summary = _parse_summary_table(raw_text)
     paths = _parse_paths(raw_text)
@@ -390,8 +414,13 @@ def format_timing_report(report: TimingReport) -> str:
     s = report.summary
     lines: list[str] = []
 
-    # 总体状态
-    status = "PASS (时序满足)" if s.timing_met else "FAIL (时序违例)"
+    # 总体状态(parse_status 非 ok 时绝不显示 PASS/FAIL —— 没数据不等于结论)
+    if s.parse_status == "no_timing_data":
+        status = "无时序数据 (设计无时序约束或无可分析路径)"
+    elif s.parse_status != "ok":
+        status = "未知 [DEGRADED] (时序报告格式不识别)"
+    else:
+        status = "PASS (时序满足)" if s.timing_met else "FAIL (时序违例)"
     lines.append(f"=== 时序分析摘要 === 状态: {status}")
 
     # Bug 2 修复:数据来源元信息(在 PASS/FAIL 旁边,用户不会漏看)
@@ -408,19 +437,29 @@ def format_timing_report(report: TimingReport) -> str:
         lines.append(f"[!] {report.stage_warning}")
     lines.append("")
 
-    # Setup 指标
-    lines.append(f"  Setup  WNS = {s.wns:+.3f} ns   TNS = {s.tns:.3f} ns")
-    lines.append(f"         失败端点: {s.failing_endpoints} / {s.total_endpoints}")
+    if s.parse_status == "no_timing_data":
+        # NA 摘要:不打全零数值(会误导),解释真实原因 + 下一步
+        lines.append("  report_timing_summary 摘要为 NA:设计没有时序约束,或没有可分析的端点。")
+        lines.append("  如需时序分析,请先在 XDC 中添加 create_clock 等约束,再重跑综合/实现。")
+    elif s.parse_status != "ok":
+        lines.append(
+            "  [DEGRADED] 未能解析 Design Timing Summary 表格,可能是 Vivado 版本格式差异。"
+        )
+        lines.append('  请用 run_tcl("report_timing_summary -return_string") 查看原始报告。')
+    else:
+        # Setup 指标
+        lines.append(f"  Setup  WNS = {s.wns:+.3f} ns   TNS = {s.tns:.3f} ns")
+        lines.append(f"         失败端点: {s.failing_endpoints} / {s.total_endpoints}")
 
-    # Hold 指标
-    lines.append(f"  Hold   WHS = {s.whs:+.3f} ns   THS = {s.ths:.3f} ns")
-    lines.append("")
+        # Hold 指标
+        lines.append(f"  Hold   WHS = {s.whs:+.3f} ns   THS = {s.ths:.3f} ns")
+        lines.append("")
 
-    # 违例警告
-    if s.wns < 0:
-        lines.append(f"  [!] Setup 违例: WNS = {s.wns:.3f} ns，需优化关键路径。")
-    if s.whs < 0:
-        lines.append(f"  [!] Hold 违例: WHS = {s.whs:.3f} ns，需检查时钟偏斜。")
+        # 违例警告
+        if s.wns < 0:
+            lines.append(f"  [!] Setup 违例: WNS = {s.wns:.3f} ns，需优化关键路径。")
+        if s.whs < 0:
+            lines.append(f"  [!] Hold 违例: WHS = {s.whs:.3f} ns，需检查时钟偏斜。")
 
     # 路径详情
     if report.paths:

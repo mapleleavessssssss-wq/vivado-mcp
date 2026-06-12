@@ -17,7 +17,12 @@ from mcp.server.fastmcp import Context
 
 from vivado_mcp.analysis.warning_parser import parse_diag_counts, parse_pre_bitstream
 from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
-from vivado_mcp.tcl_scripts import CHECK_PRE_BITSTREAM, COUNT_WARNINGS
+from vivado_mcp.tcl_scripts import (
+    CHECK_PRE_BITSTREAM,
+    COUNT_WARNINGS,
+    POLL_RUN_STATUS,
+    QUERY_FILESET_OVERRIDES,
+)
 from vivado_mcp.vivado.tcl_utils import to_tcl_path, validate_identifier
 
 logger = logging.getLogger(__name__)
@@ -26,36 +31,27 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_SEC = 2.0
 
 # --------------------------------------------------------------------------- #
-#  内部辅助：综合 / 实现共享的 launch-and-wait 逻辑
+#  内部辅助：综合 / 实现 / bitstream 共享的轮询逻辑(单一来源,勿复制)
 # --------------------------------------------------------------------------- #
 
-async def _launch_and_wait(
+async def _poll_run_until_done(
     session,
     run_name: str,
-    jobs: int,
-    timeout_minutes: int,
-    label: str,
+    timeout_sec: float,
     ctx: Context,
-) -> str:
-    """D5: 执行 reset_run → launch_runs → Python 轮询 → 自动 open_run → 诊断。
+) -> tuple[str, str, str, str]:
+    """每 2s 轮询 run STATUS/PROGRESS 直到终态(Complete/ERROR)或超时。
 
-    不再调用 Tcl 的 `wait_on_run`（它会阻塞 Vivado event loop，
-    GUI 模式下会冻住界面）。改用 Python 每 2 秒查一次 STATUS/PROGRESS。
+    Tcl 片段在 tcl_scripts.POLL_RUN_STATUS(单一定义);本 helper 是
+    _launch_and_wait 和 generate_bitstream 的共用轮询循环。
+
+    Returns:
+        ``(outcome, final_status, final_progress, final_elapsed)``,
+        outcome ∈ {"done", "timeout"}。outcome=="done" 时已上报 100% 进度。
+
+    Raises:
+        轮询 execute 抛出的异常原样上抛,由调用方格式化错误消息。
     """
-    timeout_sec = timeout_minutes * 60.0
-
-    # ------------------- 1. 启动 -------------------
-    try:
-        launch_result = await session.execute(
-            f"reset_run {run_name}\nlaunch_runs {run_name} -jobs {jobs}",
-            timeout=60.0,
-        )
-        if launch_result.is_error:
-            return f"[ERROR] 启动 {label} 失败:\n{launch_result.output}"
-    except Exception as e:
-        return f"[ERROR] 启动 {label} 失败: {e}"
-
-    # ------------------- 2. 轮询 -------------------
     deadline = time.time() + timeout_sec
     final_status = "UNKNOWN"
     final_progress = "0%"
@@ -65,17 +61,9 @@ async def _launch_and_wait(
     await ctx.report_progress(progress=0, total=100)
 
     while time.time() < deadline:
-        try:
-            poll = await session.execute(
-                f'set __r [get_runs {run_name}]\n'
-                f'set __s [get_property STATUS $__r]\n'
-                f'set __p [get_property PROGRESS $__r]\n'
-                f'set __e [get_property STATS.ELAPSED $__r]\n'
-                f'puts "VMCP_POLL|$__s|$__p|$__e"',
-                timeout=15.0,
-            )
-        except Exception as e:
-            return f"[ERROR] 轮询 {label} 状态失败: {e}"
+        poll = await session.execute(
+            POLL_RUN_STATUS.format(run_name=run_name), timeout=15.0
+        )
 
         line = next(
             (ln for ln in poll.output.splitlines() if ln.startswith("VMCP_POLL|")),
@@ -105,9 +93,104 @@ async def _launch_and_wait(
 
         await asyncio.sleep(_POLL_INTERVAL_SEC)
     else:
-        return f"[ERROR] {label}超时（{timeout_minutes} 分钟），最后状态: {final_status}"
+        return ("timeout", final_status, final_progress, final_elapsed)
 
     await ctx.report_progress(progress=100, total=100)
+    return ("done", final_status, final_progress, final_elapsed)
+
+
+async def _query_fileset_overrides(session) -> list[str]:
+    """PRD B4:查 sources_1 的 generic / verilog_define,格式化成结果行。
+
+    Returns:
+        要追加进结果的行列表:成功时两行 ``applied_generic: ...`` /
+        ``applied_verilog_define: ...``(空值明示「(无)」;generic 有值时
+        行尾追加 vivado-quirks §3 提醒 —— fileset generic 显示有值不保证
+        综合实际生效);查询失败时一行 ``[DEGRADED]``(含具体原因,不阻塞主流程)。
+    """
+    try:
+        ov = await session.execute(QUERY_FILESET_OVERRIDES, timeout=15.0)
+    except Exception as e:
+        logger.warning("查询 fileset 参数覆盖(generic/verilog_define)异常: %s", e)
+        return [f"[DEGRADED] generic/verilog_define 查询异常: {e}"]
+
+    if ov.is_error:
+        logger.warning(
+            "查询 fileset 参数覆盖失败(rc=%d): %s", ov.return_code, ov.output[:200]
+        )
+        return [
+            f"[DEGRADED] generic/verilog_define 查询失败"
+            f"(rc={ov.return_code}): {ov.output[:200]}"
+        ]
+
+    applied_generic = "(无)"
+    applied_vdefine = "(无)"
+    for ln in ov.output.splitlines():
+        s = ln.strip()
+        if s.startswith("VMCP_FS_OVERRIDE:generic="):
+            applied_generic = s[len("VMCP_FS_OVERRIDE:generic="):].strip() or "(无)"
+        elif s.startswith("VMCP_FS_OVERRIDE:verilog_define="):
+            applied_vdefine = (
+                s[len("VMCP_FS_OVERRIDE:verilog_define="):].strip() or "(无)"
+            )
+    generic_line = f"applied_generic: {applied_generic}"
+    if applied_generic != "(无)":
+        # vivado-quirks §3:fileset 级 generic 即便显示有值(综合日志都打印
+        # bound to:)也可能没真生效(类型不匹配/缓存走错分支),行尾明示防误信。
+        generic_line += (
+            "(注意 2019.1 quirk: fileset generic 显示有值不保证综合实际生效,"
+            "关键参数请核对 runme.log 的 'bound to:' 行,见 vivado-quirks §3)"
+        )
+    return [
+        generic_line,
+        f"applied_verilog_define: {applied_vdefine}",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+#  内部辅助：综合 / 实现共享的 launch-and-wait 逻辑
+# --------------------------------------------------------------------------- #
+
+async def _launch_and_wait(
+    session,
+    run_name: str,
+    jobs: int,
+    timeout_minutes: int,
+    label: str,
+    ctx: Context,
+) -> str:
+    """D5: 执行 reset_run → launch_runs → Python 轮询 → 自动 open_run → 诊断。
+
+    不再调用 Tcl 的 `wait_on_run`（它会阻塞 Vivado event loop，
+    GUI 模式下会冻住界面）。改用 Python 每 2 秒查一次 STATUS/PROGRESS。
+    """
+    timeout_sec = timeout_minutes * 60.0
+
+    # ------------------- 0. PRD B4:读取实际生效的参数覆盖 -------------------
+    # 在 reset_run 之前查 generic / verilog_define,结果里明示,
+    # 防止"以为 set_property generic 生效了实际没设上"的隐性坑。
+    override_lines = await _query_fileset_overrides(session)
+
+    # ------------------- 1. 启动 -------------------
+    try:
+        launch_result = await session.execute(
+            f"reset_run {run_name}\nlaunch_runs {run_name} -jobs {jobs}",
+            timeout=60.0,
+        )
+        if launch_result.is_error:
+            return f"[ERROR] 启动 {label} 失败:\n{launch_result.output}"
+    except Exception as e:
+        return f"[ERROR] 启动 {label} 失败: {e}"
+
+    # ------------------- 2. 轮询 -------------------
+    try:
+        outcome, final_status, final_progress, final_elapsed = (
+            await _poll_run_until_done(session, run_name, timeout_sec, ctx)
+        )
+    except Exception as e:
+        return f"[ERROR] 轮询 {label} 状态失败: {e}"
+    if outcome == "timeout":
+        return f"[ERROR] {label}超时（{timeout_minutes} 分钟），最后状态: {final_status}"
 
     # ------------------- 3. B4 修复：自动 open_run -------------------
     # 综合/实现完成后自动打开设计，让紧随其后的 report_* / report_io 能工作。
@@ -145,6 +228,7 @@ async def _launch_and_wait(
         f"进度: {final_progress}",
         f"耗时: {final_elapsed}",
     ]
+    result_parts.extend(override_lines)
     if open_note:
         result_parts.append(open_note)
 
@@ -152,22 +236,36 @@ async def _launch_and_wait(
         diag_result = await session.execute(
             COUNT_WARNINGS.format(run_name=run_name), timeout=30.0
         )
-        errors, cw, w = parse_diag_counts(diag_result.output)
-        if cw > 0:
-            result_parts.insert(
-                0,
-                f"!! 发现 {cw} 条 CRITICAL WARNING !! "
-                "建议立即运行 get_critical_warnings 查看分类详情和修复建议。",
+        if diag_result.is_error:
+            # 计数命令本身失败:不能把 -1 哨兵打成数字误导 AI,显式降级
+            result_parts.append(
+                f"\n[DEGRADED] 诊断计数不可用(rc={diag_result.return_code}): "
+                f"{diag_result.output[:200]}"
             )
-        if errors > 0:
-            result_parts.insert(
-                0,
-                f"!! 发现 {errors} 条 ERROR !! 请检查 runme.log 详情。",
-            )
-        result_parts.append(
-            f"\n诊断概览: errors={errors},"
-            f" critical_warnings={cw}, warnings={w}"
-        )
+        else:
+            errors, cw, w = parse_diag_counts(diag_result.output)
+            if errors < 0 or cw < 0:
+                # -1 哨兵 = runme.log 缺失或输出无 VMCP_DIAG 标记
+                result_parts.append(
+                    "\n[DEGRADED] 诊断计数不可用: "
+                    "runme.log 缺失或未匹配到 VMCP_DIAG 标记"
+                )
+            else:
+                if cw > 0:
+                    result_parts.insert(
+                        0,
+                        f"!! 发现 {cw} 条 CRITICAL WARNING !! "
+                        "建议立即运行 get_critical_warnings 查看分类详情和修复建议。",
+                    )
+                if errors > 0:
+                    result_parts.insert(
+                        0,
+                        f"!! 发现 {errors} 条 ERROR !! 请检查 runme.log 详情。",
+                    )
+                result_parts.append(
+                    f"\n诊断概览: errors={errors},"
+                    f" critical_warnings={cw}, warnings={w}"
+                )
     except Exception as e:
         # 诊断失败不阻塞主流程，但要告诉用户原因（1.4 错误处理铁律）
         result_parts.append(f"\n（诊断统计失败: {e}）")
@@ -187,7 +285,10 @@ async def run_synthesis(
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
-    """运行综合。自动执行 reset_run → launch_runs → wait_on_run。
+    """运行综合。自动执行 reset_run → launch_runs → Python 侧轮询 STATUS/PROGRESS。
+
+    不调用 Tcl wait_on_run(会阻塞 Vivado event loop,GUI 模式冻住界面);
+    Python 每 2 秒查一次状态,期间 GUI 保持响应,并向客户端上报进度。
 
     Args:
         run_name: 综合 run 名称，默认 "synth_1"。
@@ -217,7 +318,10 @@ async def run_implementation(
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
-    """运行实现（布局布线）。自动执行 reset_run → launch_runs → wait_on_run。
+    """运行实现（布局布线）。自动执行 reset_run → launch_runs → Python 侧轮询。
+
+    不调用 Tcl wait_on_run(会阻塞 Vivado event loop,GUI 模式冻住界面);
+    Python 每 2 秒查一次 STATUS/PROGRESS,期间 GUI 保持响应,并上报进度。
 
     Args:
         run_name: 实现 run 名称，默认 "impl_1"。
@@ -269,7 +373,10 @@ async def generate_bitstream(
     if not session:
         return _NO_SESSION.format(sid=session_id)
 
-    # 前置安全检查：force=False 时检测 CRITICAL WARNING
+    # 前置安全检查：force=False 时检测 CRITICAL WARNING。
+    # 检查本身失败时不拦截,但必须降级为显式 [DEGRADED](追加进最终返回),
+    # 不允许静默放行 —— 否则"未布线/日志不可读"这类信号会被吞掉。
+    precheck_warn = ""
     if not force:
         try:
             pre_result = await session.execute(
@@ -277,7 +384,19 @@ async def generate_bitstream(
             )
             status, cw_count, samples = parse_pre_bitstream(pre_result.output)
 
-            if cw_count > 0:
+            if pre_result.is_error or cw_count < 0:
+                # Tcl 报错(run 不存在/无项目)或输出无 VMCP_PRE_BIT 标记(-1 哨兵)
+                reason = (
+                    f"rc={pre_result.return_code}, 输出: {pre_result.output[:200]}"
+                    if pre_result.is_error
+                    else "输出未匹配到 VMCP_PRE_BIT 标记(run 不存在或日志不可读)"
+                )
+                logger.warning("bitstream 前置安全检查未能执行: %s", reason)
+                precheck_warn = (
+                    f"[DEGRADED] 前置 CW 安全检查未能执行: {reason}。"
+                    "本次生成未经 CRITICAL WARNING 门禁。"
+                )
+            elif cw_count > 0:
                 lines = [
                     f"!! 安全检查未通过: 发现 {cw_count} 条 CRITICAL WARNING !!",
                     f"实现状态: {status}",
@@ -301,7 +420,10 @@ async def generate_bitstream(
                 "bitstream 前置安全检查失败,降级跳过: %s: %s",
                 type(e).__name__, e,
             )
-            # 继续往下跑,但返回时附带警告前缀,让用户看到"摸鱼过去"的风险
+            precheck_warn = (
+                f"[DEGRADED] 前置 CW 安全检查失败: {type(e).__name__}: {e}。"
+                "本次生成未经 CRITICAL WARNING 门禁。"
+            )
 
     # D5 架构同步到 bitstream:不再用 Tcl wait_on_run(阻塞 Vivado event loop,
     # GUI 模式下界面冻住)。改 Python 轮询 STATUS/PROGRESS,界面保持响应 +
@@ -319,60 +441,18 @@ async def generate_bitstream(
     except Exception as e:
         return f"[ERROR] 启动比特流生成失败: {e}"
 
-    # 轮询
-    deadline = time.time() + timeout_sec
-    final_status = "UNKNOWN"
-    final_progress = "0%"
-    final_elapsed = ""
-    last_progress_int = 0
-
-    await ctx.report_progress(progress=0, total=100)
-
-    while time.time() < deadline:
-        try:
-            poll = await session.execute(
-                f'set __r [get_runs {impl_run}]\n'
-                f'set __s [get_property STATUS $__r]\n'
-                f'set __p [get_property PROGRESS $__r]\n'
-                f'set __e [get_property STATS.ELAPSED $__r]\n'
-                f'puts "VMCP_POLL|$__s|$__p|$__e"',
-                timeout=15.0,
-            )
-        except Exception as e:
-            return f"[ERROR] 轮询比特流状态失败: {e}"
-
-        line = next(
-            (ln for ln in poll.output.splitlines() if ln.startswith("VMCP_POLL|")),
-            None,
+    # 轮询(与 _launch_and_wait 共用 _poll_run_until_done,单一来源)
+    try:
+        outcome, final_status, final_progress, final_elapsed = (
+            await _poll_run_until_done(session, impl_run, timeout_sec, ctx)
         )
-        if line:
-            parts = line[len("VMCP_POLL|"):].split("|")
-            if len(parts) >= 2:
-                final_status = parts[0]
-                final_progress = parts[1]
-                final_elapsed = parts[2] if len(parts) >= 3 else ""
-
-        try:
-            progress_int = int(final_progress.rstrip("%").strip() or "0")
-        except ValueError:
-            progress_int = last_progress_int
-        if progress_int != last_progress_int:
-            await ctx.report_progress(progress=progress_int, total=100)
-            last_progress_int = progress_int
-
-        if "Complete" in final_status:
-            break
-        if "ERROR" in final_status.upper():
-            break
-
-        await asyncio.sleep(_POLL_INTERVAL_SEC)
-    else:
+    except Exception as e:
+        return f"[ERROR] 轮询比特流状态失败: {e}"
+    if outcome == "timeout":
         return (
             f"[ERROR] 生成比特流超时({timeout_minutes} 分钟)。"
             f"最后状态: {final_status},进度: {final_progress}"
         )
-
-    await ctx.report_progress(progress=100, total=100)
 
     if "ERROR" in final_status.upper():
         return (
@@ -397,13 +477,17 @@ async def generate_bitstream(
     except Exception as e:
         bit_dir = f"(查询失败: {e})"
 
-    return (
+    result_text = (
         f"--- 比特流生成结果 ---\n"
         f"状态: {final_status}\n"
         f"进度: {final_progress}\n"
         f"耗时: {final_elapsed}\n"
         f"比特流目录: {bit_dir}"
     )
+    if precheck_warn:
+        # 安全门检查失败时的显式降级标记:不拦截,但必须让 AI/用户看见
+        result_text += f"\n{precheck_warn}"
+    return result_text
 
 
 @mcp.tool()
@@ -415,6 +499,21 @@ async def program_device(
     ctx: Context = None,
 ) -> str:
     """编程 FPGA 设备。封装 open_hw_manager → connect → program 多步操作。
+
+    只烧 .bit 进 FPGA(掉电即丢)。要掉电自启动须烧 SPI flash,见下面配方。
+
+    **烧 flash 配方(2019.1,run_tcl 逐步执行)**:
+    1. 查 flash 型号: ``get_cfgmem_parts -of [lindex [get_hw_devices] 0]``
+       (或按板上 flash 用 -filter 选,如 mt25ql128-spi-x1_x2_x4)
+    2. 生成 .mcs: ``write_cfgmem -format mcs -size 16 -interface SPIx4
+       -loadbit {up 0x0 <top>.bit} -force out.mcs``
+    3. 建 cfgmem 对象: ``create_hw_cfgmem -hw_device [current_hw_device]
+       [lindex [get_cfgmem_parts <part>] 0]``
+    4. 设属性四件套: ``set_property PROGRAM.FILES {out.mcs} [current_hw_cfgmem]``
+       + PROGRAM.ERASE 1 / PROGRAM.CFG_PROGRAM 1 / PROGRAM.VERIFY 1
+    5. 烧写: ``program_hw_cfgmem``
+    6. 烧后 ``boot_hw_device [current_hw_device]`` 或断电重启从 flash 加载。
+    (Zynq 用 .bin: ``write_cfgmem -format bin -interface SMAPx32 ...``)
 
     Args:
         bitstream_path: 比特流文件路径（.bit 文件）。
@@ -434,7 +533,24 @@ async def program_device(
     if not bitstream_path.lower().endswith(".bit"):
         return (
             f"[ERROR] 文件扩展名不是 .bit: {bitstream_path}\n"
-            "program_device 只接受 .bit 文件(.bin/.mcs 用 write_cfgmem 烧 flash)"
+            "program_device 只接受 .bit 文件(.bin/.mcs 用 write_cfgmem 烧 flash,"
+            "配方见本工具 docstring)"
+        )
+
+    # 轻量参数校验:两者都会裸拼进 Tcl,空串/含 Tcl 特殊字符直接报清晰错误,
+    # 而不是半路炸出难懂的 Tcl 解析错(此时 hw_server 可能已连上,留脏状态)。
+    _TCL_UNSAFE = set(' \t\n;$[]{}"\\')
+    if not target or any(c in _TCL_UNSAFE for c in target):
+        # 文案与实现对齐:实现是黑名单(只拒会破坏 Tcl 裸拼词法的字符)
+        return (
+            f"[ERROR] target 为空或含非法字符: {target!r}。"
+            "不允许空白/;/$/[]/{}/引号/反斜杠"
+            "(如 '*' 或 'localhost:3121/xilinx_tcf/...')"
+        )
+    if not hw_server_url or any(c in _TCL_UNSAFE or c == "*" for c in hw_server_url):
+        return (
+            f"[ERROR] hw_server_url 为空或含非法字符: {hw_server_url!r}。"
+            "应形如 'localhost:3121' 或 '<主机名/IP>:<端口>'"
         )
 
     session = _require_session(ctx, session_id)

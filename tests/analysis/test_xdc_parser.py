@@ -12,7 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from vivado_mcp.analysis.xdc_parser import parse_xdc_constraints, parse_xdc_file
+from vivado_mcp.analysis.xdc_parser import (
+    _strip_comment,
+    parse_xdc_constraints,
+    parse_xdc_file,
+)
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 
@@ -208,3 +212,76 @@ class TestParseXdcFile:
         file_lines = fixture.read_text(encoding="utf-8").splitlines()
         for c in result:
             assert 0 < c.line_number <= len(file_lines)
+
+
+# ====================================================================== #
+#  反斜杠续行折叠(审计 P2:跨行约束静默解析为 0 条)
+# ====================================================================== #
+
+
+class TestContinuationLines:
+    """Tcl 反斜杠续行的折叠测试。"""
+
+    def test_multiline_dict_constraint(self, tmp_path):
+        """跨行 -dict 约束(行尾反斜杠续行)应解析出来,行号取首行。"""
+        p = tmp_path / "cont.xdc"
+        p.write_text(
+            "set_property -dict { PACKAGE_PIN E3 \\\n"
+            "    IOSTANDARD LVCMOS33 } [get_ports clk]\n",
+            encoding="utf-8",
+        )
+        result = parse_xdc_file(p)
+        assert len(result) == 1
+        assert result[0].pin == "E3"
+        assert result[0].port == "clk"
+        assert result[0].line_number == 1
+
+    def test_double_backslash_is_not_continuation(self, tmp_path):
+        """行尾双反斜杠是转义的字面反斜杠,不应吞掉下一行。"""
+        p = tmp_path / "dbl.xdc"
+        p.write_text(
+            "# comment with literal backslash \\\\\n"
+            "set_property PACKAGE_PIN W5 [get_ports clk]\n",
+            encoding="utf-8",
+        )
+        result = parse_xdc_file(p)
+        assert len(result) == 1
+        assert result[0].line_number == 2
+
+
+# ====================================================================== #
+#  编码探测(GBK 中文 Windows 存盘)
+# ====================================================================== #
+
+
+class TestEncodingDetection:
+    """GBK 编码 XDC 的读取测试。"""
+
+    def test_gbk_encoded_file(self, tmp_path):
+        """GBK 编码(中文 Windows ANSI 存盘)的 XDC 也能正确解析。"""
+        p = tmp_path / "gbk.xdc"
+        content = "# 时钟引脚约束\nset_property PACKAGE_PIN W5 [get_ports clk]\n"
+        p.write_bytes(content.encode("gbk"))
+        result = parse_xdc_file(p)
+        assert len(result) == 1
+        assert result[0].pin == "W5"
+        assert result[0].port == "clk"
+
+
+# ====================================================================== #
+#  _strip_comment 转义处理(审计 P3:continue 不跳过被转义字符)
+# ====================================================================== #
+
+
+class TestStripCommentEscape:
+    """_strip_comment 反斜杠转义的修复测试。"""
+
+    def test_escaped_quote_does_not_toggle_string_state(self):
+        """\\" 不应翻转引号状态,引号闭合后的 # 仍要剥掉。"""
+        line = 'set x "a\\"b" # comment'
+        assert _strip_comment(line) == 'set x "a\\"b" '
+
+    def test_escaped_hash_not_treated_as_comment(self):
+        """\\# 是转义的字面 #,不应被当注释起点截断。"""
+        line = "foo \\# bar"
+        assert _strip_comment(line) == "foo \\# bar"

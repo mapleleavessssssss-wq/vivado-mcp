@@ -23,6 +23,7 @@ from mcp.server.fastmcp import Context
 from vivado_mcp.analysis import wcfg_editor
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 from vivado_mcp.tcl_scripts import RELOAD_WCFG, RESOLVE_WCFG_PATH, SET_ANALOG_PROPS
+from vivado_mcp.vivado.tcl_utils import to_tcl_path
 
 # AnalogInterpolation 白名单。0.3.2x 用户实测仅验证 LINEAR；HOLD 是 Vivado 另一
 # 合法值一并放行，其余值直接拒(避免静默退回 default)。
@@ -182,18 +183,25 @@ async def set_wave_zoom(
             return "[ERROR] 当前无 wave_config。请先 open_wave_config 或运行仿真。"
         if status == "unsaved":
             return (
-                "[ERROR] 当前 wave_config 从未保存(FILE_NAME 为空)，磁盘上没有可改的 "
+                "[ERROR] 当前 wave_config 从未保存(FILE_PATH 为空)，磁盘上没有可改的 "
                 ".wcfg。请先 save_wave_config <路径>，再调 set_wave_zoom。"
             )
 
     try:
         wcfg_editor.set_zoom_range(wcfg_path, start_ns, end_ns)
-    except (FileNotFoundError, ValueError) as e:
-        return f"[ERROR] 改写 wcfg 缩放区间失败: {e}"
+    except (OSError, ValueError) as e:
+        # OSError 覆盖 FileNotFoundError/PermissionError(只读/占用/无写权限),
+        # 写回阶段的失败也要带具体原因返回,不能裸抛成 FastMCP 通用错误
+        return f"[ERROR] 改写 wcfg 缩放区间失败: {type(e).__name__}: {e}"
 
+    # 路径必须过 to_tcl_path 转义(转正斜杠 + 引号包裹):含空格/$/[ 的合法
+    # Windows 路径裸拼会被 Tcl 分词/替换,close 已执行而 open 失败,
+    # 用户 wave_config 会被关掉还原不回来
     tcl_path = wcfg_path.replace("\\", "/")
     try:
-        r2 = await session.execute(RELOAD_WCFG.format(wcfg_path=tcl_path), timeout=60.0)
+        r2 = await session.execute(
+            RELOAD_WCFG.format(wcfg_path=to_tcl_path(wcfg_path)), timeout=60.0
+        )
     except Exception as e:
         return f"[ERROR] 重载 wcfg 失败: {e}(XML 已改，可手动 open_wave_config {tcl_path})"
 
@@ -273,6 +281,13 @@ async def set_wave_analog(
         r = await session.execute(tcl, timeout=60.0)
     except Exception as e:
         return f"[ERROR] 设置 analog 属性失败: {e}"
+
+    # 脚本级 Tcl 报错(如无 live simulation)时透传真实错误,
+    # 不要送进逐信号解析——那会把所有信号误报成"Tcl 未回报"
+    if r.is_error:
+        return (
+            f"[ERROR] 设置 analog 属性失败(rc={r.return_code}):\n{r.output[:500]}"
+        )
 
     ok_lines, problem_lines = _parse_analog_result(r.output, signals)
     header = (

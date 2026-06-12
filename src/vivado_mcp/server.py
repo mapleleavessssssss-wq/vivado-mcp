@@ -8,8 +8,10 @@
                           └─ ...
 """
 
+import asyncio
 import json
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,9 +22,13 @@ from vivado_mcp.config import find_vivado
 from vivado_mcp.vivado.session import VivadoSession
 from vivado_mcp.vivado.session_manager import SessionManager
 
-# 配置日志
+# 配置日志:默认 WARNING(logging-guidelines §2:INFO/DEBUG 不出现在生产用户终端,
+# 用户必须看到的信息走 WARNING+),调试时设环境变量 LOG_LEVEL=INFO/DEBUG 覆盖。
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "WARNING").upper()
+if _LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+    _LOG_LEVEL = "WARNING"
 logging.basicConfig(
-    level=logging.INFO,
+    level=_LOG_LEVEL,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -94,8 +100,11 @@ def _require_session(ctx, session_id: str) -> VivadoSession | None:
 #  哲学:不改写 Vivado 原始输出(透传契约),只在末尾追加"看到 X 时该怎么办"。
 #  AI 在 run_tcl 返回里必然看到这段 hint,不需要主动查 quirks。
 #
-#  每条 hint = (keyword 子串 | 触发条件 callable, hint 文本)
-#  触发条件二选一:简单关键词字符串 / 复杂条件用 callable(output, command) -> bool
+#  每条 hint = (触发函数 callable(output, command) -> bool, hint 文本, error_only)
+#  对**所有**输出评估,不只 is_error:quirks §10 的 open_wave 误报场景真机 rc=0,
+#  只在 is_error 时追加会让该 hint 在目标场景永不触发。触发函数自己基于
+#  output/command 内容判断;error_only=True 的条目语义依赖"命令已失败",
+#  仍只在 is_error 时评估(避免成功跑完 launch_runs 也被追加失败兜底指引)。
 #  同一次返回可触发多条 hint(按 _QUIRK_HINTS 顺序追加,各加一段)。
 # --------------------------------------------------------------------------- #
 
@@ -125,7 +134,8 @@ _HINT_WAVE_STATE_CLEANUP = (
     "重试前先清理:"
     "\n  run_tcl \"while {[catch {current_sim} __c] == 0 && \\$__c ne {}} "
     "{ close_sim -force }; catch {close_wave_config}\""
-    "\n清理后仍失败 → stop_session → start_session 重启 vivado 进程(参考 quirks §7)。"
+    "\n清理后仍失败 → stop_session → start_session 重启 vivado 进程"
+    "(close_sim 不关 GUI tab,残留 tab 无 Tcl 可清,只能重启进程)。"
 )
 
 
@@ -179,22 +189,96 @@ def _looks_like_wave_failure_needs_cleanup(output: str, command: str) -> bool:
     return any(m in output for m in err_markers)
 
 
-# (触发函数, hint 文本)。按顺序匹配,命中的都追加。
-_QUIRK_HINTS: tuple[tuple, ...] = (
-    (_looks_like_run_failure, _HINT_RUN_FAILURE),
-    (_looks_like_open_wave_spurious, _HINT_OPEN_WAVE_SPURIOUS),
-    (_looks_like_wave_failure_needs_cleanup, _HINT_WAVE_STATE_CLEANUP),
+# B1:-scripts_only 每次都重生仿真脚本,用户手动 append 的内容会被擦
+_HINT_SCRIPTS_ONLY_REGEN = (
+    "\n\n提示: tb_*.tcl / xsim_*.tcl 每次 -scripts_only 都会被 Vivado 重生,"
+    "你手动 append 的 'quit 0' 会被擦。"
+    "CI 跑请用 xsim -tclbatch <script.tcl> + 脚本里显式 quit 0"
 )
 
 
-def _append_quirk_hints(summary: str, command: str) -> str:
+def _looks_like_scripts_only_regen(output: str, command: str) -> bool:
+    """B1:launch_simulation -scripts_only → 脚本会被重生(成功也提示)。"""
+    return "launch_simulation" in command and "-scripts_only" in command
+
+
+# B2:GUI 操作保存的 wcfg 混入中文 BOM,xsim 持续刷解析告警(rc 多为 0)
+_HINT_WCFG_BOM_CORRUPT = (
+    "\n\n提示: <proj>.sim/*/sim_*.wcfg 内部混了中文 BOM(GUI 操作时保存的损坏文件)。"
+    "处理: 删除该 .wcfg 或改名 *.wcfg.bak,xsim 会自动重生干净版本。"
+    "不致命,但持续干扰 log。"
+)
+
+
+def _looks_like_wcfg_bom_corrupt(output: str, command: str) -> bool:
+    """B2:输出含 wcfg 解析损坏特征 → 删除/改名后 xsim 自动重生。
+
+    'invalid byte' 是通用编码错误措辞(读任意损坏/二进制文件都可能出现),
+    单独命中会把无关报错误导向删 .wcfg —— 须输出同时含 '.wcfg' 才触发。
+    """
+    if "[Wavedata 42-472]" in output or "WCFG parsing ERROR" in output:
+        return True
+    return "invalid byte" in output and ".wcfg" in output
+
+
+# B3:open_project 路径错,Vivado 不做 fuzzy match,引导 glob 列候选。
+# 注意 Tcl glob 没有 bash globstar 语义(** 等价单层 *),递归要逐层显式列
+# pattern(glob 接受多 pattern,一条命令覆盖 1-3 层)。
+_HINT_PROJECT_NOT_FOUND = (
+    "\n\n提示: 路径错了。用 'glob -nocomplain <搜索根>/*.xpr <搜索根>/*/*.xpr"
+    " <搜索根>/*/*/*.xpr' 列出候选(一条命令覆盖 1-3 层;Tcl glob 不支持 **"
+    " 递归),或先 'pwd' 确认 cwd。Vivado 不做 fuzzy match。"
+)
+
+
+def _looks_like_project_not_found(output: str, command: str) -> bool:
+    """B3:[Coretcl 2-27] Can't find specified project → 路径错。"""
+    return (
+        "[Coretcl 2-27]" in output
+        and "Can't find specified project" in output
+    )
+
+
+# 超时 hint:_safe_execute except 分支命中超时类异常时追加(超时≠命令失败)
+_HINT_TIMEOUT = (
+    "\n\n提示: 超时≠命令失败:Vivado 仍在执行,本 session 在该命令完成前不可用。"
+    "同步长命令(synth_design/route_design/launch_simulation)请显式传大 timeout"
+    "(如 3600);勿重发命令;工程模式长任务请改用 run_synthesis/run_implementation"
+    "(Python 轮询不阻塞)。"
+)
+
+
+# (触发函数, hint 文本, error_only)。按顺序匹配,命中的都追加。
+# error_only=True:hint 语义依赖"命令已失败"(rc!=0),成功输出不评估;
+# error_only=False:对所有输出评估(quirks §10 的误报场景 rc=0 也要触发)。
+_QUIRK_HINTS: tuple[tuple, ...] = (
+    (_looks_like_run_failure, _HINT_RUN_FAILURE, True),
+    (_looks_like_open_wave_spurious, _HINT_OPEN_WAVE_SPURIOUS, False),
+    (_looks_like_wave_failure_needs_cleanup, _HINT_WAVE_STATE_CLEANUP, False),
+    (_looks_like_scripts_only_regen, _HINT_SCRIPTS_ONLY_REGEN, False),
+    (_looks_like_wcfg_bom_corrupt, _HINT_WCFG_BOM_CORRUPT, False),
+    (_looks_like_project_not_found, _HINT_PROJECT_NOT_FOUND, False),
+)
+
+
+def _append_quirk_hints(summary: str, command: str, is_error: bool = False) -> str:
     """根据返回输出 + 原命令匹配关键词,追加已知 quirk hint。
 
-    所有 hint 在原 summary 末尾按 _QUIRK_HINTS 顺序追加。一条命中追加一段,
-    多条命中追加多段(各自独立,不互相依赖)。
+    对**所有**输出调用(不只 is_error):open_wave 误报等场景真机 rc=0,
+    触发函数自己基于 output/command 内容判断。error_only 条目(如 run 失败
+    兜底诊断)仍只在 is_error=True 时评估。所有 hint 在原 summary 末尾按
+    _QUIRK_HINTS 顺序追加,一条命中追加一段,多条命中追加多段。
     """
     additions = []
-    for trigger, hint in _QUIRK_HINTS:
+    # A1/A2 分流:rc=0 的 open_wave 误报场景(A1 命中且命令实际成功)下,
+    # A2 的 close_sim -force 清理会把刚加载成功的 sim 关掉,恰好制造 A1 想
+    # 避免的破坏 —— 该场景跳过 A2;真失败(rc!=0)时 A2 照常触发。
+    skip_cleanup = not is_error and _looks_like_open_wave_spurious(summary, command)
+    for trigger, hint, error_only in _QUIRK_HINTS:
+        if error_only and not is_error:
+            continue
+        if skip_cleanup and hint is _HINT_WAVE_STATE_CLEANUP:
+            continue
         try:
             if trigger(summary, command):
                 additions.append(hint)
@@ -212,17 +296,19 @@ async def _safe_execute(
 ) -> str:
     """安全执行 Tcl 命令，异常时返回错误字符串而非抛出。
 
-    失败响应在末尾追加已知 quirk hint(W 模式):AI 在 run_tcl 返回里必然看到
-    "这条 err 怎么办" 的固定指引,不需要主动查 quirks 文档。
+    响应(成功与失败)在末尾追加已知 quirk hint(W 模式):AI 在 run_tcl 返回里
+    必然看到 "这条 err 怎么办" 的固定指引,不需要主动查 quirks 文档。
+    超时类异常额外追加 "超时≠命令失败" 指引(Vivado 仍在执行,勿重发)。
     """
     try:
         result = await session.execute(tcl, timeout=timeout)
-        summary = result.summary
-        if result.is_error:
-            summary = _append_quirk_hints(summary, tcl)
-        return summary
+        return _append_quirk_hints(result.summary, tcl, is_error=result.is_error)
     except Exception as e:
-        return f"[ERROR] {error_label}: {e}"
+        msg = f"[ERROR] {error_label}: {e}"
+        # 两类超时:asyncio.TimeoutError(3.10 与 builtin 不同类)/ builtin TimeoutError
+        if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+            msg += _HINT_TIMEOUT
+        return msg
 
 
 # --------------------------------------------------------------------------- #
@@ -231,11 +317,12 @@ async def _safe_execute(
 # --------------------------------------------------------------------------- #
 
 @mcp.resource("vivado://sessions")
-def resource_sessions() -> str:
+async def resource_sessions() -> str:
     """所有 Vivado 会话的状态信息（JSON）。"""
     if _manager_ref is None:
         return json.dumps({"sessions": [], "message": "服务器未就绪"})
-    sessions = _manager_ref.list_sessions()
+    # list_sessions 已 async 化(probe 并发跑,不阻塞 event loop),resource 同步跟进
+    sessions = await _manager_ref.list_sessions()
     if not sessions:
         return json.dumps({"sessions": [], "message": "当前没有活跃会话"})
     return json.dumps({"sessions": sessions}, ensure_ascii=False)
@@ -276,7 +363,14 @@ def fpga_workflow() -> str:
         "7. **实现**: `run_implementation`\n"
         "8. **时序检查**: `get_timing_report` — 结构化中文报告，PASS/FAIL 判定\n"
         "9. **生成比特流**: `generate_bitstream` — 前置 CRITICAL WARNING 安全检查\n"
-        "10. **编程设备**: `program_device`\n\n"
+        "10. **编程设备**: `program_device`\n"
+        "11. **工程入库（git 版本控制）**: `run_tcl(\"write_project_tcl -force "
+        "-no_copy_sources -paths_relative_to <repo_root> C:/proj/rebuild.tcl\")`\n"
+        "    - .runs/.cache/.sim 全不入 git，重建用 `vivado -mode batch -source "
+        "rebuild.tcl`\n"
+        "    - 含 BD 的工程导出脚本会内联 BD 重建过程，但 wrapper 需重跑 "
+        "make_wrapper\n"
+        "    - IP 用户改动要确认 .xci 在 srcs 内、不在 .gen 内\n\n"
         "查询运行状态: `run_tcl(\"get_property STATUS [get_runs synth_1]\")`\n"
         "设计规则检查: `run_tcl(\"report_drc -return_string\")`\n"
         "遇到 CRITICAL WARNING: `get_critical_warnings` 提取分类 + 中文修复建议。"
@@ -285,16 +379,25 @@ def fpga_workflow() -> str:
 
 @mcp.prompt()
 def debug_timing() -> str:
-    """时序违例调试引导：定位和修复时序问题。"""
+    """时序违例调试引导：2019.1 验证过的系统化报告升级链。"""
     return (
-        "时序违例调试流程：\n\n"
-        "1. **查看时序报告**: `get_timing_report` 获取结构化时序摘要\n"
-        "2. **分析关键路径**: 关注 WNS (Worst Negative Slack)\n"
-        "   - WNS < 0 表示时序违例\n"
-        "   - 查看违例路径的起点和终点\n"
-        "3. **检查时钟约束**: `run_tcl('report_clocks')` 确认时钟定义正确\n"
-        "4. **查看利用率**: `report(type='utilization')` 检查是否资源过度使用\n"
-        "5. **检查拥塞**: `report(type='congestion')` 分析布线拥塞\n\n"
+        "时序违例调试流程（2019.1 验证过的升级链，由浅入深）：\n\n"
+        "1. **第一站**: `get_timing_report` — 结构化时序摘要，WNS < 0 即违例。\n"
+        "   违例时已自动附带 Top10 违例路径 + 5 模式分类 + 具体修复 Tcl 命令，\n"
+        "   无需再手动跑 report_timing\n"
+        "2. **时钟交互矩阵**: `run_tcl(\"report_clock_interaction -return_string\")`\n"
+        "   任何 CDC 嫌疑先看这张矩阵，重点关注 unsafe / partial 时钟对\n"
+        "3. **CDC 结构检查**: `run_tcl(\"report_cdc -details -return_string\")`\n"
+        "   定位缺同步器的跨时钟域路径（CDC-1 类结构问题）\n"
+        "4. **方法学检查**: `run_tcl(\"report_methodology -return_string\")`\n"
+        "   TIMING-6/7、XDC 约束类违例在这里暴露\n"
+        "5. **QoR 体检**: `run_tcl(\"report_qor_assessment -return_string\")`\n"
+        "   1-5 分整体评估（注意：report_qor_suggestions 需 2020.1+，2019.1 不可用）\n"
+        "6. **资源与高扇出**: `get_utilization_report` 检查是否资源过度使用；\n"
+        "   `run_tcl(\"report_high_fanout_nets -fanout_greater_than 200 "
+        "-return_string\")`\n"
+        "7. **复杂违例深挖**: `run_tcl(\"report_design_analysis -congestion "
+        "-return_string\")` 分析布线拥塞（关键路径物理特征用 -timing）\n\n"
         "常见修复方法：\n"
         "- 添加流水线寄存器拆分长路径\n"
         "- 调整时钟频率约束\n"
@@ -313,7 +416,7 @@ def debug_gt_mapping() -> str:
         "[Vivado 12-1411] 引脚冲突\n"
         "   - 此 warning 表示 XDC 的 PACKAGE_PIN 约束与 IP 内部 GT LOC 冲突\n"
         "   - 常见原因：XDC 引脚顺序与 IP 配置的 Lane 映射不一致\n\n"
-        "2. **验证 IO 布局**: `verify_io_placement` 对比 XDC 约束与实际分配\n"
+        "2. **验证 IO 布局**: `verify_io_placement_tool` 对比 XDC 约束与实际分配\n"
         "   - CRITICAL 级别不匹配 = GT 引脚错误（必须修复）\n"
         "   - WARNING 级别不匹配 = GPIO 引脚偏差（通常不影响链路）\n\n"
         "3. **查看 IO 报告**: `get_io_report` 获取所有端口的实际引脚分配\n"
@@ -392,10 +495,11 @@ def debug_pcie() -> str:
         "PCIe 系统化调试流程（从底层到上层）：\n\n"
         "## 第一层：物理引脚（最常见问题源）\n"
         "1. `get_critical_warnings` — 检查 GT 引脚冲突警告\n"
-        "2. `verify_io_placement` — 验证 XDC 约束与实际布局\n"
+        "2. `verify_io_placement_tool` — 验证 XDC 约束与实际布局\n"
         "3. `get_io_report` — 确认所有 GT 端口的 Bank 和 Site\n\n"
         "## 第二层：时钟与复位\n"
-        "4. `report(type='clock')` — 检查参考时钟 (REFCLK) 频率\n"
+        "4. `run_tcl(\"report_clock_interaction -return_string\")` — "
+        "检查参考时钟 (REFCLK) 与时钟交互\n"
         "5. 确认 PERST# 复位信号的 IOSTANDARD 和极性\n\n"
         "## 第三层：时序\n"
         "6. `get_timing_report` — 检查时序是否收敛\n"

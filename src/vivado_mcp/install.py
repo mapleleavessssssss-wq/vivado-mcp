@@ -2,8 +2,9 @@
 
 **幂等性**：反复运行 ``install`` 不会重复注入；``uninstall`` 找不到注入标记就是 no-op。
 **安全性**：第一次运行会备份原 ``Vivado_init.tcl`` 到 ``Vivado_init.tcl.vmcp_backup``。
-**守卫**：注入的代码使用端口占用判断（端口池 9999-10003），``launch_runs`` 子进程
-抢不到端口会静默退出（不影响综合）。详见 ``scripts/vivado_mcp_server.tcl``。
+**守卫**：注入的代码只绑定 install 指定的单一端口（默认 9999），被占即退出、
+不滑动到其他端口；``launch_runs`` 子进程抢不到端口会静默退出（不影响综合）。
+详见 ``scripts/vivado_mcp_server.tcl``。
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ def install(vivado_path: str | None = None, port: int = 9999) -> None:
 
     Args:
         vivado_path: 可选的 Vivado 可执行文件路径，留空自动检测。
-        port: 首选监听端口，默认 9999（端口池 9999-10003）。
+        port: 监听端口，默认 9999（server 只绑定该端口，被占即退出不滑动）。
 
     Raises:
         FileNotFoundError: 无法定位 Vivado 安装或 server 脚本。
@@ -88,7 +89,7 @@ def install(vivado_path: str | None = None, port: int = 9999) -> None:
 
     print(f"Vivado init.tcl: {init_tcl}")
     print(f"Server 脚本:     {server_script}")
-    print(f"监听端口首选:    {port}")
+    print(f"监听端口:        {port}")
 
     # 确保目标目录存在
     init_tcl.parent.mkdir(parents=True, exist_ok=True)

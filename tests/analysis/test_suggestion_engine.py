@@ -17,6 +17,8 @@ def _make_info(**kw) -> ProjectInfo:
         info.files.append(ProjectFile("source", "Verilog", "C:/test/top.v"))
     if kw.get("with_xdc"):
         info.files.append(ProjectFile("xdc", "XDC", "C:/test/basys3.xdc"))
+    if kw.get("with_sim"):
+        info.files.append(ProjectFile("sim", "Verilog", "C:/test/tb.v"))
     return info
 
 
@@ -61,6 +63,70 @@ def test_ready_to_synth():
     assert sug.stage == "ready_to_synth"
     assert any("run_synthesis" in a for a in sug.actions)
     assert any("xdc_lint" in a for a in sug.actions)
+
+
+# ---------------------------------------------------------------------- #
+#  规则 4.5: 仿真档(场景吸收)
+# ---------------------------------------------------------------------- #
+
+
+def test_ready_to_sim_when_tb_present_and_no_products(tmp_path):
+    """有 testbench(sim fileset 非空)且无仿真产物 → 建议先行为仿真。"""
+    info = _make_info(
+        with_source=True, with_xdc=True, top="top", with_sim=True,
+        project_dir=str(tmp_path),  # 空目录,确定无 .sim 产物
+    )
+    sug = suggest_next(info)
+    assert sug.stage == "ready_to_sim"
+    assert any("launch_simulation" in a for a in sug.actions)
+    assert any("sim_1" in a for a in sug.actions)
+    # 引导仿真通过后再综合
+    assert any("run_synthesis" in a for a in sug.actions)
+
+
+def test_sim_rung_skipped_when_products_exist(tmp_path):
+    """已有 <proj>.sim/*/behav 产物 → 不再纠缠仿真,正常进综合档。"""
+    sim_behav = tmp_path / "test_proj.sim" / "sim_1" / "behav"
+    sim_behav.mkdir(parents=True)
+
+    info = _make_info(
+        with_source=True, with_xdc=True, top="top", with_sim=True,
+        project_dir=str(tmp_path),
+    )
+    sug = suggest_next(info)
+    assert sug.stage == "ready_to_synth"
+
+
+def test_sim_rung_not_fired_after_synth_complete():
+    """综合已完成时不再回头建议仿真(命中后续档位)。"""
+    info = _make_info(
+        with_source=True, with_xdc=True, top="top", with_sim=True,
+        synth_status="synth_design Complete!",
+    )
+    sug = suggest_next(info)
+    assert sug.stage == "ready_to_impl"
+
+
+def test_no_testbench_note_in_synth_suggestion():
+    """sim fileset 为空 → 综合建议里附"未发现 testbench"提醒。"""
+    info = _make_info(with_source=True, with_xdc=True, top="top")
+    sug = suggest_next(info)
+    assert sug.stage == "ready_to_synth"
+    assert any("未发现 testbench" in a for a in sug.actions)
+
+
+def test_no_testbench_note_absent_when_tb_exists(tmp_path):
+    """有 testbench(且已有产物,落进综合档)时不再附"未发现 testbench"。"""
+    sim_behav = tmp_path / "test_proj.sim" / "sim_1" / "behav"
+    sim_behav.mkdir(parents=True)
+
+    info = _make_info(
+        with_source=True, with_xdc=True, top="top", with_sim=True,
+        project_dir=str(tmp_path),
+    )
+    sug = suggest_next(info)
+    assert sug.stage == "ready_to_synth"
+    assert not any("未发现 testbench" in a for a in sug.actions)
 
 
 def test_ready_to_synth_with_not_started():

@@ -203,7 +203,7 @@ class TestEdgeCases:
     """空输入与异常输入容错测试。"""
 
     def test_empty_input(self):
-        """空字符串不抛异常，返回全零默认报告。"""
+        """空字符串不抛异常,返回 parse_status='unrecognized' 的占位报告(不伪装 PASS)。"""
         r = parse_timing_summary("")
         assert r.summary.wns == 0.0
         assert r.summary.tns == 0.0
@@ -211,13 +211,15 @@ class TestEdgeCases:
         assert r.summary.ths == 0.0
         assert r.summary.failing_endpoints == 0
         assert r.summary.total_endpoints == 0
-        assert r.summary.timing_met is True
+        assert r.summary.parse_status == "unrecognized"
+        assert r.summary.timing_met is False
         assert r.paths == []
 
     def test_garbage_input(self):
-        """无法识别的随机文本不抛异常。"""
+        """无法识别的随机文本不抛异常,且标记格式不识别。"""
         r = parse_timing_summary("这不是一个 Vivado 报告\n随机文字 123")
         assert r.summary.wns == 0.0
+        assert r.summary.parse_status == "unrecognized"
         assert r.paths == []
 
     def test_summary_only_no_paths(self):
@@ -230,7 +232,70 @@ class TestEdgeCases:
         r = parse_timing_summary(text)
         assert r.summary.wns == pytest.approx(1.0)
         assert r.summary.total_endpoints == 50
+        assert r.summary.parse_status == "ok"
         assert r.paths == []
+
+
+# 无时序约束设计的真实输出:表头正常,数据行全是 NA
+_NA_SUMMARY = """\
+------------------------------------------------------------------------------------
+| Design Timing Summary
+| ---------------------
+------------------------------------------------------------------------------------
+
+    WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints
+    -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------
+         NA           NA                     NA                   NA           NA           NA                     NA                   NA
+"""  # noqa: E501
+
+
+class TestNaAndDegradedSummary:
+    """NA 摘要(无约束设计)与表头缺失的降级行为。"""
+
+    def test_na_does_not_raise(self):
+        """'NA' 不能 float() 崩溃(违反不抛异常契约),按无数据处理。"""
+        r = parse_timing_summary(_NA_SUMMARY)
+        assert r.summary.parse_status == "no_timing_data"
+        assert r.summary.timing_met is False
+        assert r.summary.wns == 0.0
+
+    def test_na_format_explains_no_constraints(self):
+        """NA 摘要的格式化输出解释真实原因,不显示 PASS/FAIL。"""
+        text = format_timing_report(parse_timing_summary(_NA_SUMMARY))
+        assert "无时序" in text
+        assert "create_clock" in text
+        assert "PASS" not in text
+        assert "FAIL" not in text
+
+    def test_header_missing_format_marked_degraded(self):
+        """表头缺失时输出 [DEGRADED],绝不默认 PASS。"""
+        text = format_timing_report(parse_timing_summary("不含表头的垃圾文本"))
+        assert "[DEGRADED]" in text
+        assert "PASS" not in text
+
+    def test_non_numeric_token_marked_unrecognized(self):
+        """数据行 token 不是数值(未知格式变体)→ unrecognized,不抛异常。"""
+        text = """\
+    WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints
+    -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------
+        abc          def                    ghi                  jkl          mno          pqr                    stu                  vwx
+"""  # noqa: E501
+        r = parse_timing_summary(text)
+        assert r.summary.parse_status == "unrecognized"
+        assert r.summary.timing_met is False
+
+    def test_normal_summary_parse_status_ok(self):
+        """正常数值摘要 parse_status='ok'(positive 对照)。"""
+        text = """\
+    WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints
+    -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------
+      0.234        0.000                      0                  150        0.045        0.000                      0                  150
+"""  # noqa: E501
+        r = parse_timing_summary(text)
+        assert r.summary.parse_status == "ok"
+        assert r.summary.timing_met is True
+        text_out = format_timing_report(r)
+        assert "PASS" in text_out
 
 
 # ====================================================================== #

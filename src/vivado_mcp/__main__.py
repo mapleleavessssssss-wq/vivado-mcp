@@ -44,7 +44,7 @@ def main() -> None:
         "--port",
         type=int,
         default=9999,
-        help="监听端口首选值（默认 9999，端口池 9999-10003）。",
+        help="监听端口（默认 9999；server 只绑定该端口，被占即退出不滑动）。",
     )
 
     # uninstall

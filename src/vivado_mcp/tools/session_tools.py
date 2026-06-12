@@ -77,7 +77,11 @@ def _check_win_curdir_policy() -> str:
             # 值不存在 → 由 fallthrough 逻辑根据 Win 版本判默认
             pass
         except OSError as e:
-            logger.debug("读注册表失败 %s\\%s: %s", label, subkey, e)
+            # 读失败 = 检测能力降级(可能漏警告),warning 留痕带具体原因
+            logger.warning(
+                "读注册表 %s\\%s 失败,NoDefaultCurrentDirectoryInExePath "
+                "检测降级: %s", label, subkey, e,
+            )
 
     if explicit_enabled_at:
         source = f"({' + '.join(explicit_enabled_at)} = 1)"
@@ -224,14 +228,23 @@ async def stop_session(
         session_id: 要关闭的会话标识符。
     """
     manager = _get_manager(ctx)
-    return await manager.stop_session(session_id)
+    try:
+        return await manager.stop_session(session_id)
+    except Exception as e:
+        # 与 close_all 的兜底一致:stop 异常不能裸出 MCP 工具层。
+        # manager 是 stop 成功后才 pop,失败时会话仍在 _sessions,可重试
+        logger.error("关闭会话 '%s' 失败: %s", session_id, e)
+        return (
+            f"[ERROR] 关闭会话 '{session_id}' 失败: {type(e).__name__}: {e}。"
+            "会话仍保留,可重试 stop_session。"
+        )
 
 
 @mcp.tool()
 async def list_sessions(ctx: Context = None) -> str:
     """列出所有活跃的 Vivado 会话及其状态。"""
     manager = _get_manager(ctx)
-    sessions = manager.list_sessions()
+    sessions = await manager.list_sessions()
 
     if not sessions:
         return "当前没有活跃的 Vivado 会话。使用 start_session 启动一个新会话。"

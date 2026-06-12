@@ -260,3 +260,30 @@ class TestInspectIpParams:
 
         assert "[ERROR]" in result
         assert "查询 IP 参数失败" in result
+
+    @pytest.mark.asyncio
+    async def test_tcl_error_not_fed_to_parser(self):
+        """Tcl 报错(如无项目打开)→ 透传原始错误,不产出"0 参数"假报告。"""
+        from vivado_mcp.tools.ip_tools import inspect_ip_params
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result(
+                "ERROR: [Common 17-53] User Exception: No open project. "
+                "Please open or create a project before executing this command.",
+                return_code=1,
+            )
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.ip_tools._require_session", return_value=session):
+            result = await inspect_ip_params(
+                ip_name="xdma_0", session_id="default", ctx=ctx
+            )
+
+        assert "[ERROR]" in result
+        # 真错误必须透传
+        assert "Common 17-53" in result
+        # 不能伪装成干净的"没有参数"报告
+        assert "没有 CONFIG" not in result
+        assert "总参数数: 0" not in result

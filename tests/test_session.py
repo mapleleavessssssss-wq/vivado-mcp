@@ -50,14 +50,15 @@ class TestSessionManager:
         """获取不存在的会话返回 None。"""
         assert session_manager.get("nonexistent") is None
 
-    def test_list_empty(self, session_manager: SessionManager):
+    async def test_list_empty(self, session_manager: SessionManager):
         """空管理器列表为空(关闭外部 probe,只看 MCP 自己管的)。
 
         0.3.19 起 ``list_sessions()`` 默认会 probe 9999..10003 发现用户手动
         启动 + init.tcl 注入的外部 GUI,本机若真有 Vivado 跑会让本断言失败。
         显式 ``probe_external=False`` 关掉网络探测,只验证字典层逻辑。
+        (0.3.22 起 list_sessions 为 async:probe 并发化,不阻塞 event loop)
         """
-        assert session_manager.list_sessions(probe_external=False) == []
+        assert await session_manager.list_sessions(probe_external=False) == []
 
     def test_default_vivado_path(self, session_manager: SessionManager):
         """默认路径正确存储。"""
@@ -494,3 +495,341 @@ class TestAsciiPathScopeAnnotation:
         assert "report_" in warn or "report_*" in warn or "report" in warn
         # 必须有"可忽略"的明确语义
         assert "可忽略" in warn or "不踩" in warn or "不受影响" in warn
+
+
+class TestStartSessionFailureCleanup:
+    """start_session 失败兜底:session 不进 _sessions,必须调 stop() 清理孤儿。"""
+
+    async def test_start_failure_calls_stop_cleanup(
+        self, session_manager: SessionManager, monkeypatch
+    ):
+        from vivado_mcp.vivado import session_manager as sm_mod
+
+        calls = {"stop": 0}
+
+        class _FailSession:
+            mode = "gui"
+            connected_port = None
+            pid = None
+
+            def __init__(self, *, vivado_path, session_id, port, attach_only):
+                pass
+
+            async def start(self, timeout):
+                raise RuntimeError("连接超时(模拟)")
+
+            async def stop(self):
+                calls["stop"] += 1
+
+            @property
+            def is_alive(self):
+                return False
+
+        monkeypatch.setattr(sm_mod, "GuiSession", _FailSession)
+
+        with pytest.raises(RuntimeError, match="连接超时"):
+            await session_manager.start_session(session_id="failing", mode="gui")
+
+        assert calls["stop"] == 1, "start 失败必须调 stop() 兜底清理"
+        assert "failing" not in session_manager._sessions
+        assert "failing" not in session_manager._port_map
+
+    async def test_cleanup_failure_does_not_mask_original_error(
+        self, session_manager: SessionManager, monkeypatch
+    ):
+        """反例:兜底 stop() 自己也炸时,上传的仍是原始 start 异常。"""
+        from vivado_mcp.vivado import session_manager as sm_mod
+
+        class _DoubleFailSession:
+            mode = "gui"
+
+            def __init__(self, *, vivado_path, session_id, port, attach_only):
+                pass
+
+            async def start(self, timeout):
+                raise RuntimeError("原始启动错误")
+
+            async def stop(self):
+                raise OSError("清理也炸了")
+
+            @property
+            def is_alive(self):
+                return False
+
+        monkeypatch.setattr(sm_mod, "GuiSession", _DoubleFailSession)
+
+        with pytest.raises(RuntimeError, match="原始启动错误"):
+            await session_manager.start_session(session_id="dbl", mode="gui")
+
+
+class TestStopSessionToolErrorWrap:
+    """stop_session 工具层兜底:session.stop() 异常不裸出 MCP 层。"""
+
+    @staticmethod
+    def _fake_ctx(manager: SessionManager):
+        from types import SimpleNamespace
+
+        from vivado_mcp.server import AppContext
+
+        return SimpleNamespace(
+            request_context=SimpleNamespace(
+                lifespan_context=AppContext(session_manager=manager)
+            )
+        )
+
+    async def test_stop_exception_returns_error_text(
+        self, session_manager: SessionManager, monkeypatch
+    ):
+        from vivado_mcp.tools.session_tools import stop_session
+
+        async def boom(session_id):
+            raise RuntimeError("taskkill 炸了(模拟)")
+
+        monkeypatch.setattr(session_manager, "stop_session", boom)
+
+        result = await stop_session(
+            session_id="default", ctx=self._fake_ctx(session_manager)
+        )
+        assert result.startswith("[ERROR]")
+        assert "taskkill 炸了(模拟)" in result, "必须带具体原因"
+        assert "RuntimeError" in result
+        # 审计 P3:manager 已是 stop 成功后才 pop,失败文案必须告知可重试
+        assert "会话仍保留" in result
+        assert "可重试 stop_session" in result
+
+    async def test_stop_normal_path_unchanged(
+        self, session_manager: SessionManager
+    ):
+        """正例:正常路径语义不变(不存在的会话返回原文案)。"""
+        from vivado_mcp.tools.session_tools import stop_session
+
+        result = await stop_session(
+            session_id="nope", ctx=self._fake_ctx(session_manager)
+        )
+        assert result == "会话 'nope' 不存在。"
+
+
+class TestStopSessionPopAfterStop:
+    """manager.stop_session:stop 成功后再 pop(审计 P3)。
+
+    pop-before-stop 的问题:stop 抛异常时会话已从 _sessions/_port_map 移除,
+    AI 重试 stop_session 拿到「会话不存在」,而 Vivado 进程可能仍在跑 ——
+    auto-alloc 端口的孤儿从此对 list_sessions 完全不可见。
+    """
+
+    @staticmethod
+    def _make_fake_session(stop_error: Exception | None = None):
+        class _Fake:
+            mode = "gui"
+
+            def __init__(self):
+                self.stop_calls = 0
+
+            @property
+            def is_alive(self):
+                return True
+
+            async def stop(self):
+                self.stop_calls += 1
+                if stop_error is not None:
+                    raise stop_error
+
+            def status_dict(self):
+                return {"session_id": "x", "mode": "gui", "state": "ready"}
+
+        return _Fake()
+
+    async def test_stop_failure_keeps_session_registered(
+        self, session_manager: SessionManager
+    ):
+        """stop 抛异常 → 会话保留在 _sessions/_port_map,异常原样上抛,可重试。"""
+        fake = self._make_fake_session(RuntimeError("taskkill 失败(模拟)"))
+        session_manager._sessions["s1"] = fake
+        session_manager._port_map["s1"] = (1234, 99)
+
+        with pytest.raises(RuntimeError, match="taskkill 失败"):
+            await session_manager.stop_session("s1")
+
+        assert "s1" in session_manager._sessions, "stop 失败必须保留会话以便重试"
+        assert "s1" in session_manager._port_map
+        assert fake.stop_calls == 1
+
+        # 重试不再是「会话不存在」:第二次 stop 仍能触达同一会话
+        with pytest.raises(RuntimeError, match="taskkill 失败"):
+            await session_manager.stop_session("s1")
+        assert fake.stop_calls == 2
+
+    async def test_stop_success_pops_session(
+        self, session_manager: SessionManager
+    ):
+        """正例:stop 成功 → _sessions/_port_map 都清掉。"""
+        fake = self._make_fake_session()
+        session_manager._sessions["s2"] = fake
+        session_manager._port_map["s2"] = (5678, 11)
+
+        result = await session_manager.stop_session("s2")
+        assert result == "会话 's2' 已关闭。"
+        assert "s2" not in session_manager._sessions
+        assert "s2" not in session_manager._port_map
+
+
+class TestWinCurdirPolicyOSErrorLogging:
+    """读注册表 OSError 必须 logger.warning 留痕(错误处理铁律,禁 debug)。"""
+
+    def test_registry_oserror_logged_as_warning(self, monkeypatch, caplog):
+        import logging
+        import sys
+
+        if sys.platform != "win32":
+            pytest.skip("Windows only")
+        import winreg
+
+        from vivado_mcp.tools import session_tools
+
+        def fake_open(root, subkey, *a, **kw):
+            raise OSError("拒绝访问(模拟)")
+
+        monkeypatch.setattr(winreg, "OpenKey", fake_open)
+        # 老 Win 默认 0:两处读失败 + 无显式值 → 返回空(语义不变)
+        monkeypatch.setattr(
+            session_tools, "_is_win11_24h2_or_newer", lambda: False
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="vivado_mcp.tools.session_tools"
+        ):
+            result = session_tools._check_win_curdir_policy()
+
+        assert result == "", "读失败时返回值语义不变(降级为按版本默认判)"
+        warning_records = [
+            r for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert warning_records, "OSError 必须以 WARNING 级别留痕"
+        assert "读注册表" in caplog.text
+        assert "拒绝访问(模拟)" in caplog.text, "必须带具体异常信息"
+
+    def test_filenotfound_path_no_warning(self, monkeypatch, caplog):
+        """反例:键不存在(FileNotFoundError)走正常 fallthrough,不发 warning。"""
+        import logging
+        import sys
+
+        if sys.platform != "win32":
+            pytest.skip("Windows only")
+        import winreg
+
+        from vivado_mcp.tools import session_tools
+
+        def fake_open(root, subkey, *a, **kw):
+            raise FileNotFoundError("no key")
+
+        monkeypatch.setattr(winreg, "OpenKey", fake_open)
+        monkeypatch.setattr(
+            session_tools, "_is_win11_24h2_or_newer", lambda: False
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="vivado_mcp.tools.session_tools"
+        ):
+            assert session_tools._check_win_curdir_policy() == ""
+
+        assert "读注册表" not in caplog.text
+
+
+class TestTclServerScript:
+    """scripts/vivado_mcp_server.tcl 回归锁:控制字符转义 + 只绑回环。"""
+
+    @pytest.fixture
+    def tcl_path(self):
+        from pathlib import Path
+
+        return (
+            Path(__file__).resolve().parent.parent
+            / "scripts"
+            / "vivado_mcp_server.tcl"
+        )
+
+    @pytest.fixture
+    def tcl_source(self, tcl_path) -> str:
+        return tcl_path.read_text(encoding="utf-8")
+
+    def test_server_binds_loopback_only(self, tcl_source):
+        """socket -server 行必须带 -myaddr 127.0.0.1(防局域网任意 Tcl 执行)。"""
+        import re
+
+        assert re.search(
+            r"socket -server \S+ -myaddr 127\.0\.0\.1", tcl_source
+        ), "TCP server 必须只绑回环(-myaddr 127.0.0.1)"
+
+    def test_json_escape_map_covers_control_chars(self, tcl_source):
+        """转义映射必须含 0x00-0x1F 控制字符循环(\\u00XX)。"""
+        assert "JSON_ESC_MAP" in tcl_source
+        assert "$__i < 32" in tcl_source, "必须循环覆盖 0x00-0x1F"
+        assert "%04x" in tcl_source, "控制字符必须转成 \\u00XX 形式"
+
+    def test_start_has_rebind_guard(self, tcl_source):
+        """::vmcp::start 重入守卫:server_sock 非空时先关旧 server 再绑新端口。
+
+        消除「init.tcl 先绑 9999 + spawn -source 再绑 X → 一进程双端口」
+        (0.3.22 审计 docs P1 根因):双端口会让默认 9999 的 probe/attach
+        串到本应独立的实例上,且手动 GUI 接力因 9999 被占而失效。
+        """
+        import re
+
+        assert re.search(r'if \{\$server_sock ne ""\}', tcl_source), (
+            "::vmcp::start 必须有 server_sock 非空的重入守卫"
+        )
+        assert re.search(r"catch \{close \$server_sock\}", tcl_source), (
+            "重入守卫必须先 close 旧 server socket"
+        )
+        assert "rebind" in tcl_source, "重入时必须 log 一行 rebind(关旧绑新)"
+        # 守卫必须出现在 socket -server 绑定之前(先关旧再绑新的顺序)
+        guard_pos = tcl_source.index('if {$server_sock ne ""}')
+        bind_pos = tcl_source.index("socket -server")
+        assert guard_pos < bind_pos, "守卫必须在绑新端口之前执行"
+
+    def test_json_escape_roundtrip_via_tclsh(self, tcl_path, tmp_path):
+        """功能验证:真 tclsh 跑 json_escape,Python json.loads 必须能解析。
+
+        覆盖全部 0x00-0x1F(含 ESC 0x1B)+ 反斜杠 + 引号。
+        本机 / CI 无 tclsh 时跳过(已有静态断言兜底)。
+        """
+        import json as json_mod
+        import shutil
+        import subprocess
+
+        tclsh = shutil.which("tclsh")
+        if tclsh is None:
+            pytest.skip("tclsh 不在 PATH,跳过 Tcl 功能验证")
+
+        out_path = tmp_path / "out.json"
+        driver = tmp_path / "driver.tcl"
+        driver_src = (
+            "namespace eval ::vmcp {}\n"
+            'set f [open "' + tcl_path.as_posix() + '" r]\n'
+            "set src [read $f]\n"
+            "close $f\n"
+            "# 屏蔽末尾的 ::vmcp::start 调用,不真起 socket server\n"
+            'set patched [string map [list "::vmcp::start\\n"'
+            ' "#::vmcp::start\\n"] $src]\n'
+            "eval $patched\n"
+            'set s "a"\n'
+            "for {set i 0} {$i < 32} {incr i} { append s [format %c $i] }\n"
+            'append s [format "%c %c end" 92 34]\n'
+            "set escaped [::vmcp::json_escape $s]\n"
+            'set out [open "' + out_path.as_posix() + '" w]\n'
+            "fconfigure $out -translation binary\n"
+            "puts -nonewline $out [encoding convertto utf-8 "
+            '"\\{\\"rc\\":0,\\"output\\":\\"$escaped\\"\\}"]\n'
+            "close $out\n"
+        )
+        driver.write_text(driver_src, encoding="utf-8")
+        proc = subprocess.run(
+            [tclsh, str(driver)], capture_output=True, timeout=30
+        )
+        assert proc.returncode == 0, f"tclsh 执行失败: {proc.stderr!r}"
+
+        obj = json_mod.loads(out_path.read_bytes().decode("utf-8"))
+        expect = (
+            "a" + "".join(chr(i) for i in range(32)) + "\\ \" end"
+        )
+        assert obj["output"] == expect, "控制字符必须无损往返"

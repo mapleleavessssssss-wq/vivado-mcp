@@ -85,7 +85,7 @@ class TestSetWaveZoom:
 
     @pytest.mark.asyncio
     async def test_unsaved_wcfg_returns_error(self):
-        """current_wave_config FILE_NAME 空 → 报错要求先 save_wave_config。"""
+        """current_wave_config FILE_PATH 空 → 报错要求先 save_wave_config。"""
         from vivado_mcp.tools import wave_tools
 
         session = AsyncMock()
@@ -98,8 +98,82 @@ class TestSetWaveZoom:
 
         assert "[ERROR]" in result
         assert "save_wave_config" in result
+        # 错误文案必须用真实存在的属性名 FILE_PATH(FILE_NAME 不存在,
+        # get_property FILE_NAME 报 [Common 17-54],别把坑教回去)
+        assert "FILE_PATH" in result
+        assert "FILE_NAME" not in result
         # 未保存时不应去改 XML
         mock_set.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_path_with_spaces_quoted_for_reload(self):
+        """含空格路径必须经 to_tcl_path 引号包裹进 RELOAD_WCFG(裸拼会被 Tcl 分词)。"""
+        from vivado_mcp.tools import wave_tools
+
+        spaced = "C:/Users/John Doe/proj/wave.wcfg"
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(f"VMCP_WCFG:path={spaced}"),  # RESOLVE
+                _make_tcl_result("VMCP_RELOAD_OK:done"),       # RELOAD
+            ]
+        )
+        ctx = _mock_context()
+
+        with patch.object(wave_tools, "_require_session", return_value=session), \
+             patch.object(wave_tools.wcfg_editor, "set_zoom_range"):
+            result = await wave_tools.set_wave_zoom(start_ns=1, end_ns=2, ctx=ctx)
+
+        assert "[OK]" in result
+        sent_tcl = session.execute.await_args_list[1].args[0]
+        # 路径必须带双引号出现在 open_wave_config 后
+        assert f'open_wave_config "{spaced}"' in sent_tcl
+        # 不允许裸拼(无引号)形态
+        assert f"open_wave_config {spaced}}}" not in sent_tcl
+
+    @pytest.mark.asyncio
+    async def test_explicit_backslash_path_with_spaces_quoted(self):
+        """显式传反斜杠+空格路径 → 转正斜杠且引号包裹。"""
+        from vivado_mcp.tools import wave_tools
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result("VMCP_RELOAD_OK:done")
+        )
+        ctx = _mock_context()
+
+        with patch.object(wave_tools, "_require_session", return_value=session), \
+             patch.object(wave_tools.wcfg_editor, "set_zoom_range"):
+            result = await wave_tools.set_wave_zoom(
+                start_ns=1, end_ns=2, wcfg="C:\\My Proj\\w.wcfg", ctx=ctx
+            )
+
+        assert "[OK]" in result
+        sent_tcl = session.execute.await_args.args[0]
+        assert 'open_wave_config "C:/My Proj/w.wcfg"' in sent_tcl
+
+    @pytest.mark.asyncio
+    async def test_permission_error_on_write_returns_reason(self):
+        """写回阶段 PermissionError(只读/占用)→ [ERROR]+具体原因,不裸抛。"""
+        from vivado_mcp.tools import wave_tools
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result("VMCP_WCFG:path=C:/p/w.wcfg")
+        )
+        ctx = _mock_context()
+
+        with patch.object(wave_tools, "_require_session", return_value=session), \
+             patch.object(
+                 wave_tools.wcfg_editor,
+                 "set_zoom_range",
+                 side_effect=PermissionError("[Errno 13] 拒绝访问: w.wcfg"),
+             ):
+            result = await wave_tools.set_wave_zoom(start_ns=1, end_ns=2, ctx=ctx)
+
+        assert "[ERROR]" in result
+        assert "PermissionError" in result
+        assert "拒绝访问" in result
 
     @pytest.mark.asyncio
     async def test_no_wave_config_returns_error(self):
@@ -412,6 +486,30 @@ class TestSetWaveAnalog:
 
         assert "[ERROR]" in result
         assert "失败" in result
+
+    @pytest.mark.asyncio
+    async def test_tcl_error_passes_through_raw_error(self):
+        """脚本级 Tcl 报错(如无 live simulation)→ 透传真错,不误报"Tcl 未回报"。"""
+        from vivado_mcp.tools import wave_tools
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result(
+                "ERROR: [Common 17-53] No simulation is currently running.",
+                return_code=1,
+            )
+        )
+        ctx = _mock_context()
+
+        with patch.object(wave_tools, "_require_session", return_value=session):
+            result = await wave_tools.set_wave_analog(
+                signals=["/tb/adc"], min=-1, max=1, ctx=ctx
+            )
+
+        assert "[ERROR]" in result
+        assert "Common 17-53" in result
+        # 不能把所有信号误报成"Tcl 未回报"
+        assert "Tcl 未回报" not in result
 
 
 # ====================================================================== #

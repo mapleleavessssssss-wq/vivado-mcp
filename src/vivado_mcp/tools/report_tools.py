@@ -127,7 +127,8 @@ async def get_timing_report(
 
         # 时序违例 → 二次查询违例路径详情 + 模式嗅探 + 修复建议
         # 健康工程跳过不跑,省 10-30s。异常降级:不阻断主报告。
-        if not timing_report.summary.timing_met:
+        # parse_status 非 ok(NA/格式不识别)时摘要不可信,跳过这次昂贵查询
+        if timing_report.summary.parse_status == "ok" and not timing_report.summary.timing_met:
             try:
                 paths_result = await session.execute(
                     REPORT_VIOLATING_PATHS, timeout=60.0
@@ -200,24 +201,42 @@ async def check_bitstream_readiness(
     timing_met = None
     timing_line = ""
     timing_err: str = ""
+    # True = 时序子查询失败(rc 错误/格式不识别/查询异常),判定本身不可信;
+    # 与 NA(数据本来就不存在,WARN 语义成立)分流,前者 verdict 附 [DEGRADED]
+    timing_degraded = False
     try:
         timing_raw = await session.execute(
             "report_timing_summary -return_string", timeout=60.0
         )
         if not timing_raw.is_error:
             tr = parse_timing_summary(timing_raw.output)
-            timing_met = tr.summary.timing_met
-            timing_line = (
-                f"  WNS = {tr.summary.wns:+.3f} ns  WHS = {tr.summary.whs:+.3f} ns  "
-                f"失败端点 = {tr.summary.failing_endpoints}/{tr.summary.total_endpoints}"
-            )
+            if tr.summary.parse_status == "ok":
+                timing_met = tr.summary.timing_met
+                timing_line = (
+                    f"  WNS = {tr.summary.wns:+.3f} ns  WHS = {tr.summary.whs:+.3f} ns  "
+                    f"失败端点 = {tr.summary.failing_endpoints}/{tr.summary.total_endpoints}"
+                )
+            else:
+                # NA / 格式不识别:timing_met 保持 None 走"未能读取"提示,
+                # 绝不能把全零占位摘要当 PASS/FAIL 参与判定
+                if tr.summary.parse_status == "no_timing_data":
+                    timing_err = "时序摘要为 NA(设计无时序约束或无可分析端点)"
+                else:
+                    timing_err = "时序报告格式不识别,未能解析 Design Timing Summary"
+                    timing_degraded = True
+                logger.warning(
+                    "check_bitstream_readiness 时序摘要降级(parse_status=%s): %s",
+                    tr.summary.parse_status, timing_err,
+                )
         else:
             timing_err = (
                 f"report_timing_summary rc={timing_raw.return_code}: "
                 f"{timing_raw.output[:200]}"
             )
+            timing_degraded = True
     except Exception as e:
         timing_err = f"{type(e).__name__}: {e}"
+        timing_degraded = True
         logger.warning("check_bitstream_readiness 时序查询失败: %s", timing_err)
 
     # 3. 判定总体结论
@@ -253,6 +272,11 @@ async def check_bitstream_readiness(
     else:
         verdict = "READY (可以安全生成比特流)"
 
+    # 时序子查询失败 ≠ 数据不存在:判定不可信,verdict 行附 [DEGRADED] 标记
+    # (BLOCK 由实现状态等可信信号触发,结论已足够强,不叠加标记)
+    if timing_degraded and not blockers:
+        verdict += " [DEGRADED]"
+
     out: list[str] = [f"=== 烧板前检查: {verdict} ==="]
     out.append(f"实现状态: {status or 'UNKNOWN'}")
     out.append(f"CRITICAL WARNING: {cw_count if cw_count >= 0 else '无法读取'}")
@@ -286,6 +310,7 @@ async def check_bitstream_readiness(
 
 @mcp.tool()
 async def get_utilization_report(
+    detail: bool = False,
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
@@ -297,8 +322,11 @@ async def get_utilization_report(
     典型用途:
     - 综合后检查"LUT 够不够 / BRAM 够不够"
     - 时序收敛困难时先看资源是否超限(> 90% 会导致拥塞)
+    - detail=True 进一步看 BRAM 由 RAMB36 还是 RAMB18 组成(优化位宽/级联时用)
 
     Args:
+        detail: True 时末尾附加 Block RAM 明细段(RAMB36/FIFO* / RAMB36E1 only /
+            RAMB18 的 used/available)。默认 False,输出与原有格式一致。
         session_id: 目标会话 ID。
     """
     session = _require_session(ctx, session_id)
@@ -316,7 +344,7 @@ async def get_utilization_report(
                 "提示: report_utilization 需要打开综合或实现后的设计。"
             )
         report = parse_utilization(result.output)
-        return format_utilization_report(report)
+        return format_utilization_report(report, detail=detail)
     except Exception as e:
         return f"[ERROR] 获取资源占用失败: {e}"
 
@@ -415,6 +443,7 @@ async def get_next_suggestion(
     - 有项目没源文件 → 建议 add_files
     - 没顶层 → 建议 set_property TOP
     - 没 XDC → 建议添加约束
+    - 有 testbench 且没跑过行为仿真 → 先 launch_simulation
     - 可综合 → xdc_lint + run_synthesis
     - 综合完成 → run_implementation
     - 布线完成 → check_bitstream_readiness + generate_bitstream
@@ -534,6 +563,17 @@ async def get_pre_commit_summary(
         )
         if not tr.is_error:
             timing = parse_timing_summary(tr.output)
+            if timing.summary.parse_status != "ok":
+                # NA / 格式不识别:全零占位摘要不能进 commit 摘要(会撒谎),
+                # 计入采样失败 → verdict 降级 DEGRADED
+                reason = (
+                    "NA,设计无时序约束"
+                    if timing.summary.parse_status == "no_timing_data"
+                    else "格式不识别"
+                )
+                sample_failures.append(f"时序解析降级({reason})")
+                logger.warning("pre_commit 时序摘要解析降级: %s", reason)
+                timing = None
         else:
             sample_failures.append(f"时序 rc={tr.return_code}")
     except Exception as e:
@@ -548,6 +588,12 @@ async def get_pre_commit_summary(
         )
         if not ur.is_error:
             util = parse_utilization(ur.output)
+            if util.parse_error:
+                # 格式不识别:空 resources 不能静默跳过资源段(会假 READY),
+                # 比照时序分支计入采样失败 → verdict 降级 DEGRADED
+                sample_failures.append("资源解析降级(格式不识别)")
+                logger.warning("pre_commit 资源报告解析降级: %s", util.parse_error)
+                util = None
         else:
             sample_failures.append(f"资源 rc={ur.return_code}")
     except Exception as e:

@@ -48,6 +48,7 @@ from vivado_mcp.tcl_scripts import (
     EXTRACT_ERRORS,
     LAUNCH_SCRIPTS_AND_GLOB,
     LIST_PROJECT_XDC_FILES,
+    QUERY_TARGET_SIMULATOR,
     RUN_BAT_STEP,
     TAIL_RUNME_LOG,
     TAIL_SIM_LOGS,
@@ -137,6 +138,35 @@ async def _scan_runme_nonstandard(
 
     errs = scan_nonstandard_errors(body, start_line=start_line)
     return status, format_nonstandard_section(errs)
+
+
+async def _get_target_simulator(session) -> str | None:
+    """查当前项目 target_simulator;查询失败返回 None(按 XSim 继续,不阻断诊断)。"""
+    try:
+        r = await session.execute(QUERY_TARGET_SIMULATOR, timeout=10.0)
+    except Exception as e:
+        logger.warning("查询 target_simulator 失败,按 XSim 继续诊断: %s", e)
+        return None
+
+    for line in r.output.splitlines():
+        s = line.strip()
+        if s.startswith("VMCP_TARGET_SIM:"):
+            value = s[len("VMCP_TARGET_SIM:"):].strip()
+            if value.startswith("error="):
+                logger.warning(
+                    "查询 target_simulator 出错,按 XSim 继续诊断: %s",
+                    value[len("error="):],
+                )
+                return None
+            return value or None
+    # 第三条降级路径:输出里完全没有 VMCP_TARGET_SIM 标记(如传输层吃行)。
+    # 同样按 XSim 继续,但要留诊断痕迹(error-handling §1:降级前说明原因)。
+    logger.warning(
+        "target_simulator 查询输出未含 VMCP_TARGET_SIM 标记,按 XSim 继续诊断,"
+        "输出前 200 字: %r",
+        r.output[:200],
+    )
+    return None
 
 
 async def _run_sim_bat_fallback(session, run_name: str, tail_n: int) -> str:
@@ -269,10 +299,33 @@ async def _diagnose_sim_run(session, run_name: str, tail_n: int) -> str:
             "请确认 launch_simulation 已执行过,或检查 fileset 名(默认 sim_1)。"
         )
 
+    # guard target_simulator 提前到 logs 判空之前:本诊断(TAIL_SIM_LOGS / bat
+    # fallback)硬编码 XSim 日志布局(*/xsim/*.log)。第三方仿真器
+    # (ModelSim/Questa/VCS)场景下,拍空是预期;而 logs 非空时命中的只可能是
+    # 上一轮 XSim 的**陈旧日志**(本次真日志在 */<simulator>/ 下),把它当本次
+    # 失败的证据展示正是「误导性结论比没结论更糟」。
+    simulator = await _get_target_simulator(session)
+    non_xsim = bool(simulator) and simulator.lower() != "xsim"
+
     if not logs:
-        # 0.3.15: launch_simulation wrapper 在 spawn .bat **之前**炸时,xsim/*.log
-        # 完全没生成。复刻用户绕过路径:跑 -scripts_only,再 MCP 进程逐个 spawn
-        # compile/elaborate.bat 抓 stderr,把 Vivado 吞掉的真错暴露出来。
+        if non_xsim:
+            sim_lc = simulator.lower()
+            return (
+                f"仿真目录: {sim_dir}\n"
+                f"当前 target_simulator={simulator}(非 XSim),本诊断仅覆盖 XSim "
+                "日志布局(*/xsim/*.log),拍空是预期而非故障。\n"
+                f"请手查 {sim_dir}/*/{sim_lc}/ 下的日志;\n"
+                f"另:第三方仿真器需先 compile_simlib -simulator {sim_lc} "
+                "-directory <libs> 编译仿真库,"
+                f"并 set_property compxlib.{sim_lc}_compiled_library_dir <libs> "
+                "[current_project]。"
+            )
+
+        # launch_simulation wrapper 在 spawn .bat **之前**炸时,xsim/*.log
+        # 完全没生成。走 scripts-only fallback:跑 -scripts_only 生成 .bat,
+        # 再 **Vivado session 内 exec** 逐个跑 compile/elaborate.bat
+        # (见 _run_sim_bat_fallback;0.3.15 的 MCP 进程 spawn 方案因 PATH
+        # 假阳性已返工),把 Vivado 吞掉的真错暴露出来。
         fallback = await _run_sim_bat_fallback(session, run_name, tail_n)
         return (
             f"仿真目录: {sim_dir}\n"
@@ -284,6 +337,13 @@ async def _diagnose_sim_run(session, run_name: str, tail_n: int) -> str:
     lines: list[str] = []
     lines.append(f"=== 仿真诊断: {run_name} ===")
     lines.append(f"仿真目录: {sim_dir}")
+    if non_xsim:
+        # 第三方仿真器 + logs 非空 = 命中的是上一轮 XSim 的陈旧日志,头部明示
+        sim_lc = simulator.lower()
+        lines.append(
+            f"⚠ 以下为 */xsim/ 下的陈旧 XSim 日志,当前 target_simulator="
+            f"{simulator},本次失败的真日志请查 {sim_dir}/*/{sim_lc}/。"
+        )
     lines.append(f"扫描到 {len(logs)} 个日志文件")
     lines.append("")
 
@@ -353,14 +413,19 @@ async def get_critical_warnings(
         run_name: run / fileset 名称(如 ``synth_1`` / ``impl_1`` / ``sim_1``),
             默认 ``impl_1``。``sim_*`` 走 simulation 日志诊断路径。
         compare_with_last: True 时追加一段与上次快照的差分报告(仅对综合/实现有效)。
-        tail_n: 非标错误扫描时每个日志 tail 的末尾行数,默认 50。仿真模式适用于
-            每个 xsim 子日志。
+        tail_n: 非标错误扫描时每个日志 tail 的末尾行数,默认 50,范围 1~500。
+            仿真模式适用于每个 xsim 子日志。
         session_id: 目标会话 ID。
     """
     try:
         run_name = validate_identifier(run_name, "run_name")
     except ValueError as e:
         return f"[ERROR] {e}"
+
+    # 范围校验(对齐 get_run_progress 的 tail_lines):0 在 sim fallback 里
+    # 切片语义会反转成"全量回灌",负值让 Tcl lrange 静默拍空,直接拒
+    if tail_n < 1 or tail_n > 500:
+        return f"[ERROR] tail_n 必须在 1~500 之间(收到 {tail_n})。"
 
     session = _require_session(ctx, session_id)
     if not session:
@@ -376,9 +441,19 @@ async def get_critical_warnings(
         count_result = await session.execute(
             COUNT_WARNINGS.format(run_name=run_name), timeout=30.0
         )
-        errors, cw_count, w_count = parse_diag_counts(count_result.output)
     except Exception as e:
         return f"[ERROR] 读取警告计数失败: {e}"
+
+    # Tcl 报错(run 不存在/无项目打开)时透传原始错误,不要落进 -1 分支
+    # 误报"未找到 runme.log"——那会把 AI 引向"去跑 run"而不是"先开项目"
+    if count_result.is_error:
+        return (
+            f"[ERROR] 读取警告计数失败(rc={count_result.return_code}):\n"
+            f"{count_result.output[:200]}\n"
+            "提示: 请确认项目已打开且 run 名正确(run_tcl 'get_runs' 可列出)。"
+        )
+
+    errors, cw_count, w_count = parse_diag_counts(count_result.output)
 
     if cw_count == -1:
         return "[ERROR] 未找到 runme.log，请确认 run 已执行过。"
@@ -600,6 +675,8 @@ async def xdc_auto_fix(
     """自动修复 XDC 文件中能安全自修的问题(MISSING_IOSTANDARD / CLOCK_NO_PERIOD)。
 
     默认 dry_run=True 只预览补丁,确认无误后调用 dry_run=False 实际写回。
+    写回前会为每个被修改文件生成同名 .bak 备份;注意 **.bak 只保留最近一次
+    修改前的版本**(再次写回会覆盖上一次的 .bak,与 ``sed -i.bak`` 同语义)。
 
     **只修**这两类问题(其他需要人工判断):
     - MISSING_IOSTANDARD —— 在 PACKAGE_PIN 行之后插入 IOSTANDARD 语句
@@ -666,6 +743,7 @@ async def verilog_compile_check(
 
     Args:
         files: Verilog / SystemVerilog 文件路径列表(.v / .sv)。
+            .vhd/.vhdl 不支持,返回 SKIP 并附替代方案指引(check_syntax)。
         tool: "auto"(默认,优先 iverilog) / "iverilog" / "verilator"。
         timeout: 子进程超时秒数,默认 30。
     """

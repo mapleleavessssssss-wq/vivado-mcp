@@ -26,8 +26,12 @@ namespace eval ::vmcp {
 
 ## JSON 字符串转义：只处理 {"rc", "output"} 两字段够用
 ## Tcl 8.5 没有内置 JSON，手写简单编码
-proc ::vmcp::json_escape {s} {
-    set result [string map [list \
+## JSON 标准要求 U+0000..U+001F 控制字符**全部**转义：Vivado 输出可能混入
+## ESC(0x1B 等 ANSI 序列)/VT 等裸控制字符，漏转会让 Python 端 json.loads
+## 直接抛 "Invalid control character" 丢掉整条命令结果。
+## 映射表在脚本加载时生成一次（string map 单遍替换，不会二次转义）。
+namespace eval ::vmcp {
+    variable JSON_ESC_MAP [list \
         "\\" "\\\\" \
         "\"" "\\\"" \
         "\n" "\\n" \
@@ -35,8 +39,20 @@ proc ::vmcp::json_escape {s} {
         "\t" "\\t" \
         "\b" "\\b" \
         "\f" "\\f" \
-    ] $s]
-    return $result
+    ]
+    # 其余 0x00-0x1F 一律 \u00XX；0x08-0x0A / 0x0C-0x0D 已有可读映射，跳过
+    for {set __i 0} {$__i < 32} {incr __i} {
+        if {$__i == 8 || $__i == 9 || $__i == 10 || $__i == 12 || $__i == 13} {
+            continue
+        }
+        lappend JSON_ESC_MAP [format %c $__i] [format "\\u%04x" $__i]
+    }
+    unset __i
+}
+
+proc ::vmcp::json_escape {s} {
+    variable JSON_ESC_MAP
+    return [string map $JSON_ESC_MAP $s]
 }
 
 ## 发送响应：[4 字节长度][JSON payload]
@@ -188,7 +204,23 @@ proc ::vmcp::start {} {
         set port $::VMCP_PORT_PREF
     }
 
-    if {[catch {socket -server ::vmcp::on_accept $port} sock] == 0} {
+    ## 重入守卫:已 install 的机器上 Vivado_init.tcl 先 source 本脚本绑 9999,
+    ## Python spawn 的 -source 临时脚本随后再次 source → start 二次执行。
+    ## 不关旧 socket 就会一个进程同时监听两个端口:默认 9999 的 probe/attach
+    ## 会串到这台本应独立的实例上(0.3.22 审计 docs P1 根因)。先关旧再绑新。
+    ## 运行期 puts 保持纯 ASCII:Vivado 2019.1 按系统编码 source 本脚本,
+    ## 中文输出在 cp936/cp1252 控制台会乱码(本文件注释不输出,不受影响)
+    if {$server_sock ne ""} {
+        puts "vivado-mcp: rebind: closing old port $active_port, rebinding to $port"
+        catch {close $server_sock}
+        set server_sock {}
+        set active_port 0
+    }
+
+    # -myaddr 127.0.0.1:只绑回环。Tcl socket -server 默认绑 0.0.0.0(全部接口),
+    # 该通道执行任意 Tcl 且无鉴权,绑全接口 = 把任意代码执行开放给局域网。
+    # Python 客户端全程只连 127.0.0.1,绑回环零功能损失。
+    if {[catch {socket -server ::vmcp::on_accept -myaddr 127.0.0.1 $port} sock] == 0} {
         set server_sock $sock
         set active_port $port
         puts "vivado-mcp server ready on port $port"

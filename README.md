@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/mapleleavessssssss-wq/vivado-mcp)](LICENSE)
 [![CI](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml)
 
-精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **25 个工具 + 5 个智能 Hook** 控制 Xilinx Vivado EDA——少即是多。
+精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **27 个精简工具** 控制 Xilinx Vivado EDA——少即是多。
 
 > **0.3 系列新增了什么**:
 > - **list_sessions 不再"无中生有"(0.3.21)** ⭐:0.3.19 加的"主动探测外部 Vivado"在装了 VMware / Hyper-V 虚拟网卡的机器上会**偶发误报**——端口 10000 上其实是虚拟网卡服务凑巧回了类 JSON 的数据,被错认成 Vivado。本版给握手加**随机 token**(`puts VMCP_PROBE_<uuid>`),服务端必须把 token 原样回弹才算真 Vivado——假阳性归零
@@ -26,7 +26,7 @@
 >
 > 详见 [CHANGELOG](CHANGELOG.md)。
 
-## 设计哲学 — 为什么是 25 个工具而不是 500 个？
+## 设计哲学 — 为什么是 27 个工具而不是 500 个？
 
 主流 Vivado MCP（如 SynthPilot）动辄 500+ 工具，每个工具本质是一行 Tcl 包装。问题是：
 
@@ -46,14 +46,14 @@
 ## 特性
 
 - **双模式会话**：默认 GUI 可视化（能看到 Vivado 图标 + Tcl Console 实时输出），也支持无头 CI 模式和 attach 已开 GUI
-- **25 个精简工具 + 5 个智能 Hook** — 覆盖完整 FPGA 开发流程 + 智能诊断 + 新手引导 + 外部工具链联动
-- **智能诊断** — 综合/实现后自动提取 CRITICAL WARNING / ERROR 分类 + 中文修复建议（含 19 种已知 ID）
+- **27 个精简工具 + 可选 Hook 配置示例** — 覆盖完整 FPGA 开发流程 + 智能诊断 + 新手引导 + 外部工具链联动
+- **智能诊断** — 综合/实现后自动提取 CRITICAL WARNING / ERROR 分类 + 中文修复建议（含 18+ 种已知 ID）
 - **IO 验证** — XDC 约束（**支持 -dict 和传统两种语法**）对比实际引脚分配，GT 端口不匹配标记为 CRITICAL
 - **IP 调试** — 查询 IP 所有 CONFIG.* 参数（含 GUI 隐藏参数）、纯 Python 对比两个 XCI 文件
 - **Bitstream 安全检查** — 生成比特流前自动检测 CRITICAL WARNING 并阻止（可 force 跳过）
 - **结构化报告** — IO 和时序报告解析为 JSON，便于 AI 精确提取数值（**不再有"假 PASS"陷阱**）
 - **安全转义** — `safe_tcl` 自动对路径/标识符做 Tcl list 转义，Windows 含空格/中文/$ 的路径也能用
-- **多会话支持** — 同时管理多个独立 Vivado 实例（端口池 9999-10003）
+- **多会话支持** — 默认复用端口 9999 的单个 GUI（不同 session_id 也 attach 同一台）；传 `port=0` 自动分配空闲端口启动独立实例；server 只绑单一端口，被占即退出不滑动
 - **跨平台** — 支持 Windows 和 Linux
 - **零额外依赖** — 仅依赖 `mcp` SDK
 
@@ -71,7 +71,7 @@ pip install vivado-mcp
 vivado-mcp install
 ```
 
-这会修改你 Vivado 的 `Vivado_init.tcl`，让以后启动 GUI 时自动开启 TCP server（端口 9999-10003）。**原文件会备份**，`vivado-mcp uninstall` 可恢复。
+这会修改你 Vivado 的 `Vivado_init.tcl`，让以后启动 GUI 时自动开启 TCP server（绑定 install 指定的单一端口，默认 9999；被占即退出，不会滑动到其他端口）。**原文件会备份**，`vivado-mcp uninstall` 可恢复。
 
 如果 Vivado 装在受保护目录（如 `C:\Program Files\`），用管理员身份运行命令即可。
 
@@ -97,7 +97,7 @@ vivado-mcp install
 
 ### 4. 重启 Claude Code
 
-配置完成后重启 Claude Code，即可使用 25 个 Vivado 工具。
+配置完成后重启 Claude Code，即可使用 27 个 Vivado 工具。
 
 <details>
 <summary>从源码安装（开发/贡献）</summary>
@@ -166,11 +166,11 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI,跑得更快
 ### 诊断(独家差异化)
 | 工具 | 说明 |
 |------|------|
-| `get_critical_warnings` | 提取并按 ID 分类 CRITICAL WARNING + ERROR,含 19 种已知 ID 的中文修复建议。**0.3.9** 加 `compare_with_last=True` 差分。**0.3.14** errors=0+cw=0 但 STATUS=ERROR 时 tail runme.log 扫非标关键词(TclStackFree/segfault/中文路径 cmd 报错)。**0.3.15/16** `run_name='sim_*'` 时:先 glob xsim/*.log;全空就自动 `launch_simulation -scripts_only` + Vivado session 内 `exec` 跑 compile/elaborate.bat 抓真错 |
+| `get_critical_warnings` | 提取并按 ID 分类 CRITICAL WARNING + ERROR,含 18+ 种已知 ID 的中文修复建议。**0.3.9** 加 `compare_with_last=True` 差分。**0.3.14** errors=0+cw=0 但 STATUS=ERROR 时 tail runme.log 扫非标关键词(TclStackFree/segfault/中文路径 cmd 报错)。**0.3.15/16** `run_name='sim_*'` 时:先 glob xsim/*.log;全空就自动 `launch_simulation -scripts_only` + Vivado session 内 `exec` 跑 compile/elaborate.bat 抓真错 |
 | `check_bitstream_readiness` | **0.3.0** 烧板前一键 READY/WARN/BLOCK 综合判定 |
-| `verify_io_placement` | 对比 XDC 约束（-dict/传统两种语法）与实际 IO 布局，GT 不匹配标为 CRITICAL |
+| `verify_io_placement_tool` | 对比 XDC 约束（-dict/传统两种语法）与实际 IO 布局，GT 不匹配标为 CRITICAL |
 | `xdc_lint` | **0.3.0** 纯 Python 静态 XDC 检查(PIN_CONFLICT / 漏 IOSTANDARD / DUPLICATE_PORT / CLOCK_NO_PERIOD / 跨文件冲突),不需 Vivado |
-| `xdc_auto_fix` | **0.3.3** 自动补 IOSTANDARD + create_clock -period,dry_run 预览 + 板卡 profile(basys3/nexys/arty/zybo/kc705),不碰 PIN_CONFLICT |
+| `xdc_auto_fix` | **0.3.3** 自动补 IOSTANDARD + create_clock -period,dry_run 预览 + 板卡 profile(basys3/nexys-a7/arty-a7/zybo/kc705),不碰 PIN_CONFLICT |
 | `verilog_compile_check` | **0.3.4** 用 iverilog / verilator 做语法 + 连接性检查,比 Vivado 综合快 50 倍。未装返回 SKIP + 安装指引,支持 Windows+scoop 路径自动发现 |
 
 ### IP 调试
@@ -190,19 +190,88 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI,跑得更快
 > 通用报告（power / drc / clock / methodology / cdc 等）请直接用
 > `run_tcl("report_power -return_string")`，无需包装。
 
-## 智能 Hook(Claude Code 独有)
+### 波形显示(XSim)
+| 工具 | 说明 |
+|------|------|
+| `set_wave_zoom` | **0.3.22** 设置波形时间缩放窗:改 .wcfg XML → close -force → open 重载(Vivado 2019.1 无 Tcl zoom 命令,跨命令协议封装) |
+| `set_wave_analog` | **0.3.22** 把信号设为 Analog 模拟显示:自动补 STYLE_ 前缀 + 全路径/显示名寻址 + 空对象判空(三个实测静默坑一次封掉)。注意先 zoom 后 analog(重载会冲掉 analog 设置) |
 
-仓库的 `.claude/settings.json` 预置了 **5 个 Claude Code hook**,让 AI 不只会"被动应答",还能**主动守门**:
+## 可选:Claude Code Hook 配置示例
+
+> **注意**:`.claude/` 目录不随仓库 / PyPI 包分发,下面是一份**可选**的 hook 配置示例,
+> 复制到你自己项目的 `.claude/settings.json` 即可启用。hook 里 import 的
+> `vivado_mcp.analysis` 模块随 `pip install vivado-mcp` 一起装好,无需额外脚本。
+> 所有 hook 命令均为**单行** `python -c`(分号串联)——Windows cmd 与 bash 下都能直接执行,
+> 多行 `python -c` 在 cmd 下会 SyntaxError 静默失效,自行改写时请保持单行。
+
+配好后 AI 不只会"被动应答",还能**主动守门**:
 
 | Hook | 触发事件 | 作用 |
 |---|---|---|
-| `bitstream-guard` | AI 调 `generate_bitstream` 前 | 拦截并提醒先跑 `check_bitstream_readiness`,避免时序违例时烧出废比特流 |
+| `bitstream-guard` | AI 调 `generate_bitstream` 前 | 弹确认框(permissionDecision: ask):提醒先跑 `check_bitstream_readiness`,由你决定放行或拒绝,不会硬阻断流程 |
 | `xdc-lint` | 保存任意 `.xdc` 文件后 | 纯 Python 静态检查:PIN_CONFLICT / 漏 IOSTANDARD / create_clock 缺 -period 等,无需等综合 |
 | `verilog-lint` | 保存任意 `.v` / `.sv` 文件后 | 零依赖预检:module 名匹配文件名 / endmodule 存在 / 括号配对 |
 | `iverilog-check` | 保存任意 `.v` / `.sv` 文件后 | **0.3.4** iverilog 或 verilator 语法+连接性检查,未装静默跳过,有 error 时阻断 |
 | `session-guard` | Claude 停下时 | 扫 `vivado_pid*.str` 文件,提醒清理未关闭的 Vivado session |
 
-首次打开本仓库时 Claude Code 会弹框:*"检测到项目配置了 hook,是否信任?"* — 选 **Yes** 即启用。
+<details>
+<summary>可复制的 settings.json 片段(点击展开)</summary>
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__vivado__generate_bitstream",
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "bitstream-guard",
+            "command": "python -c \"import json; print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'ask', 'permissionDecisionReason': '烧板前确认已跑 check_bitstream_readiness 且结论为 READY(时序违例/未布线状态下生成的是无效比特流)'}}))\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "xdc-lint",
+            "command": "python -c \"import json,sys; sys.stderr.reconfigure(encoding='utf-8'); d=json.load(sys.stdin); fp=d.get('tool_input',{}).get('file_path') or d.get('tool_response',{}).get('filePath') or ''; fp.lower().endswith('.xdc') or sys.exit(0); from vivado_mcp.analysis.xdc_linter import lint_xdc_files, format_lint_report; r=lint_xdc_files([fp]); r.issues and (sys.stderr.write('[xdc-lint hook] '+format_lint_report(r)+chr(10)), sys.exit(2))\""
+          },
+          {
+            "type": "command",
+            "statusMessage": "verilog-lint",
+            "command": "python -c \"import json,sys; sys.stderr.reconfigure(encoding='utf-8'); d=json.load(sys.stdin); fp=d.get('tool_input',{}).get('file_path') or d.get('tool_response',{}).get('filePath') or ''; fp.lower().endswith(('.v','.sv')) or sys.exit(0); from vivado_mcp.analysis.verilog_quick_check import quick_check_verilog, format_report; t=format_report(quick_check_verilog(fp)); t and (sys.stderr.write('[verilog-lint hook] '+t+chr(10)), sys.exit(2))\""
+          },
+          {
+            "type": "command",
+            "statusMessage": "iverilog-check",
+            "command": "python -c \"import json,sys; sys.stderr.reconfigure(encoding='utf-8'); d=json.load(sys.stdin); fp=d.get('tool_input',{}).get('file_path') or d.get('tool_response',{}).get('filePath') or ''; fp.lower().endswith(('.v','.sv')) or sys.exit(0); from vivado_mcp.analysis.verilog_compile_check import compile_check, format_compile_report; r=compile_check([fp], tool='auto', timeout=15.0); r.tool_available or sys.exit(0); r.errors and (sys.stderr.write('[iverilog-check hook] '+format_compile_report(r)+chr(10)), sys.exit(2))\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "session-guard",
+            "command": "python -c \"import sys,glob; sys.stderr.reconfigure(encoding='utf-8'); pids=glob.glob('vivado_pid*.str'); pids and (sys.stderr.write('[session-guard] 发现未清理的 Vivado session 痕迹: '+', '.join(pids)+'。建议用 mcp__vivado__stop_session 清理,或手动删除 .str 文件。'+chr(10)), sys.exit(2))\""
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+把片段写入你项目的 `.claude/settings.json` 后,Claude Code 打开该项目时会弹框:*"检测到项目配置了 hook,是否信任?"* — 选 **Yes** 即启用。
 
 要禁用单个或全部:在 `.claude/settings.local.json`(个人本地文件,不进 git)写入 `{"hooks": {}}` 覆盖即可。
 
@@ -318,7 +387,7 @@ compare_xci(file_a="golden.xci", file_b="suspect.xci")
 # → LINK_SPEED:    A=5.0_GT/s | B=8.0_GT/s
 
 # 验证 GT 引脚实际布局是否和 XDC 一致(支持 -dict 语法)
-verify_io_placement
+verify_io_placement_tool
 # → !!! CRITICAL 不匹配 !!!  端口: pcie_7x_mgt_rtl_0_rxp[0]
 #    XDC: AA4 | 实际: M6
 
@@ -338,8 +407,9 @@ AI Tool (Claude/Cursor/Codex) ──(stdio MCP)──▶  vivado-mcp
                       SubprocessSession        GuiSession             GuiSession
                       (mode="tcl")             (mode="gui")           (mode="attach")
                               │                     │                      │
-                     vivado -mode tcl        Popen + TCP:9999+       TCP:9999+ 连到
-                     (子进程 stdio)          auto-spawn GUI          已开的 Vivado GUI
+                     vivado -mode tcl     Popen + auto-spawn GUI    连到已开的 Vivado GUI
+                     (子进程 stdio)       TCP:9999 / port=0         TCP:9999 / port=0
+                                          auto-alloc                auto-alloc
 ```
 
 **核心协议**：
@@ -420,6 +490,7 @@ ruff check src/ tests/
 - [迁移指南 0.1 → 0.2](docs/MIGRATION_0.1_to_0.2.md) — 每个被删工具的 run_tcl/safe_tcl 替代
 - [审计报告](docs/AUDIT_REPORT.md) — 0.1.0 的 7 个 bug 根因分析
 - [IP 调试实践手册](docs/IP_DEBUG_GUIDE.md) — PCIe GT 映射调试、XCI 配置对比等实战
+- [PITFALLS](PITFALLS.md) — MCP 物理上无法替你做的事(需手动操作)
 
 ## 许可证
 

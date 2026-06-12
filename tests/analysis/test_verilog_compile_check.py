@@ -42,6 +42,39 @@ def test_iverilog_ignores_irrelevant_lines():
     assert _parse_iverilog(stderr) == []
 
 
+def test_iverilog_sorry_classified_as_error():
+    """iverilog 的 'sorry:'(构造合法但工具无法处理)归为 error,不是 info。"""
+    stderr = "tb.sv:12: sorry: constant selects in always_* processes are not currently supported (all bits will be included).\n"  # noqa: E501
+    issues = _parse_iverilog(stderr)
+    assert len(issues) == 1
+    assert issues[0].severity == "error"
+    assert issues[0].line == 12
+    # 保留 "sorry:" 前缀,让用户知道是工具能力限制而非代码错误
+    assert "sorry:" in issues[0].message
+
+
+def test_sorry_only_rc1_reports_fail_not_empty_warn():
+    """rc=1 且诊断全是 sorry 时,报告是 FAIL + 可见原因,
+    不再是 'WARN (0 warnings) 返回码: 1' 的空报告。"""
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
+               return_value="/fake/iverilog"), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
+        with patch(
+            "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
+            return_value=MagicMock(
+                returncode=1,
+                stdout="",
+                stderr="tb.sv:12: sorry: case inside is not currently supported.\n",
+            ),
+        ):
+            rep = compile_check(["tb.sv"], tool="iverilog")
+    assert len(rep.errors) >= 1
+    text = format_compile_report(rep)
+    assert "FAIL" in text
+    assert "WARN (0 warnings)" not in text
+    assert "sorry" in text  # 具体原因可见
+
+
 # -- parser: verilator -------------------------------------------------------- #
 
 def test_verilator_parses_error():
@@ -233,3 +266,102 @@ def test_format_skip_shows_install_hint():
     text = format_compile_report(rep)
     assert "SKIP" in text
     assert "scoop install iverilog" in text
+
+
+# -- SystemVerilog: iverilog 需要 -g2012 -------------------------------------- #
+
+def test_sv_file_adds_g2012():
+    """含 .sv 文件时 iverilog 命令必须带 -g2012(否则合法 SV 误报 FAIL)。"""
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
+               return_value="/fake/iverilog"), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
+        with patch(
+            "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="", stderr=""),
+        ) as sp:
+            compile_check(["counter.sv"], tool="iverilog")
+    cmd = sp.call_args[0][0]
+    assert "-g2012" in cmd
+
+
+def test_pure_v_files_no_g2012():
+    """纯 .v 文件保持现状,不加 -g2012。"""
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
+               return_value="/fake/iverilog"), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
+        with patch(
+            "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="", stderr=""),
+        ) as sp:
+            compile_check(["top.v", "uart.v"], tool="iverilog")
+    cmd = sp.call_args[0][0]
+    assert "-g2012" not in cmd
+
+
+def test_mixed_v_sv_adds_g2012():
+    """混合 .v + .sv 列表也要加 -g2012(.SV 大写后缀同样识别)。"""
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
+               return_value="/fake/iverilog"), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
+        with patch(
+            "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="", stderr=""),
+        ) as sp:
+            compile_check(["top.v", "fifo.SV"], tool="iverilog")
+    cmd = sp.call_args[0][0]
+    assert "-g2012" in cmd
+
+
+def test_verilator_sv_no_g2012_flag():
+    """verilator 原生支持 SV,不需要(也不认识 iverilog 的)-g2012。"""
+    def _which(name):
+        return "/fake/verilator" if name == "verilator" else None
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which", side_effect=_which), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
+        with patch(
+            "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="", stderr=""),
+        ) as sp:
+            compile_check(["counter.sv"], tool="verilator")
+    cmd = sp.call_args[0][0]
+    assert "-g2012" not in cmd
+
+
+# -- VHDL 扩展名守卫 ----------------------------------------------------------- #
+
+def test_vhdl_file_returns_skip():
+    """.vhd 文件直接 SKIP + 指引,不跑工具(守卫在工具检测之前)。"""
+    rep = compile_check(["top.vhd"])
+    assert rep.skip_reason != ""
+    assert rep.tool_used == ""
+    text = format_compile_report(rep)
+    assert "SKIP" in text
+    assert "VHDL" in text
+    assert "check_syntax" in text
+    assert "FAIL" not in text
+
+
+def test_vhdl_uppercase_and_vhdl_extension_also_skip():
+    """.VHDL 大写后缀同样触发守卫。"""
+    rep = compile_check(["TOP.VHDL"])
+    assert rep.skip_reason != ""
+
+
+def test_mixed_verilog_vhdl_skips_with_filenames():
+    """混合列表里只要有 VHDL 就 SKIP,且指出具体文件名。"""
+    rep = compile_check(["top.v", "pkg.vhd"])
+    assert "pkg.vhd" in rep.skip_reason
+
+
+def test_v_file_not_caught_by_vhdl_guard():
+    """negative: 纯 .v 不触发 VHDL 守卫。"""
+    with patch("vivado_mcp.analysis.verilog_compile_check.shutil.which",
+               return_value="/fake/iverilog"), \
+         patch("vivado_mcp.analysis.verilog_compile_check._scoop_fallback", return_value=None):
+        with patch(
+            "vivado_mcp.analysis.verilog_compile_check.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="", stderr=""),
+        ):
+            rep = compile_check(["foo.v"], tool="iverilog")
+    assert rep.skip_reason == ""
+    assert rep.tool_used == "iverilog"

@@ -1,5 +1,111 @@
 # Changelog
 
+## [0.3.22] — 未发布
+
+> 本版 = b8e748b(wave 工具 + 端口 B 方案,已合入未发布)+ 一轮全方位体检
+> (59-agent 审计,17 条 P0/P1 经三视角对抗验证确认,0 误报)+ S3 反馈 PRD
+> 实施 + 收尾 review 修复。工具数 25 → 27(仅 b8e748b 的两个 wave 工具,
+> 体检轮零新增,less-is-more 兑现)。测试 526 → 695。
+
+### 新工具(b8e748b)
+
+- **`set_wave_zoom`** — XSim 无 Tcl zoom 命令,正则就地改 .wcfg
+  `<zoom_setting>` 后 close -force/open 重载;BOM/CRLF/中文逐字保留。
+- **`set_wave_analog`** — `WaveformStyle=STYLE_ANALOG` 配方封装
+  (STYLE_ 前缀 / DESIGN_OBJECT 寻址 / 空对象判空三静默坑)。
+- **多开端口 B 方案** — spawn 不再扫端口池:`bind(("",0))` 拿确切空闲端口,
+  tcl server 绑不上即退出;`session_id→(port,pid)` 映射,stop 按 pid 精杀。
+
+### 安全(体检确认,P1)
+
+- **TCP Tcl server 改绑 127.0.0.1**(原 0.0.0.0)— 局域网内任意机器原本可
+  向 Vivado 发任意 Tcl(= 任意代码执行)。如确需远程 attach 场景请提 issue。
+- **`_handshake` 补 magic token 校验** — 0.3.21 的 token 反射验证只加在了
+  probe,attach 握手路径漏掉;现统一为单一实现两处复用(B16 反 fork 纪律)。
+
+### 修复(体检确认 P0/P1,全部带回归测试)
+
+- **[P0] xdc_lint/xdc_auto_fix 不认通配符与 -dict 形式 IOSTANDARD** — 误报
+  MISSING_IOSTANDARD 并插入覆盖用户真实电平的约束(改坏 XDC)。lint 改 Tcl
+  glob 语义匹配 + -dict 解析 + **跨文件聚合**(IOSTANDARD 与 PACKAGE_PIN 分
+  属不同 XDC 的常见组织方式)。
+- **XDC 写回安全** — 原 utf-8+errors=replace 读 GBK 文件再写回会把中文注释
+  全打成 U+FFFD;现编码探测(utf-8→gbk)同编码写回 + `.bak` 备份 + 临时文件
+  原子替换 + CRLF/LF 保留;不可解码文件拒写并在报告露出 ENCODING_DEGRADED。
+- **create_clock 续行(行尾 `\`)误报 CLOCK_NO_PERIOD** — parser 层折叠续行;
+  fixer 对续行场景拒绝就地改(归 skipped),插入点推进到续行链末尾。
+- **GUI 路径 JSON 转义漏 0x00-0x1F 控制字符** — 输出含 ESC/ANSI 序列时
+  Python 端 json.loads 抛异常吞掉整条命令结果;tcl 端补 `\u00XX` 映射。
+- **spawn 失败/超时不清理已启动的 Vivado** — 真孤儿进程(不进 _sessions,
+  stop 无从触达);现失败分支按记录的 pid 清理 + session_manager 兜底。
+- **timing_parser 摘要 'NA' 直接 float() 崩溃;表头缺失静默判 PASS** — 新增
+  parse_status 三态,NA 报"无时序约束"、格式不识别报 [DEGRADED],绝不默认
+  PASS;check_bitstream_readiness / get_pre_commit_summary 同步消费。
+- **util_parser 在 2020.1+ 含 Prohibited 列的报告上整列错位**(误报 CRITICAL)
+  — 改表头动态定位列;格式不识别显式 [DEGRADED] 而非静默 0 条。
+- **verilog_compile_check 对 .sv 缺 -g2012** — 合法 SystemVerilog 误报 FAIL;
+  另:iverilog `sorry:` 诊断归为 error(原会产出空 WARN 报告)。
+- **generate_bitstream 安全门检查失败静默放行** — 现显式 [DEGRADED] 标记
+  (含具体原因),不拦截但 AI/用户必然看见。
+- **inspect_ip_params 不查 is_error** — 错误目标时假报"该 IP 没有 CONFIG.*
+  参数";get_critical_warnings / flow 诊断概览同类问题一并修。
+- **set_wave_zoom 带空格路径必炸** — wcfg 路径过 to_tcl_path 转义;同修
+  unsaved 文案 FILE_NAME→FILE_PATH(原指引会撞 [Common 17-54])。
+- **VMCP_POLL Tcl 片段与轮询循环两处复制** — 收口 tcl_scripts.py 单一定义
+  + 共享 helper(B16 反 fork 纪律)。
+
+### S3 反馈 PRD(0.3.22 计划项全部落地)
+
+- **A1:list_sessions 主动探活 known sessions** — 原 is_alive 纯本地状态,
+  Vivado 内部 server 挂了仍报活。现 fresh-connection 并发探活(asyncio
+  gather,不阻塞 event loop);探活失败给中性 note(「可能正忙或挂死,勿立即
+  stop_session」),**不会**把正在跑长命令的健康 Vivado 引导成 kill 目标
+  (execute 超时后 _pending_response 窗口内跳过探活)。
+- **A2:start_session banner 显示当前 project** — project 为空/"New Project"
+  时提示先 open_project;查询走一次性独立短连接,绝不污染主连接。
+- **B1/B2/B3 quirk hint** — `-scripts_only` 重生擦除提醒、wcfg BOM 损坏处置、
+  [Coretcl 2-27] 路径排查指引(多层 glob,Tcl 无 ** 递归)。
+- **B4:run_synthesis/run_implementation 显示 applied_generic /
+  applied_verilog_define**(空值明示「(无)」,附 quirks §3 生效核对提醒)。
+- **C2:get_utilization_report 加 detail 参数** — Block RAM 子表
+  (RAMB36/FIFO* / RAMB36E1 only / RAMB18 / RAMB18E1 only);默认输出逐字节
+  向后兼容。
+- **hint 框架升级** — `_QUIRK_HINTS` 改三元组带 error_only 标记:内容型
+  hint 在 rc=0 也能触发(A1 误报场景 rc=0,原框架永不触发);A1 误报命中时
+  抑制矛盾的 A2 清理指引。
+- **超时 hint** — run_tcl 超时追加「超时≠失败,Vivado 仍在执行,勿重发」
+  指引(非工程模式长命令最易踩)。
+
+### 场景覆盖(FPGA 全工作流盘点,零新工具)
+
+- **prompts 修死引用** — debug_timing/debug_pcie 引用 0.2.0 已删的
+  `report()` 工具;debug_timing 重写为 2019.1 验证过的时序收敛升级链
+  (clock_interaction → cdc → methodology → qor_assessment → high_fanout →
+  design_analysis);fpga_workflow 补 write_project_tcl 工程入库步骤。
+- **第三方仿真器诊断 guard** — target_simulator 非 XSim 时不再用 XSim 日志
+  布局得出误导结论(含陈旧 XSim 日志场景)。
+- **get_next_suggestion 补仿真档** — 有 testbench 且没跑过行为仿真 → 先
+  launch_simulation(原决策表从可综合直接跳综合)。
+- **verilog_compile_check 挡 .vhd/.vhdl** — 返回 SKIP + check_syntax 替代
+  方案(原会喂给 iverilog 报一堆无关错误)。
+- **get_project_info 展示 testbench 列表**(sim_1 独有文件)。
+- **docstring 配方** — program_device 补烧 flash 六步配方(write_cfgmem /
+  PROGRAM.* 四件套);run_tcl 补 timeout 语义与 §8.6/§8.7 两坑。
+- **quirks 新增 §12 多策略并行与增量编译、§13 ILA/VIO 硬件调试配方**
+  (wait_on_hw_ila 必带 -timeout / VIO 写后必 commit_hw_vio)。
+
+### 文档同步
+
+- README:工具数 25→27、端口 B 方案语义(删全部「端口池 9999-10003」)、
+  hook 节改"可选配置示例"(.claude/ 不随仓库分发,原宣称不成立;示例改
+  单行命令 + bitstream-guard 改 ask 不死锁)、verify_io_placement_tool /
+  nexys-a7 等名称订正、补 PITFALLS 链接。
+- PITFALLS C1 配方订正为真机验证版(glob 寻址 + llength 判空),并指向
+  set_wave_analog 工具。
+- `::vmcp::start` 加重入守卫 — 修复 init.tcl + spawn -source 双加载导致
+  一个 Vivado 进程同时监听 9999 和 auto-alloc 端口。
+- 日志默认级别改 WARNING,支持 LOG_LEVEL 环境变量(对齐 logging spec)。
+
 ## [0.3.21] — 2026-05-25
 
 ### 修复(0.3.19 probe 假阳性 — 现场实测发现)

@@ -16,7 +16,7 @@ _IP_RE = re.compile(r"VMCP_PROJ_IP:([^|]+)\|(.+)")
 
 @dataclass(frozen=True)
 class ProjectFile:
-    category: str   # "source" / "xdc"
+    category: str   # "source" / "xdc" / "sim"
     file_type: str  # "Verilog" / "SystemVerilog" / "VHDL" / "XDC" 等
     path: str
 
@@ -111,6 +111,7 @@ def format_project_info(info: ProjectInfo) -> str:
 
     sources = [f for f in info.files if f.category == "source"]
     xdcs = [f for f in info.files if f.category == "xdc"]
+    sims = [f for f in info.files if f.category == "sim"]
 
     lines.append("")
     lines.append(f"源文件({len(sources)} 个):")
@@ -125,6 +126,14 @@ def format_project_info(info: ProjectInfo) -> str:
         lines.append(f"  {f.path}")
     if len(xdcs) > 10:
         lines.append(f"  ... 还有 {len(xdcs) - 10} 个文件")
+
+    # sim_1 独有文件(testbench):Tcl 端已采集,展示层同步渲染(格式同 sources)
+    lines.append("")
+    lines.append(f"仿真文件/testbench({len(sims)} 个):")
+    for f in sims[:20]:
+        lines.append(f"  [{f.file_type}] {f.path}")
+    if len(sims) > 20:
+        lines.append(f"  ... 还有 {len(sims) - 20} 个文件")
 
     lines.append("")
     lines.append(f"IP 实例({len(info.ips)} 个):")

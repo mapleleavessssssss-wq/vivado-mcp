@@ -24,6 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
+from vivado_mcp.tcl_scripts import QUERY_CURRENT_PROJECT
 from vivado_mcp.vivado.base_session import BaseSession, SessionState
 from vivado_mcp.vivado.tcl_utils import TclResult, clean_output
 
@@ -38,6 +39,41 @@ _HANDSHAKE_MAX_RESP = 8192
 # 进程退出兜底:记录所有临时 tcl 脚本,强杀 MCP 时也会被 atexit 清掉
 # 避免 /tmp/tmp*.tcl 堆积。正常路径 stop() 会主动 unlink 并从此集合移除。
 _TMP_SCRIPTS: set[str] = set()
+
+# 正在 spawn、尚未注册进 SessionManager._sessions 的目标端口集合。
+# list_sessions 外部探测据此跳过,避免把自己正在启动的 GUI 误报为 external。
+# start() 在 spawn 后登记,连接循环结束(成功/失败)即移除。
+# 已知窗口(审计 P3,接受现状):普通 set 非引用计数 —— 同端口并发 spawn 时
+# (AI 重试/双发),先结束的 start 在 finally discard 会摘掉后者的标记,后者
+# 余下启动窗口内可能被外部探测误报为 external 一次。瞬时且无害:同端口的
+# 第二个 spawn 本就注定 bind 失败,不值得为此换 Counter。
+_PENDING_SPAWN_PORTS: set[int] = set()
+
+# current_project 一次性查询(PRD A2)的独立短连接超时。模块级常量便于测试覆盖。
+_CURPROJ_TIMEOUT = 5.0
+
+
+def _make_probe_payload() -> tuple[str, bytes]:
+    """生成一次性握手探测 payload:(magic token, 未加 length 头的 payload 字节)。
+
+    vmcp 服务端会把 ``puts`` 的 token 反射进响应 output(captured_buf 路径),
+    校验方用 :func:`_verify_probe_resp` 验反射。probe(同步)与 _handshake(异步)
+    **必须共用**这一份逻辑 —— 0.3.21 token 校验只打在 probe 漏了 _handshake,
+    正是 B16「逻辑 fork 改一处漏一处」的重演。
+    """
+    token = "VMCP_PROBE_" + uuid.uuid4().hex[:16]
+    return token, f"puts {token}".encode("utf-8")
+
+
+def _verify_probe_resp(obj: object, token: str) -> bool:
+    """校验握手响应:必须是含 rc/output 的 dict,且 output 反射了本次 token。
+
+    仅验"dict + rc/output 字段"挡不住 VMware vNIC 等假阳性 listener
+    (0.3.21 真机实测),必须验响应**内容**包含本次探测的随机 token。
+    """
+    if not (isinstance(obj, dict) and "rc" in obj and "output" in obj):
+        return False
+    return token in str(obj.get("output", ""))
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
@@ -70,8 +106,7 @@ def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
         True 表示成功握手且响应 output 含 magic token(对面是同协议 server);
         False 表示连不上 / 协议不匹配 / 响应 output 缺 magic。
     """
-    token = "VMCP_PROBE_" + uuid.uuid4().hex[:16]
-    payload = f"puts {token}".encode("utf-8")
+    token, payload = _make_probe_payload()
     header = len(payload).to_bytes(4, "big")
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
@@ -87,12 +122,74 @@ def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
             if body is None:
                 return False
             obj = json.loads(body.decode("utf-8"))
-            if not (isinstance(obj, dict) and "rc" in obj and "output" in obj):
-                return False
             # magic token 反射校验:挡掉 echo-type / 非 vmcp 服务的假阳性
-            return token in str(obj.get("output", ""))
+            return _verify_probe_resp(obj, token)
     except (OSError, socket.timeout, json.JSONDecodeError, UnicodeDecodeError):
         return False
+
+
+def _query_current_project(
+    host: str, port: int, timeout: float = _CURPROJ_TIMEOUT
+) -> str | None:
+    """一次性独立短连接查询 current_project(PRD A2 横幅提示用)。
+
+    **绝不走会话主连接**:主连接上的查询一旦超时,迟到的响应会残留在流上,
+    让后续所有 execute 的请求/响应永久错位一格(0.3.22 审计 P1,fake server
+    实测复现)。本函数与 :func:`probe_vmcp_server` 同款同步收发:
+    连接 → 发一帧 QUERY_CURRENT_PROJECT → 读一帧 → 关闭,失败即丢弃连接。
+
+    Returns:
+        current_project 名称(无项目时为 ``""``);任何失败返回 None 并
+        logger.warning 具体原因 —— 失败只意味着 banner 无提示。
+    """
+    payload = QUERY_CURRENT_PROJECT.encode("utf-8")
+    header = len(payload).to_bytes(4, "big")
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(header + payload)
+            hdr = _recv_exact(s, 4)
+            if hdr is None:
+                logger.warning(
+                    "current_project 查询读响应头失败(对端关闭或 %ss 超时),"
+                    "banner 省略项目提示", timeout,
+                )
+                return None
+            resp_len = int.from_bytes(hdr, "big")
+            if resp_len <= 0 or resp_len > _HANDSHAKE_MAX_RESP:
+                logger.warning(
+                    "current_project 查询响应长度非法: %d,banner 省略项目提示",
+                    resp_len,
+                )
+                return None
+            body = _recv_exact(s, resp_len)
+            if body is None:
+                logger.warning(
+                    "current_project 查询读响应体失败(对端关闭或 %ss 超时),"
+                    "banner 省略项目提示", timeout,
+                )
+                return None
+            obj = json.loads(body.decode("utf-8"))
+            output = str(obj.get("output", ""))
+    except (OSError, socket.timeout) as e:
+        logger.warning(
+            "current_project 查询连接/收发失败(banner 省略项目提示): %s", e
+        )
+        return None
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.warning(
+            "current_project 查询响应解析失败(banner 省略项目提示): %s", e
+        )
+        return None
+
+    for line in output.splitlines():
+        if line.startswith("VMCP_CURPROJ:"):
+            return line[len("VMCP_CURPROJ:"):].strip()
+    logger.warning(
+        "current_project 查询输出缺 VMCP_CURPROJ 标记,前 200 字: %r",
+        output[:200],
+    )
+    return None
 
 
 def _cleanup_tmp_scripts_atexit() -> None:
@@ -172,6 +269,10 @@ class GuiSession(BaseSession):
         self._connected_port: int | None = None
         self._lock = asyncio.Lock()
         self._tmp_script: str | None = None
+        # 上一条 execute 超时且响应尚未收到时为 True(下次成功收到一帧即清除)。
+        # list_sessions 探活守卫据此跳过 fresh probe:Vivado 单线程 event loop
+        # 正在跑已超时的长命令时,新连接得不到服务,1s 探活必然落空 ≠ 挂死。
+        self._pending_response: bool = False
 
     @property
     def mode(self) -> str:
@@ -296,7 +397,7 @@ class GuiSession(BaseSession):
                     "会话 '%s' attach 到外部 GUI(端口 %d),跳过 spawn",
                     self.session_id, self._connected_port,
                 )
-                return msg
+                return msg + await self._current_project_hint()
             logger.info(
                 "端口 %d 无 vivado-mcp server,走 spawn 新 GUI 路径",
                 self._port_preference,
@@ -366,57 +467,136 @@ class GuiSession(BaseSession):
             else self._port_preference
         )
 
-        deadline = time.time() + timeout
-        connect_err: Exception | None = None
-        while time.time() < deadline:
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection("127.0.0.1", target_port),
-                    timeout=2.0,
-                )
-            except (ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
-                # 新 vivado 还没起完 → 等下一轮重试同一个确切端口
-                connect_err = e
-            else:
-                # 连上后必须握手验证：确认对面说的是我们的 length-prefix 协议
-                # （避免连到 SynthPilot 等其他产品的 server 上）
-                handshake_ok = await self._handshake(reader, writer)
-                if handshake_ok:
-                    self._reader = reader
-                    self._writer = writer
-                    self._connected_port = target_port
-                    self._state = SessionState.READY
-                    self._start_time = time.time()
-                    msg = (
-                        f"GUI 会话就绪：attach={self._attach_only}，"
-                        f"端口 {target_port}"
-                    )
-                    logger.info(msg)
-                    return msg
-                logger.debug(
-                    "端口 %d 握手失败（可能是其他产品的 server），重试",
-                    target_port,
-                )
-                writer.close()
+        # spawn 中的目标端口登记进 pending 集合:此时 session 尚未进
+        # SessionManager._sessions,list_sessions 外部探测会把自己正在启动的
+        # GUI 误报为 external,靠这个集合跳过。try/finally 保证异常路径也移除。
+        spawned = self._proc is not None
+        if spawned:
+            _PENDING_SPAWN_PORTS.add(target_port)
+        try:
+            deadline = time.time() + timeout
+            connect_err: Exception | None = None
+            while time.time() < deadline:
                 try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection("127.0.0.1", target_port),
+                        timeout=2.0,
+                    )
+                except (ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
+                    # 新 vivado 还没起完 → 等下一轮重试同一个确切端口
+                    connect_err = e
+                else:
+                    # 连上后必须握手验证：确认对面说的是我们的 length-prefix 协议
+                    # （避免连到 SynthPilot 等其他产品的 server 上）
+                    handshake_ok = await self._handshake(reader, writer)
+                    if handshake_ok:
+                        self._reader = reader
+                        self._writer = writer
+                        self._connected_port = target_port
+                        self._state = SessionState.READY
+                        self._start_time = time.time()
+                        msg = (
+                            f"GUI 会话就绪：attach={self._attach_only}，"
+                            f"端口 {target_port}"
+                        )
+                        logger.info(msg)
+                        return msg + await self._current_project_hint()
+                    logger.debug(
+                        "端口 %d 握手失败（可能是其他产品的 server），重试",
+                        target_port,
+                    )
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
 
-            # 进程还活吗
-            if self._proc is not None and self._proc.returncode is not None:
-                self._state = SessionState.ERROR
-                raise RuntimeError(
-                    f"Vivado GUI 进程提前退出 (returncode={self._proc.returncode})"
-                )
-            await asyncio.sleep(2.0)
+                # 进程还活吗
+                if self._proc is not None and self._proc.returncode is not None:
+                    self._state = SessionState.ERROR
+                    raise RuntimeError(
+                        f"Vivado GUI 进程提前退出 "
+                        f"(returncode={self._proc.returncode})"
+                    )
+                await asyncio.sleep(2.0)
 
-        # 超时
-        self._state = SessionState.ERROR
-        raise RuntimeError(
-            f"连接 Vivado GUI 超时（{timeout}s，确切端口 {target_port}）。"
-            f"该端口可能被其他进程抢占,请重试。最后一次错误: {connect_err}"
+            # 超时:先杀掉自己 spawn 的 Vivado 再抛 —— 异常上传后 session 不会
+            # 进 SessionManager._sessions,stop_session 无从清理,不杀就是真孤儿
+            await self._cleanup_failed_spawn()
+            self._state = SessionState.ERROR
+            raise RuntimeError(
+                f"连接 Vivado GUI 超时（{timeout}s，确切端口 {target_port}）。"
+                f"该端口可能被其他进程抢占,请重试。最后一次错误: {connect_err}"
+            )
+        finally:
+            if spawned:
+                _PENDING_SPAWN_PORTS.discard(target_port)
+
+    async def _cleanup_failed_spawn(self) -> None:
+        """start() 超时/失败时杀掉自己 spawn 的 Vivado,防止产生孤儿进程。
+
+        start 失败异常上传后 session 不会进 SessionManager._sessions,
+        stop_session 此后无从清理 —— 必须在抛错前自己收尾。
+        attach / 外部命中路径不 spawn(_proc is None),天然跳过。
+        """
+        import subprocess
+        import sys
+
+        if self._proc is None or self._proc.returncode is not None:
+            return
+        kill_pid = self._pid if self._pid is not None else self._proc.pid
+        logger.warning(
+            "会话 '%s' 启动失败,清理已 spawn 的 Vivado 进程 (pid=%s)",
+            self.session_id, kill_pid,
         )
+        try:
+            if sys.platform == "win32":
+                # /T 递归杀进程树:vivado.bat 的 cmd.exe 外壳下还有 vivado.exe
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(kill_pid)],
+                    capture_output=True,
+                    timeout=10.0,
+                )
+            else:
+                # Unix: 单进程 kill(非 killpg)。vivado 是 shell 包装脚本且
+                # 子进程未被 exec 接管时可能留孤儿 —— 项目主战场是 Windows
+                # 真机,暂不做 start_new_session+killpg 改造(与 stop() 步骤 3 同)
+                self._proc.kill()
+            await asyncio.wait_for(self._proc.wait(), timeout=10.0)
+        except Exception as e:
+            logger.warning(
+                "清理 spawn 失败的 Vivado (pid=%s) 异常: %s", kill_pid, e
+            )
+
+    async def _current_project_hint(self) -> str:
+        """启动横幅的项目状态提示(PRD A2)。
+
+        spawn 出来的全新 GUI / 用户停在 Start Page 的 GUI 没打开任何项目
+        (current_project 为空或 "New Project"),AI 直接跑 report_* 只会
+        拿到一串错。此时提示先 open_project。
+
+        查询走 :func:`_query_current_project` 的**一次性独立短连接**,主连接
+        零接触 —— 在主连接上 execute 查询一旦超时,残留响应会让后续所有命令
+        的结果永久错位(0.3.22 审计 P1)。查询失败不阻塞启动,降级为无提示
+        (helper 内已 log 具体原因)。同步收发包进 to_thread,不阻塞 event loop。
+        """
+        if self._connected_port is None:
+            return ""
+        proj = await asyncio.to_thread(
+            _query_current_project,
+            "127.0.0.1",
+            self._connected_port,
+            _CURPROJ_TIMEOUT,
+        )
+        if proj is None:
+            return ""
+        if proj in ("", "New Project"):
+            shown = proj if proj else "<无>"
+            return (
+                f"\n提示: 当前 project={shown},如非预期请先 "
+                "close_project -quiet 再 open_project <绝对路径>"
+            )
+        return ""
 
     async def _handshake(
         self,
@@ -426,11 +606,17 @@ class GuiSession(BaseSession):
     ) -> bool:
         """发送探测命令验证对端说的是我们的 length-prefix 协议。
 
-        成功：收到格式正确的 JSON 响应（含 rc 和 output 字段）
-        失败：超时 / 长度头异常大 / JSON 解析失败 / 字段缺失
-        → 说明对面可能是 SynthPilot 或其他产品的 server
+        与同步版 :func:`probe_vmcp_server` 共用同一份 token 生成 + 反射校验
+        (_make_probe_payload / _verify_probe_resp)。0.3.21 的 magic token
+        修复曾只打在 probe 这半边,_handshake 仍是弱校验(只验 rc/output
+        字段存在),VMware vNIC 类假阳性 listener 在 attach 路径上仍能骗过
+        —— 本次归一,杜绝逻辑 fork。
+
+        成功:JSON 响应是 dict、含 rc/output 字段,且 output 反射了本次 token
+        失败:超时 / 长度头异常大 / JSON 解析失败 / token 未反射
+        → 说明对面可能是 SynthPilot / VMware vNIC 等其他服务
         """
-        payload = b"puts VMCP_HANDSHAKE_ACK"
+        token, payload = _make_probe_payload()
         header = len(payload).to_bytes(4, "big")
         try:
             writer.write(header + payload)
@@ -442,14 +628,14 @@ class GuiSession(BaseSession):
             )
             resp_len = int.from_bytes(resp_hdr, "big")
             # 合理响应通常 <1KB；超过这值大概率是把 ASCII 当长度解释的
-            if resp_len < 0 or resp_len > 8192:
+            if resp_len <= 0 or resp_len > _HANDSHAKE_MAX_RESP:
                 return False
 
             body = await asyncio.wait_for(
                 reader.readexactly(resp_len), timeout=timeout
             )
             obj = json.loads(body.decode("utf-8"))
-            return "output" in obj and "rc" in obj
+            return _verify_probe_resp(obj, token)
         except Exception:
             return False
 
@@ -506,6 +692,9 @@ class GuiSession(BaseSession):
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
+            # 超时 ≠ 命令失败:Vivado 多半仍在跑,响应稍后才到并残留在流上。
+            # 标记 pending,list_sessions 探活据此跳过(避免"忙=死"误判)
+            self._pending_response = True
             raise asyncio.TimeoutError(
                 f"读取响应长度头超时（{timeout}s）。命令: {tcl_command[:200]}"
             )
@@ -516,10 +705,20 @@ class GuiSession(BaseSession):
                 f"非法响应长度 {resp_len}（限 {_MAX_RESPONSE_BYTES} 字节以内）。"
             )
 
-        resp_body = await asyncio.wait_for(
-            self._reader.readexactly(resp_len),
-            timeout=timeout,
-        )
+        try:
+            resp_body = await asyncio.wait_for(
+                self._reader.readexactly(resp_len),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            # 比照头部读包一层带 message 的超时:裸 TimeoutError str() 为空,
+            # 工具层只会显示 "[ERROR] 命令执行失败: "(审计 P3,缺具体原因)
+            self._pending_response = True
+            raise asyncio.TimeoutError(
+                f"读取响应体超时（{timeout}s）。命令: {tcl_command[:200]}"
+            )
+        # 成功收满一帧响应 → 清除 pending 标记(流上不再有在途残留)
+        self._pending_response = False
         try:
             obj = json.loads(resp_body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -612,7 +811,9 @@ class GuiSession(BaseSession):
                                 timeout=timeout,
                             )
                         else:
-                            # Unix: kill 进程组
+                            # Unix: 单进程 kill(非 killpg,旧注释"kill 进程组"
+                            # 与实现不符已订正)。vivado 包装脚本场景可能留孤儿,
+                            # 主战场 Windows,暂不做 killpg 改造
                             self._proc.kill()
                         await asyncio.wait_for(self._proc.wait(), timeout=timeout)
                     except asyncio.TimeoutError:

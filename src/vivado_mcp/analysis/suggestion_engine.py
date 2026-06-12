@@ -8,7 +8,8 @@
   2. 没源文件 → add_files
   3. 没顶层 → set_property TOP
   4. 没 XDC → 添加约束
-  5. 没综合 → xdc_lint + run_synthesis
+  4.5 有 testbench 且没跑过行为仿真 → 先 launch_simulation 验证逻辑
+  5. 没综合 → xdc_lint + run_synthesis(无 testbench 时附补仿真提醒)
   6. 综合失败 / 有 ERROR → get_critical_warnings
   7. 综合完成但没实现 → run_implementation
   8. 实现失败(place/route ERROR) → get_critical_warnings
@@ -18,9 +19,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from vivado_mcp.analysis.project_parser import ProjectInfo
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,6 +47,28 @@ def _source_count(info: ProjectInfo) -> int:
 
 def _xdc_count(info: ProjectInfo) -> int:
     return sum(1 for f in info.files if f.category == "xdc")
+
+
+def _sim_count(info: ProjectInfo) -> int:
+    """sim_1 fileset 独有文件数(QUERY_PROJECT_INFO 已剔除继承自 sources_1 的)。"""
+    return sum(1 for f in info.files if f.category == "sim")
+
+
+def _has_sim_products(info: ProjectInfo) -> bool:
+    """检查 <project_dir>/<project_name>.sim 下是否已有行为仿真产物。
+
+    Vivado 默认 layout:跑过 launch_simulation 后生成 <proj>.sim/<fileset>/behav/。
+    session 即本机 Vivado,目录本机可达,纯 os 检查即可,不依赖 session。
+    """
+    if not info.project_dir or not info.project_name:
+        return False
+    sim_root = Path(info.project_dir) / f"{info.project_name}.sim"
+    try:
+        return any(sim_root.glob("*/behav"))
+    except OSError as e:
+        # 目录不可读按"无产物"处理,但要留诊断痕迹(错误处理铁律)
+        logger.warning("检查仿真产物目录失败(%s),按无产物处理: %s", sim_root, e)
+        return False
 
 
 def suggest_next(info: ProjectInfo) -> Suggestion:
@@ -105,16 +132,48 @@ def suggest_next(info: ProjectInfo) -> Suggestion:
     synth = info.synth_status or ""
     impl = info.impl_status or ""
 
+    sim_n = _sim_count(info)
+
+    # 规则 4.5: 有 testbench 且没跑过行为仿真 → 先仿真验证逻辑再综合
+    # (FPGA 基本纪律:烧完板才发现逻辑错的代价远高于先仿真)
+    if (
+        "Complete" not in synth
+        and "ERROR" not in synth.upper()
+        and sim_n > 0
+        and not _has_sim_products(info)
+    ):
+        return Suggestion(
+            stage="ready_to_sim",
+            summary="发现 testbench 且尚未跑过行为仿真,建议先仿真验证逻辑再综合。",
+            reasons=[
+                f"sim_1 fileset 有 {sim_n} 个文件,但 "
+                f"{info.project_name}.sim 下无行为仿真产物",
+                f"synth_1 状态: {synth or '未启动'}",
+            ],
+            actions=[
+                "run_tcl(\"launch_simulation\")  # 行为仿真(XSim)",
+                "run_tcl(\"run 1us\")  # 跑一段仿真时间,观察波形/输出",
+                "失败诊断用 get_critical_warnings(run_name='sim_1')",
+                "仿真通过后再 run_synthesis()",
+            ],
+        )
+
     # 规则 5: 没综合
     if "Complete" not in synth and "ERROR" not in synth.upper():
+        actions = [
+            "xdc_lint()  # 先跑纯 Python 静态 XDC 检查(< 1s),捕捉低级错误",
+            "run_synthesis()  # 正式综合(5-15 分钟,取决于设计规模)",
+        ]
+        if sim_n == 0:
+            actions.append(
+                "提醒: 未发现 testbench(sim_1 为空),建议先补行为仿真验证逻辑"
+                "(add_files -fileset sim_1 tb.v 后 launch_simulation)。"
+            )
         return Suggestion(
             stage="ready_to_synth",
             summary="源文件 + 顶层 + XDC 已就绪,可以综合。",
             reasons=[f"synth_1 状态: {synth or '未启动'}"],
-            actions=[
-                "xdc_lint()  # 先跑纯 Python 静态 XDC 检查(< 1s),捕捉低级错误",
-                "run_synthesis()  # 正式综合(5-15 分钟,取决于设计规模)",
-            ],
+            actions=actions,
         )
 
     # 规则 6: 综合失败

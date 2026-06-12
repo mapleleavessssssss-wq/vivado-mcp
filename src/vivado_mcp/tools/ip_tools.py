@@ -83,6 +83,15 @@ async def inspect_ip_params(
     except Exception as e:
         return f"[ERROR] 查询 IP 参数失败: {e}"
 
+    # B2 同款守卫:命令失败时不要把错误文本送进 parser,
+    # 否则会解析出"0 个参数"的假报告,真错误(如无项目打开)被丢弃
+    if result.is_error:
+        return (
+            f"[ERROR] 查询 IP 参数失败(rc={result.return_code}):\n"
+            f"{result.output}\n"
+            "提示: 需要项目已打开(run_tcl 'open_project <path>.xpr')"
+        )
+
     # 解析输出
     report = parse_ip_params(result.output, ip_name)
 

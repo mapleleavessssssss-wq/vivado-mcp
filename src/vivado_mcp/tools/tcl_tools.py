@@ -39,7 +39,7 @@ async def run_tcl(
 
     **路径含特殊字符时请用 safe_tcl 而非 run_tcl**，避免 Tcl 解析错误。
 
-    **XSim 仿真常见坑摘要**（0.3.17 实战沉淀,完整版见 vivado-quirks.md §8）:
+    **XSim 仿真常见坑摘要**（0.3.17 实战沉淀,下面即完整清单）:
 
     - **`add_wave_group` 必须配 `-into $g`**,否则信号全跑到顶层,group 是空的:
 
@@ -57,6 +57,17 @@ async def run_tcl(
       current_scope /tb/u_dut       ;# ✓ 切上下文
       add_wave sig
       ```
+
+    - **`get_scopes` 不支持多 path 参数**,一次只能查一个 scope,多个要 foreach 逐个:
+
+      ```tcl
+      # ✗ get_scopes /tb/u_dut /tb/u_ctrl
+      foreach __p {/tb/u_dut /tb/u_ctrl} { puts "$__p: [get_scopes $__p]" }
+      ```
+
+    - **`size > 1` filter 对 escaped id 总线对象无效且不报错**(其 size 属性可能
+      =1,静默漏数据)。筛总线别依赖 size,改用 `regexp NAME` 匹配 `\[.*:.*\]`
+      总线命名约定。
 
     - **清空波形只认 `remove_wave [get_waves *]`**,`-all` / `*` / `-of_objects` 都
       不工作(XSim 2019.1 bug)
@@ -130,7 +141,11 @@ async def run_tcl(
     Args:
         command: Tcl 命令文本（支持多行）。
         session_id: 目标会话 ID，默认 "default"。
-        timeout: 命令执行超时秒数，默认 120。
+        timeout: 命令执行超时秒数，默认 120。注意超时语义:超时只是 MCP 停止
+            等待并返回错误,**命令在 Vivado 里仍在继续跑**(不会被取消),后续
+            命令会排队等它跑完。长任务(综合/实现/比特流)请改用
+            run_synthesis / run_implementation / generate_bitstream
+            (Python 轮询不阻塞),或按预期耗时调大本值。
     """
     session = _require_session(ctx, session_id)
     if not session:

@@ -6,12 +6,17 @@
 - ``mode="attach"`` —— 连接到用户已手动打开的 Vivado GUI（需先 ``vivado-mcp install``）
 """
 
+import asyncio
 import logging
 import re
 from typing import Literal
 
 from vivado_mcp.vivado.base_session import BaseSession
-from vivado_mcp.vivado.gui_session import GuiSession, probe_vmcp_server
+from vivado_mcp.vivado.gui_session import (
+    _PENDING_SPAWN_PORTS,
+    GuiSession,
+    probe_vmcp_server,
+)
 from vivado_mcp.vivado.session import SubprocessSession
 
 # 向后兼容：0.1.x 代码可能 import VivadoSession
@@ -29,7 +34,10 @@ _VALID_MODES: tuple[str, ...] = ("gui", "tcl", "attach")
 # 0.3.19 修复:用户手动启动 + init.tcl 注入的 GUI 不在 _sessions 字典中,
 # 不主动 probe 就会被报"无活跃会话",误导后续 start_session 抢占端口
 _EXTERNAL_PROBE_PORTS: tuple[int, ...] = tuple(range(9999, 9999 + 5))
-_EXTERNAL_PROBE_TIMEOUT = 0.3  # 单端口超时,总 <=5*0.3=1.5s,且 RST 会立即返回
+_EXTERNAL_PROBE_TIMEOUT = 0.3  # 单端口超时,并发 probe,RST 会立即返回
+# 已管理会话的探活超时(PRD A1):并发 fresh-connection probe,每个 <=1s。
+# is_alive 只看 socket 半边状态,Vivado 挂死时仍报 True,必须真发一次请求验证
+_KNOWN_PROBE_TIMEOUT = 1.0
 
 
 def _validate_session_id(session_id: str) -> str:
@@ -129,7 +137,24 @@ class SessionManager:
                 attach_only=True,
             )
 
-        banner = await session.start(timeout=timeout)
+        try:
+            banner = await session.start(timeout=timeout)
+        except Exception as e:
+            # 兜底清理:start 失败的 session 不会进 _sessions,此后 stop_session
+            # 无从触达;若 session 自己的失败清理没兜住(或 tcl 模式半启动),
+            # 这里再调一次 stop() 收尾。原始异常原样上传。
+            logger.warning(
+                "会话 '%s' 启动失败(%s: %s),执行兜底清理",
+                session_id, type(e).__name__, e,
+            )
+            try:
+                await session.stop()
+            except Exception as cleanup_err:
+                logger.warning(
+                    "会话 '%s' 启动失败后的兜底清理也失败: %s",
+                    session_id, cleanup_err,
+                )
+            raise
         self._sessions[session_id] = session
         # 记一份 (port, pid) 二级映射供诊断 / stop 兜底(从 session 读,不另算)
         self._port_map[session_id] = (
@@ -163,12 +188,17 @@ class SessionManager:
         Returns:
             操作结果描述。
         """
-        session = self._sessions.pop(session_id, None)
-        self._port_map.pop(session_id, None)
+        session = self._sessions.get(session_id)
         if not session:
             return f"会话 '{session_id}' 不存在。"
 
+        # stop 成功后再 pop:stop 抛异常时会话保留在 _sessions/_port_map,
+        # AI 看到 [ERROR] 后可重试 stop_session。pop-before-stop 会让重试
+        # 拿到"会话不存在"而 Vivado 进程仍在跑(审计 P3:孤儿失联)。
+        # 异常原样上抛,工具层 wrapper 兜底成 [ERROR] 文案。
         await session.stop()
+        self._sessions.pop(session_id, None)
+        self._port_map.pop(session_id, None)
         return f"会话 '{session_id}' 已关闭。"
 
     async def close_all(self) -> None:
@@ -185,7 +215,7 @@ class SessionManager:
 
         logger.info("所有 Vivado 会话已清理完毕。")
 
-    def list_sessions(self, probe_external: bool = True) -> list[dict]:
+    async def list_sessions(self, probe_external: bool = True) -> list[dict]:
         """列出所有会话的状态信息(含死会话,标记 is_alive=False)。
 
         纯只读,不会清理死会话 —— 否则 AI 连续调 list → stop 时第二次会
@@ -193,31 +223,88 @@ class SessionManager:
 
         Args:
             probe_external: 是否主动 probe 9999..10003 发现未被 MCP 管理的
-                外部 Vivado GUI(用户手动启动 + init.tcl 注入)。默认 True。
-                关掉 probe 在不需要网络访问的场景(测试 / 离线诊断)更快。
+                外部 Vivado GUI(用户手动启动 + init.tcl 注入),同时对已管理
+                的 GUI/attach 会话探活(PRD A1)。所有 probe 包进 to_thread
+                并发跑,总耗时 ≈ 单个最大超时,不阻塞 event loop。默认
+                True。关掉 probe 在不需要网络访问的场景(测试 / 离线诊断)更快。
 
         Returns:
             列表中每条 dict 至少含 ``session_id`` / ``mode`` / ``state``。
             外部 GUI 的 entry 会带 ``owner="external"`` + ``port`` 字段,
             ``session_id`` 形如 ``"<external@9999>"``,**不能**作为 stop_session
-            的参数(MCP 没管它,无权关闭)。
+            的参数(MCP 没管它,无权关闭)。探活失败的已管理会话带
+            ``responsive=False`` + 中性 note(未响应 ≠ 已死,is_alive 不翻转)。
         """
-        known = [s.status_dict() for s in self._sessions.values()]
+        sessions = list(self._sessions.values())
+        known = [s.status_dict() for s in sessions]
 
         if not probe_external:
             return known
 
-        # 已被 MCP 管理的端口跳过 probe,避免把同一个 server 列两次
+        # —— PRD A1:已管理会话探活目标筛选 ——
+        # 用 fresh-connection 的 probe_vmcp_server 而非在会话自有连接上探活:
+        # execute 超时后自有连接上可能残留迟到的响应,在其上发探测会把旧响应
+        # 误读成探活响应 → 把活着的会话误标死亡;fresh 连接对主连接零污染。
+        # 守卫:BUSY(MCP 侧命令在飞)或 _pending_response(上一条命令已超时
+        # 但 Vivado 仍在跑,单线程 event loop 不会服务新连接)都跳过探活,
+        # 避免把"忙"误判成"死"(审计 P1)。
+        probe_targets: list[tuple[dict, int]] = []
+        for s, entry in zip(sessions, known):
+            port = entry.get("port")
+            if (
+                port is not None
+                and entry.get("is_alive")
+                and entry.get("state") != "busy"
+                and not getattr(s, "_pending_response", False)
+            ):
+                probe_targets.append((entry, port))
+
+        # 已被 MCP 管理的端口跳过外部 probe,避免把同一个 server 列两次;
+        # 正在 spawn 中、尚未注册进 _sessions 的自己的 GUI 端口同样跳过,
+        # 避免把它误报为 owner="external"(实际是 MCP 自己正在启动的)
         occupied = {
             entry["port"] for entry in known
             if entry.get("port") is not None
         }
+        external_ports = [
+            port for port in _EXTERNAL_PROBE_PORTS
+            if port not in occupied and port not in _PENDING_SPAWN_PORTS
+        ]
+
+        # 同步 socket probe 包进 to_thread 并发执行:不再阻塞 event loop,
+        # 总耗时 ≈ 单个最大超时(此前串行最坏 1s×N + 1.5s,审计 P2)
+        results = await asyncio.gather(
+            *[
+                asyncio.to_thread(
+                    probe_vmcp_server, "127.0.0.1", port, _KNOWN_PROBE_TIMEOUT
+                )
+                for _, port in probe_targets
+            ],
+            *[
+                asyncio.to_thread(
+                    probe_vmcp_server, "127.0.0.1", port, _EXTERNAL_PROBE_TIMEOUT
+                )
+                for port in external_ports
+            ],
+        )
+        known_results = results[: len(probe_targets)]
+        ext_results = results[len(probe_targets):]
+
+        for (entry, _), ok in zip(probe_targets, known_results):
+            if not ok:
+                # 不翻转 is_alive、不无条件建议 stop:「未响应」≠「已死」——
+                # 用户在 GUI 里跑长 Tcl / 已超时命令仍在跑都会让短探测落空,
+                # 此时建议 stop_session 会引导 AI 杀掉健康会话(审计 P1)
+                entry["responsive"] = False
+                entry["note"] = (
+                    f"探活失败:未在 {_KNOWN_PROBE_TIMEOUT:g}s 内响应。"
+                    "可能正在执行长命令(含已超时仍在跑的命令)或已挂死;"
+                    "若你最近有命令超时,请等它完成,勿立即 stop_session。"
+                )
 
         external = []
-        for port in _EXTERNAL_PROBE_PORTS:
-            if port in occupied:
-                continue
-            if not probe_vmcp_server("127.0.0.1", port, _EXTERNAL_PROBE_TIMEOUT):
+        for port, ok in zip(external_ports, ext_results):
+            if not ok:
                 continue
             external.append({
                 "session_id": f"<external@{port}>",

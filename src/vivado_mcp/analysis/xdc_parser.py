@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,60 @@ _DICT_RE = re.compile(
 _DICT_PIN_KEY_RE = re.compile(r"PACKAGE_PIN\s+(\S+)", re.IGNORECASE)
 
 
+def _read_xdc_text(path: str | Path) -> tuple[str, str | None]:
+    """读 XDC 文件并探测编码,返回 (文本, 编码名)。
+
+    依次尝试 UTF-8 严格解码、GBK 严格解码(中文 Windows 记事本默认 ANSI=GBK
+    存盘很常见)。两者都失败时降级为 UTF-8 + errors="replace" **仅供只读解析**,
+    此时编码名返回 None —— 调用方不得用该结果写回文件(会把替换符落盘损坏内容)。
+    """
+    data = Path(path).read_bytes()
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        # 非法 UTF-8 → 继续尝试 GBK,这是预期路径不算降级
+        pass
+    try:
+        return data.decode("gbk"), "gbk"
+    except UnicodeDecodeError as e:
+        logger.warning(
+            "[DEGRADED] %s 既不是合法 UTF-8 也不是合法 GBK,按 UTF-8 替换符降级解码(只读): %s",
+            path, e,
+        )
+        return data.decode("utf-8", errors="replace"), None
+
+
+def _ends_with_continuation(line: str) -> bool:
+    """判断物理行是否以 Tcl 续行反斜杠结尾(奇数个尾随反斜杠 = 续行)。
+
+    偶数个尾随反斜杠是转义的字面反斜杠,不构成续行;反斜杠后若有空白
+    也不是续行(Tcl 里 backslash-space 是转义空格),故不做 rstrip。
+    """
+    return (len(line) - len(line.rstrip("\\"))) % 2 == 1
+
+
+def _fold_continuations(text: str) -> list[tuple[int, str]]:
+    """把反斜杠续行折叠成逻辑行,返回 [(首个物理行号, 逻辑行)] 列表。
+
+    Tcl 中 backslash-newline 等价于一个空格,XDC 里
+    ``create_clock -name sys_clk \\`` + 续行 ``-period 10 [get_ports clk]``
+    是合法写法。逐物理行的正则扫描会看不见续行内容,这里先折叠。
+    行号取续行链的首个物理行,供 lint 报告与 fixer 定位。
+    """
+    physical = text.splitlines()
+    logical: list[tuple[int, str]] = []
+    i = 0
+    while i < len(physical):
+        start_lineno = i + 1
+        line = physical[i]
+        while _ends_with_continuation(line) and i + 1 < len(physical):
+            i += 1
+            line = line[:-1].rstrip() + " " + physical[i].lstrip()
+        logical.append((start_lineno, line))
+        i += 1
+    return logical
+
+
 def _clean_port(port_raw: str) -> str:
     """清理端口名：去除外围的花括号和空白。
 
@@ -103,12 +160,13 @@ def parse_xdc_file(path: str | Path) -> list[XdcConstraint]:
         OSError: 文件读取失败。
     """
     path_obj = Path(path)
-    text = path_obj.read_text(encoding="utf-8", errors="replace")
+    text = _read_xdc_text(path_obj)[0]
     source_file = str(path_obj)
 
     constraints: list[XdcConstraint] = []
 
-    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+    # 先折叠反斜杠续行:跨行 -dict 约束逐物理行扫描会静默解析为 0 条
+    for lineno, raw_line in _fold_continuations(text):
         # 去除行尾注释（# 后面的内容），但保留引号内的 #
         line = _strip_comment(raw_line)
         if not line.strip():
@@ -160,9 +218,14 @@ def _strip_comment(line: str) -> str:
     in_single = False
     in_double = False
     brace_depth = 0
+    escaped = False
     for i, ch in enumerate(line):
-        if ch == "\\" and i + 1 < len(line):
-            # 跳过转义字符
+        if escaped:
+            # 上一个字符是反斜杠,本字符被转义,不参与引号/花括号/# 判定
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
             continue
         if ch == '"' and not in_single:
             in_double = not in_double

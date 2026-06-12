@@ -49,6 +49,63 @@ if {{[file exists $__log]}} {{
 """
 
 # --------------------------------------------------------------------------- #
+#  轮询 run 状态(D5 架构:Python 侧轮询代替 wait_on_run,避免冻住 GUI event loop)
+#  占位符 {run_name}。输出单行 VMCP_POLL|<STATUS>|<PROGRESS>|<STATS.ELAPSED>
+#  flow_tools._poll_run_until_done 是唯一消费方(单一来源,勿在 .py 内重写)
+# --------------------------------------------------------------------------- #
+
+POLL_RUN_STATUS = """\
+set __r [get_runs {run_name}]
+set __s [get_property STATUS $__r]
+set __p [get_property PROGRESS $__r]
+set __e [get_property STATS.ELAPSED $__r]
+puts "VMCP_POLL|$__s|$__p|$__e"
+"""
+
+# --------------------------------------------------------------------------- #
+#  查询 sources_1 fileset 上的参数覆盖(generic / verilog_define)
+#  用途(PRD B4):_launch_and_wait 启动综合/实现前读取,把 fileset 上设置的参数
+#  明示进结果,防止"以为 set_property generic 生效了实际没设上"的隐性坑。
+#  注意:fileset 上有值 ≠ 综合实际生效(quirks §3 类型不匹配可走错分支),
+#  所以结果行附带核对 runme.log 'bound to:' 的提醒,措辞两边保持一致。
+#  无 Python 占位符,直接用单花括号。
+# --------------------------------------------------------------------------- #
+
+QUERY_FILESET_OVERRIDES = """\
+set __fs [get_filesets sources_1]
+puts "VMCP_FS_OVERRIDE:generic=[get_property generic $__fs]"
+puts "VMCP_FS_OVERRIDE:verilog_define=[get_property verilog_define $__fs]"
+"""
+
+# --------------------------------------------------------------------------- #
+#  查询当前项目的 target_simulator(XSim / ModelSim / Questa / VCS / IES ...)
+#  用途:_diagnose_sim_run 在日志拍空、走 XSim 专属 bat fallback 之前 guard ——
+#  第三方仿真器的日志不在 */xsim/ 下,拍空是预期,误导性结论比没结论更糟。
+#  无 Python 占位符,直接用单花括号。
+# --------------------------------------------------------------------------- #
+
+QUERY_TARGET_SIMULATOR = """\
+if {[catch {get_property target_simulator [current_project]} __ts]} {
+    puts "VMCP_TARGET_SIM:error=$__ts"
+} else {
+    puts "VMCP_TARGET_SIM:$__ts"
+}
+"""
+
+# --------------------------------------------------------------------------- #
+#  查询当前打开的 project(PRD A2:启动横幅项目提示)
+#  无项目时 current_project 直接报错 → catch 住置空。输出单行 VMCP_CURPROJ:<name>
+#  消费方:gui_session._query_current_project —— 走**一次性独立短连接**发送,
+#  绝不在会话主连接上跑(主连接查询超时的残留响应会让后续 execute 永久错位)。
+#  无 Python 占位符,直接用单花括号。
+# --------------------------------------------------------------------------- #
+
+QUERY_CURRENT_PROJECT = """\
+if {[catch {current_project} __p]} { set __p "" }
+puts "VMCP_CURPROJ:$__p"
+"""
+
+# --------------------------------------------------------------------------- #
 #  提取 CRITICAL WARNING 详情：逐行扫描 runme.log，只输出 CW 行
 #  格式：VMCP_CW:行号|原始文本
 # --------------------------------------------------------------------------- #
@@ -225,6 +282,24 @@ if {[catch {current_project} __proj]} {
     puts "VMCP_PROJ:xdc_count=[llength $__xdcs]"
     foreach __f $__xdcs {
         puts "VMCP_PROJ_FILE:xdc|XDC|$__f"
+    }
+
+    # simulation fileset 文件(testbench)。注意:sim_1 的 get_files 会带出
+    # 继承自 sources_1 的设计源,这里只算 sim_1 独有的文件(真 testbench)
+    if {[llength [get_filesets -quiet sim_1]] > 0} {
+        set __sim_only [list]
+        foreach __f [get_files -quiet -of_objects [get_filesets sim_1]] {
+            if {[lsearch -exact $__srcs $__f] == -1} {
+                lappend __sim_only $__f
+            }
+        }
+        puts "VMCP_PROJ:sim_count=[llength $__sim_only]"
+        foreach __f $__sim_only {
+            set __ft [get_property FILE_TYPE $__f]
+            puts "VMCP_PROJ_FILE:sim|$__ft|$__f"
+        }
+    } else {
+        puts "VMCP_PROJ:sim_count=0"
     }
 
     # IP 列表
@@ -581,10 +656,13 @@ if {[llength $__wc] == 0} {
 }
 """
 
-# 重载 wcfg:close -force 后再 open。占位符 {wcfg_path}(已转正斜杠)。
+# 重载 wcfg:close -force 后再 open。占位符 {wcfg_path}——**必须传
+# to_tcl_path() 转义后的带引号值**(裸路径含空格会被 Tcl 分词、含 $/[ 会触发
+# 替换;close 已成功时 open 失败会让用户 wave_config 处于被关闭状态)。
 #   - close 漏 -force → [Wavedata 42-26](内存 wave_config 脏,拒绝丢弃)
 #   - 同名 wcfg 已 open 时直接 open → [Wavedata 42-52](重复打开),故必须先 close
 # close_wave_config 不接受 wcfg 名参数(关的是 current),所以无名直接 close。
+# OK 行不内插路径(路径含 $/[ 在双引号里会再替换一次;Python 侧本来就知道路径)。
 RELOAD_WCFG = """\
 if {{[catch {{close_wave_config -force}} __e]}} {{
     puts "VMCP_RELOAD_ERR:close|$__e"
@@ -592,7 +670,7 @@ if {{[catch {{close_wave_config -force}} __e]}} {{
     if {{[catch {{open_wave_config {wcfg_path}}} __e2]}} {{
         puts "VMCP_RELOAD_ERR:open|$__e2"
     }} else {{
-        puts "VMCP_RELOAD_OK:{wcfg_path}"
+        puts "VMCP_RELOAD_OK:done"
     }}
 }}
 """

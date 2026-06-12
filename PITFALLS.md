@@ -1,7 +1,7 @@
 # PITFALLS — 给 vivado-mcp 用户的操作约束
 
 > **本文档面向用户**(用 vivado-mcp + AI 跑 Vivado 工作流的人),不是给 AI 协作者
-> 看的(AI 协作约束在 `.trellis/spec/backend/vivado-quirks.md`)。
+> 看的(AI 协作约束在项目内部 spec `vivado-quirks.md`,不随仓库分发)。
 >
 > 这里列的是 **MCP 物理上无法替你做** 的事 —— 不是 bug,不是设计缺陷,是 Vivado
 > 本身的限制或 OS 边界,需要你**手动**操作。
@@ -22,19 +22,25 @@
 
 **真根因**:WaveformStyle 属性不在 `set_property` / `list_property` 全集里(所以
 看不到、误以为无接口),要用专用命令 `set_wave_prop`;且当年值写成裸 `ANALOG`,
-Vivado 收下不报错但渲染器不认,静默不渲染。**正确值必须带 `STYLE_` 前缀**
-(详见 `.trellis/spec/backend/vivado-quirks.md` §8.9):
+Vivado 收下不报错但渲染器不认,静默不渲染。**正确值必须带 `STYLE_` 前缀**:
 
 ```tcl
-set w [get_waves /tb/adc_out]
-set_wave_prop WaveformStyle STYLE_ANALOG $w   ;# ★ 裸 ANALOG 静默吞值不渲染
-set_wave_prop AnalogMin -2048 $w              ;# 贴数据:太宽压平,太窄削顶
-set_wave_prop AnalogMax  2047 $w
-set_wave_prop AnalogInterpolation LINEAR $w
-set_property HEIGHT 80 $w                      ;# 存为 CellHeight
+# ★ get_waves 按"显示名"(如 adc_out[11:0])/glob 匹配,传全路径 /tb/adc_out 返回空!
+#   且 set_wave_prop 对空对象 rc=0 静默接受 → 信号没 add 会伪装成功,务必先判空。
+set w [get_waves -quiet adc_out*]   ;# 用显示名/glob;或遍历 get_waves * 按 DESIGN_OBJECT 全路径过滤
+if {[llength $w]} {
+    set_wave_prop WaveformStyle STYLE_ANALOG $w   ;# ★ 裸 ANALOG 静默吞值不渲染
+    set_wave_prop AnalogMin -2048 $w              ;# 贴数据:太宽压平,太窄削顶
+    set_wave_prop AnalogMax  2047 $w
+    set_wave_prop AnalogInterpolation LINEAR $w
+    set_property HEIGHT 80 $w                      ;# 存为 CellHeight
+}
 ```
 
 **关键坑**:重载 wcfg 会冲掉 analog,**先定好 zoom 再实时上 analog**。
+
+> **MCP 已提供 `set_wave_analog` 工具封装此配方**(STYLE_ 前缀补全 + 全路径/显示名
+> 寻址 + 空对象判空),不想手拼 Tcl 直接调它;缩放窗用 `set_wave_zoom`。
 
 ---
 
@@ -63,7 +69,7 @@ set_property HEIGHT 80 $w                      ;# 存为 CellHeight
 | 文档 | 给谁看 | 内容性质 |
 |---|---|---|
 | `PITFALLS.md`(本文) | **用户** | "MCP 物理上做不到 / 你必须手动" |
-| `.trellis/spec/backend/vivado-quirks.md` | **AI 协作者** | "AI 写脚本 / debug 时要知道的 Vivado quirks" |
+| `vivado-quirks.md`(项目内部 spec,不随仓库分发) | **AI 协作者** | "AI 写脚本 / debug 时要知道的 Vivado quirks" |
 | `_safe_execute` 里的 W hints | **AI 运行时** | "命令出 err 时自动追加的复制粘贴指引" |
 
 三层互补,不重复。

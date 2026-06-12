@@ -37,6 +37,8 @@ class CompileReport:
     return_code: int = 0
     raw_stderr: str = ""
     install_hint: str = ""
+    # 输入文件本身不适用本检查时(如 VHDL)的跳过原因,正常为空
+    skip_reason: str = ""
 
     @property
     def errors(self) -> list[CompileIssue]:
@@ -57,6 +59,7 @@ class CompileReport:
             "warning_count": len(self.warnings),
             "issues": [asdict(i) for i in self.issues],
             "install_hint": self.install_hint,
+            "skip_reason": self.skip_reason,
         }
 
 
@@ -93,7 +96,7 @@ def _parse_iverilog(stderr: str, tool_name: str = "iverilog") -> list[CompileIss
         rest = m.group("rest").strip()
         lower = rest.lower()
 
-        # 严重度嗅探:syntax error / error / warning
+        # 严重度嗅探:syntax error / error / sorry / warning
         if lower.startswith("syntax error") or lower.startswith("error:") or " error:" in lower:
             severity = "error"
             # 去掉 "error:" 前缀让 message 干净
@@ -101,6 +104,12 @@ def _parse_iverilog(stderr: str, tool_name: str = "iverilog") -> list[CompileIss
                 msg = rest[len("error:"):].strip()
             else:
                 msg = rest
+        elif lower.startswith("sorry:"):
+            # iverilog 的 "sorry:" = 构造合法但本工具无法处理(常见于 -g2012
+            # 打开的 SV 特性),本次检查对该文件已失效 → 归为 error,
+            # 否则 rc=1 + 全 info 会产出 "WARN (0 warnings)" 的空报告
+            severity = "error"
+            msg = rest  # 保留 "sorry:" 前缀,让用户知道是工具能力限制而非代码错误
         elif lower.startswith("warning:") or " warning:" in lower:
             severity = "warning"
             if lower.startswith("warning:"):
@@ -208,9 +217,27 @@ def compile_check(
     tool: str = "auto",
     timeout: float = 30.0,
 ) -> CompileReport:
-    """用 iverilog 或 verilator 做语法/静态检查。"""
+    """用 iverilog 或 verilator 做语法/静态检查。
+
+    Args:
+        files: 仅支持 Verilog / SystemVerilog 文件(.v / .sv)。
+            含 .vhd/.vhdl 时直接返回 SKIP(skip_reason 附替代方案),不跑工具。
+        tool: "auto" / "iverilog" / "verilator"。
+        timeout: 子进程超时秒数。
+    """
     file_strs = [str(f) for f in files]
     report = CompileReport(files=file_strs)
+
+    # 扩展名守卫:iverilog/verilator 都不支持 VHDL,跑了只会产出误导性 FAIL
+    vhdl_files = [f for f in file_strs if f.lower().endswith((".vhd", ".vhdl"))]
+    if vhdl_files:
+        names = ", ".join(Path(f).name for f in vhdl_files)
+        report.skip_reason = (
+            f"检测到 VHDL 文件: {names}。iverilog/verilator 不支持 VHDL;"
+            '项目内快速语法检查用 run_tcl("check_syntax -fileset sources_1")'
+            "(2019.1 可用,需项目已打开)。"
+        )
+        return report
 
     tool_name, hint = _detect_tool(tool)
     if not tool_name:
@@ -229,6 +256,10 @@ def compile_check(
     if tool_name == "iverilog":
         # -t null:不产物,只做 parse + elab + 连接性检查
         cmd = [exe_path, "-t", "null"] + file_strs
+        # iverilog 默认按 IEEE1364-2005 解析,.sv 的 logic/always_ff 等会被
+        # 误报 syntax error —— 含 .sv 文件时加 -g2012 开 SystemVerilog 支持
+        if any(f.lower().endswith(".sv") for f in file_strs):
+            cmd.insert(1, "-g2012")
     else:
         # verilator --lint-only:静态检查,不编译
         cmd = [exe_path, "--lint-only", "-Wall"] + file_strs
@@ -279,6 +310,13 @@ def compile_check(
 
 
 def format_compile_report(report: CompileReport) -> str:
+    if report.skip_reason:
+        # 输入文件不适用(VHDL 等):明确说原因和替代路径,不误导成 FAIL
+        return (
+            "=== Verilog 编译检查: SKIP ===\n"
+            f"{report.skip_reason}"
+        )
+
     if not report.tool_available:
         return (
             "=== Verilog 编译检查: SKIP ===\n"
