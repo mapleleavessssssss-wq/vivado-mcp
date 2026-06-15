@@ -1,6 +1,8 @@
 # Changelog
 
-## [0.3.23] — 未发布
+## [0.3.23] — 2026-06-15
+
+> 本次 PyPI 发布(v0.3.23)同时包含下方 [0.3.22] 体检轮(此前已 commit 未 tag)。
 
 > 2026-06-15 场景轮:discovery workflow(53 候选 → 对抗 facade 过滤掉 33 → 20
 > 存活 → 7 shortlist)+ 真机经验性验证,落 3 个 G4 离线 introspection parser
@@ -28,7 +30,7 @@
   `wcfg_editor` 范式(analysis/ 纯解析 + tools/ ≤80 行薄壳)。discovery 轮 53 候选
   里 33 个被对抗 facade 过滤驳回,兑现 less-is-more。
 
-## [0.3.22] — 未发布
+## [0.3.22] —(并入 v0.3.23 发布)
 
 > 本版 = b8e748b(wave 工具 + 端口 B 方案,已合入未发布)+ 一轮全方位体检
 > (59-agent 审计,17 条 P0/P1 经三视角对抗验证确认,0 误报)+ S3 反馈 PRD
