@@ -520,6 +520,7 @@ def debug_pcie() -> str:
 
 import vivado_mcp.tools.diagnostic_tools  # noqa: E402, F401
 import vivado_mcp.tools.flow_tools  # noqa: E402, F401
+import vivado_mcp.tools.introspect_tools  # noqa: E402, F401
 import vivado_mcp.tools.ip_tools  # noqa: E402, F401
 import vivado_mcp.tools.report_tools  # noqa: E402, F401
 import vivado_mcp.tools.session_tools  # noqa: E402, F401

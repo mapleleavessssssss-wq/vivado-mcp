@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/mapleleavessssssss-wq/vivado-mcp)](LICENSE)
 [![CI](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml)
 
-精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **27 个精简工具** 控制 Xilinx Vivado EDA——少即是多。
+精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **30 个精简工具** 控制 Xilinx Vivado EDA——少即是多。
 
 > **0.3 系列新增了什么**:
 > - **list_sessions 不再"无中生有"(0.3.21)** ⭐:0.3.19 加的"主动探测外部 Vivado"在装了 VMware / Hyper-V 虚拟网卡的机器上会**偶发误报**——端口 10000 上其实是虚拟网卡服务凑巧回了类 JSON 的数据,被错认成 Vivado。本版给握手加**随机 token**(`puts VMCP_PROBE_<uuid>`),服务端必须把 token 原样回弹才算真 Vivado——假阳性归零
@@ -26,7 +26,7 @@
 >
 > 详见 [CHANGELOG](CHANGELOG.md)。
 
-## 设计哲学 — 为什么是 27 个工具而不是 500 个？
+## 设计哲学 — 为什么是 30 个工具而不是 500 个？
 
 主流 Vivado MCP（如 SynthPilot）动辄 500+ 工具，每个工具本质是一行 Tcl 包装。问题是：
 
@@ -46,7 +46,7 @@
 ## 特性
 
 - **双模式会话**：默认 GUI 可视化（能看到 Vivado 图标 + Tcl Console 实时输出），也支持无头 CI 模式和 attach 已开 GUI
-- **27 个精简工具 + 可选 Hook 配置示例** — 覆盖完整 FPGA 开发流程 + 智能诊断 + 新手引导 + 外部工具链联动
+- **30 个精简工具 + 可选 Hook 配置示例** — 覆盖完整 FPGA 开发流程 + 智能诊断 + 新手引导 + 外部工具链联动
 - **智能诊断** — 综合/实现后自动提取 CRITICAL WARNING / ERROR 分类 + 中文修复建议（含 18+ 种已知 ID）
 - **IO 验证** — XDC 约束（**支持 -dict 和传统两种语法**）对比实际引脚分配，GT 端口不匹配标记为 CRITICAL
 - **IP 调试** — 查询 IP 所有 CONFIG.* 参数（含 GUI 隐藏参数）、纯 Python 对比两个 XCI 文件
@@ -97,7 +97,7 @@ vivado-mcp install
 
 ### 4. 重启 Claude Code
 
-配置完成后重启 Claude Code，即可使用 27 个 Vivado 工具。
+配置完成后重启 Claude Code，即可使用 30 个 Vivado 工具。
 
 <details>
 <summary>从源码安装（开发/贡献）</summary>
@@ -179,6 +179,13 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI,跑得更快
 | `inspect_ip_params` | 查询 IP 实例所有 CONFIG.* 参数（含 GUI 隐藏项），支持关键词过滤 |
 | `compare_xci` | 纯 Python 对比两个 XCI 文件的参数差异（无需 Vivado 会话） |
 | `get_ip_status` | **0.3.4** 检查哪些 IP 需要升级 / 被锁定 / 已最新,附 upgrade_ip 批量建议 |
+
+### 离线摸底（无需 Vivado 会话，纯 Python）
+| 工具 | 说明 |
+|------|------|
+| `parse_xpr` | **0.3.23** 离线解析 .xpr 工程文件——不启 Vivado 秒级拿 part/顶层/源文件(按 fileset 分组,含 .v/.mem/.xci IP)/XDC/runs。对照 `get_project_info` 需先 open_project(中文路径会 TclStackFree 崩) |
+| `parse_bit_header` | **0.3.23** 离线解析 .bit 头部——设计名/part(原始 `7k325tffg900` + 规整 `xc7k325tffg900`)/构建日期时间/SHA256。烧前防错板 + 交付对账,Vivado 无 Tcl 命令读离线 .bit |
+| `parse_ltx` | **0.3.23** 离线解析 .ltx ILA 探针清单——probe 名/位宽/映射 net。连板抓波前先拿清单,`get_hw_probes` 需活 hw session |
 
 ### 结构化报告
 | 工具 | 说明 |

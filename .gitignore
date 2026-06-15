@@ -42,6 +42,11 @@ Thumbs.db
 *.xpr.bak
 .Xil/
 *.runs/
+
+# 例外:离线 parser 的测试 fixture 是合成的小样本(真实格式),必须入库,
+# 否则上面的 *.bit/*.ltx 规则会把它们排除 → CI 在干净检出上找不到 fixture。
+!tests/fixtures/*.bit
+!tests/fixtures/*.ltx
 *.cache/
 *.hw/
 *.ip_user_files/

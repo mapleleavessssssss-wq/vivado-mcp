@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.3.23] — 未发布
+
+> 2026-06-15 场景轮:discovery workflow(53 候选 → 对抗 facade 过滤掉 33 → 20
+> 存活 → 7 shortlist)+ 真机经验性验证,落 3 个 G4 离线 introspection parser
+> (用户选定)。工具数 27 → 30,全部纯 Python、零 Vivado 依赖、可对真文件离线
+> 单测。测试 695 → 754。
+
+### 新工具(离线摸底,无需 Vivado 会话)
+
+- **`parse_xpr`** — 离线解析 .xpr 工程文件,秒级拿 part/顶层/源文件(按 fileset
+  分组,含 .v/.mem/.xci IP)/XDC/synth+impl runs 及 Strategy。对照 get_project_info
+  需先 start_session + open_project(且中文工程根目录触发 TclStackFree 崩),本工具
+  完全离线、CI 友好。真机验证:离线解 gauss_noise.xpr 逐字段 == live get_property
+  (part=xc7k325tffg676-2 / top=gauss_noise_top / 7 源 / runs=synth_1+impl_1)。
+- **`parse_bit_header`** — 离线解析 .bit 比特流头部(只读 TLV 头,不读 payload):
+  设计名 / 目标 part(原始 `7k325tffg900` + 规整 `xc7k325tffg900`,.bit 本就去 xc
+  前缀 + 去速度等级)/ 构建日期时间 / SHA256。烧录前防错板(part 比对)、交付/返修
+  对账。`info commands read_bitstream*` 实测为空,Vivado 无 Tcl 命令读离线 .bit。
+- **`parse_ltx`** — 离线解析 .ltx ILA 探针清单(Vivado 2019.1 是 **JSON** 不是 XML):
+  每个 hw_ila 的 probe 名 / 位宽 / 映射 net。连板抓波前先拿清单辅助写
+  TRIGGER_COMPARE_VALUE;`get_hw_probes` 需板子在手 + 活 hw session,本工具完全离线。
+
+### 设计纪律
+
+- 三者均满足"Tcl 做不了/做不好"准入(G4 跨会话纯 Python),同 `compare_xci` /
+  `wcfg_editor` 范式(analysis/ 纯解析 + tools/ ≤80 行薄壳)。discovery 轮 53 候选
+  里 33 个被对抗 facade 过滤驳回,兑现 less-is-more。
+
 ## [0.3.22] — 未发布
 
 > 本版 = b8e748b(wave 工具 + 端口 B 方案,已合入未发布)+ 一轮全方位体检
