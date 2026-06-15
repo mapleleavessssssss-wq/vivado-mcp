@@ -1,0 +1,6 @@
+# 测试 fixture 必须逐字节保真:wcfg_editor 测 CRLF/BOM/中文 编码保留,
+# 禁 git EOL 归一化。否则 Windows(autocrlf)本地存 LF、Linux CI 取 LF →
+# 「CRLF 保留」断言假阴性(0.3.22 wave 测试在首次上 Linux CI 时暴露)。
+tests/fixtures/*.wcfg -text
+# .bit 是二进制比特流头样本,禁任何转换/diff
+tests/fixtures/*.bit binary
