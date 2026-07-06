@@ -197,9 +197,15 @@ set __ip [get_ips {ip_name}]
 if {{$__ip eq ""}} {{
     puts "VMCP_IP_PARAM_ERROR:IP '{ip_name}' not found"
 }} else {{
-    set __vlnv [get_property VLNV $__ip]
-    puts "VMCP_IP_INFO:$__vlnv"
     set __props [list_property $__ip]
+    if {{[lsearch -exact $__props VLNV] >= 0}} {{
+        set __vlnv [get_property VLNV $__ip]
+    }} elseif {{[lsearch -exact $__props IPDEF] >= 0}} {{
+        set __vlnv [get_property IPDEF $__ip]
+    }} else {{
+        set __vlnv "<unknown>"
+    }}
+    puts "VMCP_IP_INFO:$__vlnv"
     foreach __p $__props {{
         if {{[string match "CONFIG.*" $__p]}} {{
             set __val [get_property $__p $__ip]
@@ -306,7 +312,14 @@ if {[catch {current_project} __proj]} {
     set __ips [get_ips -quiet]
     puts "VMCP_PROJ:ip_count=[llength $__ips]"
     foreach __ip $__ips {
-        set __vlnv [get_property VLNV $__ip]
+        set __ip_props [list_property $__ip]
+        if {[lsearch -exact $__ip_props VLNV] >= 0} {
+            set __vlnv [get_property VLNV $__ip]
+        } elseif {[lsearch -exact $__ip_props IPDEF] >= 0} {
+            set __vlnv [get_property IPDEF $__ip]
+        } else {
+            set __vlnv "<unknown>"
+        }
         puts "VMCP_PROJ_IP:$__ip|$__vlnv"
     }
 
