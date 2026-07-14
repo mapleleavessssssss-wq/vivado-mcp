@@ -6,11 +6,23 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "NJ" }]
-keywords = ["mcp", "vivado", "fpga", "eda", "tcl", "xilinx"]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "vivado",
+    "fpga",
+    "eda",
+    "tcl",
+    "verilog",
+    "xilinx",
+    "claude",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -26,6 +38,7 @@ dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.4"]
 Homepage = "https://github.com/mapleleavessssssss-wq/vivado-mcp"
 Repository = "https://github.com/mapleleavessssssss-wq/vivado-mcp"
 Issues = "https://github.com/mapleleavessssssss-wq/vivado-mcp/issues"
+Changelog = "https://github.com/mapleleavessssssss-wq/vivado-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
 vivado-mcp = "vivado_mcp.__main__:main"

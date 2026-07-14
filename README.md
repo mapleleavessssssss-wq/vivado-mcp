@@ -7,55 +7,15 @@
 
 精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **30 个精简工具** 控制 Xilinx Vivado EDA——少即是多。
 
-> **0.3 系列新增了什么**:
-> - **list_sessions 不再"无中生有"(0.3.21)** ⭐:0.3.19 加的"主动探测外部 Vivado"在装了 VMware / Hyper-V 虚拟网卡的机器上会**偶发误报**——端口 10000 上其实是虚拟网卡服务凑巧回了类 JSON 的数据,被错认成 Vivado。本版给握手加**随机 token**(`puts VMCP_PROBE_<uuid>`),服务端必须把 token 原样回弹才算真 Vivado——假阳性归零
-> - **Vivado 报错时自动多送一句"清理指南"(0.3.20)** ⭐:wave 类命令(`open_wave_database` / `add_wave` / `log_wave` 等)失败时,Vivado GUI 会留下**孤儿 simulation tab + 几百 MB 内存浪费**。本版在错误输出末尾自动追加可复制的 `close_sim` / `close_wave_config` 清理脚本片段,AI 不用主动查 quirks;同时 `run_tcl` 工具描述里塞进 4 条 XSim 写脚本静默踩坑(如 `set_property RADIX` 必须小写 `dec` 不能大写 `DEC`)。**契约**:原始 Vivado 输出**不改写,只追加**
-> - **手动开的 Vivado GUI 现在能"接力"(0.3.19)** ⭐:你自己跑 `vivado -mode gui`(`vivado-mcp install` 已注入 init.tcl 让它自动开 TCP server),之后从 AI 调 `start_session(mode="gui")` **不会再 spawn 第二个 GUI 孤儿**,而是直接 attach 到你那台——端口冲突 + 800 MB 内存浪费的老坑没了。`list_sessions` 也会把你手动开的列为 `<external@端口>`,并注明"stop_session 无权关闭,请在 GUI 内手动 exit"
-> - **中文 Windows stdio mode 输出对齐(0.3.18)** ⭐:0.3.17 及之前 `run_tcl` 在中文 Win 上返回的路径含中文时会变 `锟斤拷` / `���`(Vivado stdout 默认 CP936/GBK,但 session.py 强制 UTF-8 decode)。新增 `decode_vivado_output()` —— UTF-8 严格 decode + 含 U+FFFD 时 fallback `mbcs`(系统 code page),全链路对齐。**仅影响 tcl/stdio 模式**,GUI mode TCP UTF-8 协议本来就 OK
-> - **XSim 仿真坑摘要自动注入 run_tcl docstring(0.3.18)**:0.3.17 用户实战踩了一遍 XSim 的 9 个 Tcl 写法坑(`add_wave_group` 必须 `-into $g` / escaped id 必须 `current_scope` 切上下文 / `remove_wave` 只认 `[get_waves *]` / `xsim -tclbatch` 必须显式 `quit` 等)。这些坑的精简摘要直接塞到 `run_tcl` docstring 末尾 —— AI 每次拿到工具描述就能看到,不用等踩了再问
-> - **仿真失败自动剥洋葱(0.3.16)**:`launch_simulation` 失败 + xsim/*.log 全空时(Win 11 24H2 默认安全策略 + Vivado 2019.1 spawn bug 的经典坑),`get_critical_warnings(run_name='sim_1')` 自动 `-scripts_only` 触发 .bat 生成,在 Vivado session 内顺序 `exec` compile/elaborate.bat 抓真错,直接告诉你"是 wrapper 失败还是 RTL 失败" + 给一行 `reg add` 根治命令
-> - **环境陷阱启动自检(0.3.14 / 0.3.16 / 0.3.18)**:`start_session` 检测中文路径(2019.x TclStackFree,**0.3.18 扩警告:GUI session 内 cd/open_project 中文路径同样触发**)+ Win 11 24H2 `NoDefaultCurrentDirectoryInExePath`=1 + 注册表策略,踩坑前先给警告
-> - **时序违例自动定位(0.3.9)**:`get_timing_report` 违例时自动跑 `report_timing -max_paths 10`,嗅探 5 种模式(CDC / HIGH_FANOUT / LONG_COMBO / IO_UNREGISTERED / UNKNOWN)并给出具体 Tcl 修复命令,不再让你对着时序日志发呆
-> - **CW 修复效果可视化(0.3.9)**:`get_critical_warnings(compare_with_last=True)` 对比上次快照,报告"已消除 N 条 / 新出现 N 条 / 仍存在 N 条",让"改 XDC 有没有改到点子上"直接有数
-> - **长任务可视化**:`get_run_progress` 让 10-30 分钟的综合/实现不再是黑盒
-> - **新手引导**:`get_next_suggestion` 根据项目状态告诉你下一步该干啥
-> - **XDC 一键自修**:`xdc_auto_fix` 自动补 IOSTANDARD 和 create_clock period
-> - **外部 Verilog 预检**:`verilog_compile_check` 用 iverilog/verilator,比 Vivado 综合快 50 倍
-> - **IP 老化检测**:`get_ip_status` 扫出项目里哪些 IP 需要升级
-> - **Commit 摘要**:`get_pre_commit_summary` 生成 WNS/资源/CW 的 markdown 片段直接贴 commit body
->
-> 详见 [CHANGELOG](CHANGELOG.md)。
+> **TL;DR (English)** — A lean MCP server that lets AI agents (Claude Code, Cursor, etc.) drive Xilinx Vivado: synthesis, implementation, XSim simulation & waveforms, timing / CRITICAL WARNING diagnostics — 30 curated tools, everything else via raw `run_tcl`. Docs and diagnostic messages are in Chinese.
 
-## 设计哲学 — 为什么是 30 个工具而不是 500 个？
+**目录**:[环境要求](#环境要求) · [快速开始](#快速开始) · [设计哲学](#设计哲学--为什么是-30-个工具而不是-500-个) · [特性](#特性) · [会话模式](#会话模式) · [工具列表](#工具列表) · [Hook 配置](#可选claude-code-hook-配置示例) · [使用示例](#使用示例--一轮完整的调试闭环) · [架构](#架构) · [CLI 参考](#cli-参考) · [反馈](#反馈与-bug-提交)
 
-主流 Vivado MCP（如 SynthPilot）动辄 500+ 工具，每个工具本质是一行 Tcl 包装。问题是：
+## 环境要求
 
-- **每个工具都占用 AI 上下文**（工具签名注入到每次系统提示）→ 调不调都烧 token
-- **大模型比我们更会拼 Tcl**（`create_bd_cell` 这种就是写一行 Tcl 的事）
-- **绝大多数 facade 工具做的事 `run_tcl("...")` 能做**
-
-本项目只保留**真正有本地价值**的工具——Tcl 做不了或做不好的事：
-
-1. **结构化解析**：IO / 时序报告 → JSON / 中文摘要（比原始表格省 token）
-2. **本地知识库**：CRITICAL WARNING 按 ID 分类 + 中文修复建议（Tcl 里写这个太难）
-3. **跨命令协议**：sentinel、会话管理、超时、比特流前置安全检查
-4. **跨会话工具**：`compare_xci` 纯 Python 对比两个 XCI 文件，不需要 Vivado
-
-其他（BD / 仿真 / XSCT / 硬件调试 / IP 配置等）全部交给 `run_tcl`，让大模型自己拼 Tcl。
-
-## 特性
-
-- **双模式会话**：默认 GUI 可视化（能看到 Vivado 图标 + Tcl Console 实时输出），也支持无头 CI 模式和 attach 已开 GUI
-- **30 个精简工具 + 可选 Hook 配置示例** — 覆盖完整 FPGA 开发流程 + 智能诊断 + 新手引导 + 外部工具链联动
-- **智能诊断** — 综合/实现后自动提取 CRITICAL WARNING / ERROR 分类 + 中文修复建议（含 18+ 种已知 ID）
-- **IO 验证** — XDC 约束（**支持 -dict 和传统两种语法**）对比实际引脚分配，GT 端口不匹配标记为 CRITICAL
-- **IP 调试** — 查询 IP 所有 CONFIG.* 参数（含 GUI 隐藏参数）、纯 Python 对比两个 XCI 文件
-- **Bitstream 安全检查** — 生成比特流前自动检测 CRITICAL WARNING 并阻止（可 force 跳过）
-- **结构化报告** — IO 和时序报告解析为 JSON，便于 AI 精确提取数值（**不再有"假 PASS"陷阱**）
-- **安全转义** — `safe_tcl` 自动对路径/标识符做 Tcl list 转义，Windows 含空格/中文/$ 的路径也能用
-- **多会话支持** — 默认复用端口 9999 的单个 GUI（不同 session_id 也 attach 同一台）；传 `port=0` 自动分配空闲端口启动独立实例；server 只绑单一端口，被占即退出不滑动
-- **跨平台** — 支持 Windows 和 Linux
-- **零额外依赖** — 仅依赖 `mcp` SDK
+- **Python ≥ 3.10**,Windows / Linux
+- **Xilinx Vivado**:作者长期实测 **2019.1**;协议层为纯 Tcl,2018.3 / 2022.2 已有社区用户实际使用(见 issues / PR),其他版本理论兼容
+- **零额外依赖** — 仅依赖 `mcp` SDK,测试无需 Vivado
 
 ## 快速开始
 
@@ -108,6 +68,58 @@ cd vivado-mcp
 pip install -e ".[dev]"
 ```
 </details>
+
+<details>
+<summary><b>0.3 系列新增了什么</b>(点击展开)</summary>
+
+> - **list_sessions 不再"无中生有"(0.3.21)** ⭐:0.3.19 加的"主动探测外部 Vivado"在装了 VMware / Hyper-V 虚拟网卡的机器上会**偶发误报**——端口 10000 上其实是虚拟网卡服务凑巧回了类 JSON 的数据,被错认成 Vivado。本版给握手加**随机 token**(`puts VMCP_PROBE_<uuid>`),服务端必须把 token 原样回弹才算真 Vivado——假阳性归零
+> - **Vivado 报错时自动多送一句"清理指南"(0.3.20)** ⭐:wave 类命令(`open_wave_database` / `add_wave` / `log_wave` 等)失败时,Vivado GUI 会留下**孤儿 simulation tab + 几百 MB 内存浪费**。本版在错误输出末尾自动追加可复制的 `close_sim` / `close_wave_config` 清理脚本片段,AI 不用主动查 quirks;同时 `run_tcl` 工具描述里塞进 4 条 XSim 写脚本静默踩坑(如 `set_property RADIX` 必须小写 `dec` 不能大写 `DEC`)。**契约**:原始 Vivado 输出**不改写,只追加**
+> - **手动开的 Vivado GUI 现在能"接力"(0.3.19)** ⭐:你自己跑 `vivado -mode gui`(`vivado-mcp install` 已注入 init.tcl 让它自动开 TCP server),之后从 AI 调 `start_session(mode="gui")` **不会再 spawn 第二个 GUI 孤儿**,而是直接 attach 到你那台——端口冲突 + 800 MB 内存浪费的老坑没了。`list_sessions` 也会把你手动开的列为 `<external@端口>`,并注明"stop_session 无权关闭,请在 GUI 内手动 exit"
+> - **中文 Windows stdio mode 输出对齐(0.3.18)** ⭐:0.3.17 及之前 `run_tcl` 在中文 Win 上返回的路径含中文时会变 `锟斤拷` / `���`(Vivado stdout 默认 CP936/GBK,但 session.py 强制 UTF-8 decode)。新增 `decode_vivado_output()` —— UTF-8 严格 decode + 含 U+FFFD 时 fallback `mbcs`(系统 code page),全链路对齐。**仅影响 tcl/stdio 模式**,GUI mode TCP UTF-8 协议本来就 OK
+> - **XSim 仿真坑摘要自动注入 run_tcl docstring(0.3.18)**:0.3.17 用户实战踩了一遍 XSim 的 9 个 Tcl 写法坑(`add_wave_group` 必须 `-into $g` / escaped id 必须 `current_scope` 切上下文 / `remove_wave` 只认 `[get_waves *]` / `xsim -tclbatch` 必须显式 `quit` 等)。这些坑的精简摘要直接塞到 `run_tcl` docstring 末尾 —— AI 每次拿到工具描述就能看到,不用等踩了再问
+> - **仿真失败自动剥洋葱(0.3.16)**:`launch_simulation` 失败 + xsim/*.log 全空时(Win 11 24H2 默认安全策略 + Vivado 2019.1 spawn bug 的经典坑),`get_critical_warnings(run_name='sim_1')` 自动 `-scripts_only` 触发 .bat 生成,在 Vivado session 内顺序 `exec` compile/elaborate.bat 抓真错,直接告诉你"是 wrapper 失败还是 RTL 失败" + 给一行 `reg add` 根治命令
+> - **环境陷阱启动自检(0.3.14 / 0.3.16 / 0.3.18)**:`start_session` 检测中文路径(2019.x TclStackFree,**0.3.18 扩警告:GUI session 内 cd/open_project 中文路径同样触发**)+ Win 11 24H2 `NoDefaultCurrentDirectoryInExePath`=1 + 注册表策略,踩坑前先给警告
+> - **时序违例自动定位(0.3.9)**:`get_timing_report` 违例时自动跑 `report_timing -max_paths 10`,嗅探 5 种模式(CDC / HIGH_FANOUT / LONG_COMBO / IO_UNREGISTERED / UNKNOWN)并给出具体 Tcl 修复命令,不再让你对着时序日志发呆
+> - **CW 修复效果可视化(0.3.9)**:`get_critical_warnings(compare_with_last=True)` 对比上次快照,报告"已消除 N 条 / 新出现 N 条 / 仍存在 N 条",让"改 XDC 有没有改到点子上"直接有数
+> - **长任务可视化**:`get_run_progress` 让 10-30 分钟的综合/实现不再是黑盒
+> - **新手引导**:`get_next_suggestion` 根据项目状态告诉你下一步该干啥
+> - **XDC 一键自修**:`xdc_auto_fix` 自动补 IOSTANDARD 和 create_clock period
+> - **外部 Verilog 预检**:`verilog_compile_check` 用 iverilog/verilator,比 Vivado 综合快 50 倍
+> - **IP 老化检测**:`get_ip_status` 扫出项目里哪些 IP 需要升级
+> - **Commit 摘要**:`get_pre_commit_summary` 生成 WNS/资源/CW 的 markdown 片段直接贴 commit body
+>
+> 详见 [CHANGELOG](CHANGELOG.md)。
+
+</details>
+
+## 设计哲学 — 为什么是 30 个工具而不是 500 个？
+
+主流 Vivado MCP（如 SynthPilot）动辄 500+ 工具，每个工具本质是一行 Tcl 包装。问题是：
+
+- **每个工具都占用 AI 上下文**（工具签名注入到每次系统提示）→ 调不调都烧 token
+- **大模型比我们更会拼 Tcl**（`create_bd_cell` 这种就是写一行 Tcl 的事）
+- **绝大多数 facade 工具做的事 `run_tcl("...")` 能做**
+
+本项目只保留**真正有本地价值**的工具——Tcl 做不了或做不好的事：
+
+1. **结构化解析**：IO / 时序报告 → JSON / 中文摘要（比原始表格省 token）
+2. **本地知识库**：CRITICAL WARNING 按 ID 分类 + 中文修复建议（Tcl 里写这个太难）
+3. **跨命令协议**：sentinel、会话管理、超时、比特流前置安全检查
+4. **跨会话工具**：`compare_xci` 纯 Python 对比两个 XCI 文件，不需要 Vivado
+
+其他（BD / 仿真 / XSCT / 硬件调试 / IP 配置等）全部交给 `run_tcl`，让大模型自己拼 Tcl。
+
+## 特性
+
+- **双模式会话**：默认 GUI 可视化（能看到 Vivado 图标 + Tcl Console 实时输出），也支持无头 CI 模式和 attach 已开 GUI
+- **30 个精简工具 + 可选 Hook 配置示例** — 覆盖完整 FPGA 开发流程 + 智能诊断 + 新手引导 + 外部工具链联动
+- **智能诊断** — 综合/实现后自动提取 CRITICAL WARNING / ERROR 分类 + 中文修复建议（含 18+ 种已知 ID）
+- **IO 验证** — XDC 约束（**支持 -dict 和传统两种语法**）对比实际引脚分配，GT 端口不匹配标记为 CRITICAL
+- **IP 调试** — 查询 IP 所有 CONFIG.* 参数（含 GUI 隐藏参数）、纯 Python 对比两个 XCI 文件
+- **Bitstream 安全检查** — 生成比特流前自动检测 CRITICAL WARNING 并阻止（可 force 跳过）
+- **结构化报告** — IO 和时序报告解析为 JSON，便于 AI 精确提取数值（**不再有"假 PASS"陷阱**）
+- **安全转义** — `safe_tcl` 自动对路径/标识符做 Tcl list 转义，Windows 含空格/中文/$ 的路径也能用
+- **多会话支持** — 默认复用端口 9999 的单个 GUI（不同 session_id 也 attach 同一台）；传 `port=0` 自动分配空闲端口启动独立实例；server 只绑单一端口，被占即退出不滑动
 
 ## 会话模式
 

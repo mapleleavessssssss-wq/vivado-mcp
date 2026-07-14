@@ -14,7 +14,7 @@
 - [ ] 跑过 `ruff check src/ tests/`,无新增警告
 - [ ] 改了行为的话,**新增/更新了对应测试**
 - [ ] 改了用户可见行为的话,**更新了 README / CHANGELOG**
-- [ ] 如果触及 `vivado/` 协议层 或 `tcl_scripts.py`,我读过了 `.trellis/spec/backend/tcl-protocol-guidelines.md`
+- [ ] 如果触及 `vivado/` 协议层 或 `tcl_scripts.py`,我读过了 `CONTRIBUTING.md` 的「Tcl 协议规则」一节
 - [ ] 如果新增 MCP 工具,我确认过**不能**用 `run_tcl` 直接做(参考 README"少即是多"段)
 
 ## 实机验证(可选但强烈推荐)
