@@ -1,5 +1,44 @@
 # Changelog
 
+## [未发布]
+
+> GitHub issue #2(Vivado 2022.2 / Win10 GUI 模式 `launch_simulation` 报
+> `[Common 17-180] Spawn failed: Broken pipe`)触发的诊断链补强。定性:该报错是
+> Vivado **自身 spawn 子进程失败**(最常见根因:杀软拦截 .bat / 工程在
+> Desktop-OneDrive 同步目录),非 MCP 功能 bug;但现有诊断引导有三个短板,本轮修复。
+
+### 诊断链修复(issue #2)
+
+- **新增 `Spawn failed` 专项 W-hint**(`server.py`):`run_tcl` 输出含
+  `Spawn failed` 时自动追加根因清单(杀软拦截 / OneDrive 同步目录 /
+  `NoDefaultCurrentDirectoryInExePath` 策略,按概率排序)+ 引导调
+  `get_critical_warnings(run_name='sim_1')` 做判别实验。`error_only=False`:
+  AI 用 `catch {launch_simulation}` 包裹(rc=0)时也触发。此前该报错的真错文本
+  只出现在 run_tcl 返回里,不落任何日志,日志扫描层物理上打不到。
+- **修 scripts-only fallback 的假 "✓" 结论**(`tcl_scripts.py` RUN_BAT_STEP +
+  `warning_parser.py`):Tcl `exec` 的子进程 POSIX spawn 失败 / 被杀
+  (CHILDKILLED,杀软场景)此前被并进 rc=0,fallback 输出"✓ 复刻的 .bat 步骤
+  全部正常退出…wrapper 失败而非脚本失败"的假结论,把杀软拦截误导向改注册表。
+  现细分 errorcode:非 CHILDSTATUS/NONE 置 rc=-4,渲染"✗ 子进程未正常退出"
+  (全量展示被杀前输出 + errorcode 原文)+ 杀软定向结论,并停跑后续步骤。
+  **协议变更**:`VMCP_BAT_RUN:rc=` 取值域新增 -4(解析/渲染侧已同步)。
+  顺带修 Linux:RUN_BAT_STEP 此前对 glob 到的 .sh 硬跑 `exec cmd /c`(Linux 无
+  cmd,必然 POSIX ENOENT 假结论),现按 `$::tcl_platform(platform)` 分派
+  `cmd /c` / `sh`。
+- **空日志不再击穿 fallback 触发条件**(`diagnostic_tools.py`):spawn 秒死场景
+  launcher 可能留下 0 字节 xsim log,此前一个空文件就绕过 scripts-only fallback,
+  掉进"未命中关键词、加大 tail_n"的死胡同。现在"日志全缺 或 全空"都触发 fallback。
+
+### 文档 / 展示页
+
+- README 首屏重排:新增「环境要求」小节 + 英文 TL;DR + 单行目录;「快速开始」
+  前移到第二屏;18 行的「0.3 系列新增了什么」折叠进 `<details>`(内容不变)
+- `CONTRIBUTING.md` 新增「Tcl 协议规则」一节(sentinel 命名空间 / `__` 变量前缀 /
+  花括号转义等 6 条硬规则);PR 模板死链修复(此前引用未随仓库分发的
+  `.trellis/spec/` 内部路径,外部贡献者不可见,PR #1 作者实际踩到)
+- pyproject 元数据:keywords 补 `model-context-protocol` / `verilog` / `claude`,
+  classifiers 补 Windows / Linux,urls 补 Changelog(PyPI 页面渲染,下次发版生效)
+
 ## [0.3.23] — 2026-06-15
 
 > 本次 PyPI 发布(v0.3.23)同时包含下方 [0.3.22] 体检轮(此前已 commit 未 tag)。

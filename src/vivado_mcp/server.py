@@ -239,6 +239,43 @@ def _looks_like_project_not_found(output: str, command: str) -> bool:
     )
 
 
+# 0.3.24(issue #2):[Common 17-180] Spawn failed = Vivado 自身 spawn 子进程失败
+# (compile.bat 起不来/秒死),真错不落在任何日志里,W-hint 层是唯一拦截点。
+_HINT_SPAWN_FAILED = (
+    "\n\n⚠ 'Spawn failed' 是 Vivado **自身 spawn 子进程失败**(如 compile.bat 起不来"
+    "或刚启动就被终止),不是 HDL 编译错误,compile.log 多半没生成。常见根因按概率:"
+    "\n  1. 杀软/安全软件拦截 .bat / xvlog 子进程('Broken pipe' 变体的已知公开案例根因)"
+    "→ 查 Windows 安全中心保护历史 / 360 / 火绒拦截记录,把 Vivado 安装目录与工程目录加白"
+    "\n  2. 工程在 Desktop / OneDrive 同步目录 → 移到 C:/vivado_proj/ 之类短 ASCII 非同步路径"
+    "\n  3. NoDefaultCurrentDirectoryInExePath 策略('No such file or directory' 变体):"
+    "Win10 及更早该变量**存在即生效**,用 reg delete \"HKCU\\Environment\" /v"
+    " NoDefaultCurrentDirectoryInExePath /f 删除;Win11 24H2+ 默认开启,需 reg add"
+    " \"HKCU\\Environment\" /v NoDefaultCurrentDirectoryInExePath /d 0 /f。改完注销重登"
+    "\n下一步: 调 get_critical_warnings(run_name='sim_1') 兜底诊断 —— 日志全缺/全空时"
+    "自动走 scripts-only fallback,在 Vivado session 内用完整路径复刻 compile/elaborate,"
+    "既是绕过也是判别实验(fallback 能过 = wrapper/策略问题;fallback 也 spawn 失败 = "
+    "杀软拦一切子进程)。"
+)
+
+
+def _looks_like_spawn_failed(output: str, command: str) -> bool:
+    """[Common 17-180] Spawn failed:子进程起不来/秒死,非编译错误。
+
+    error_only=False:AI 用 catch {launch_simulation} 包裹时 rc=0,
+    但输出里的 ERROR 行仍在,hint 不能因 rc=0 静默。
+    裸 'Spawn failed' 子串太泛(用户 grep 任意日志也可能含),须伴随
+    Vivado 消息 ID 或仿真上下文才触发。
+    """
+    if "Spawn failed" not in output:
+        return False
+    haystack = command + "\n" + output
+    return (
+        "[Common 17-180]" in output
+        or "[USF-XSim" in output
+        or "launch_simulation" in haystack
+    )
+
+
 # 超时 hint:_safe_execute except 分支命中超时类异常时追加(超时≠命令失败)
 _HINT_TIMEOUT = (
     "\n\n提示: 超时≠命令失败:Vivado 仍在执行,本 session 在该命令完成前不可用。"
@@ -258,6 +295,7 @@ _QUIRK_HINTS: tuple[tuple, ...] = (
     (_looks_like_scripts_only_regen, _HINT_SCRIPTS_ONLY_REGEN, False),
     (_looks_like_wcfg_bom_corrupt, _HINT_WCFG_BOM_CORRUPT, False),
     (_looks_like_project_not_found, _HINT_PROJECT_NOT_FOUND, False),
+    (_looks_like_spawn_failed, _HINT_SPAWN_FAILED, False),
 )
 
 

@@ -1491,6 +1491,50 @@ class TestSimDiagnose:
         assert session.execute.call_count == 3
 
     @pytest.mark.asyncio
+    async def test_all_empty_logs_treated_as_missing_triggers_fallback(self):
+        """issue #2:spawn 秒死可能留下 0 字节日志,全空日志视同未生成走 fallback。
+
+        此前一个空 compile.log 就击穿 `not logs` 条件,掉进"未命中关键词、
+        加大 tail_n"的死胡同(空日志里不可能有可诊断内容)。
+        """
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        sim_out = (
+            "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+            "VMCP_SIM:log_count=1\n"
+            "VMCP_SIM_LOG_START:C:/proj/proj.sim/sim_1/behav/xsim/compile.log\n"
+            "VMCP_SIM_LOG_END:C:/proj/proj.sim/sim_1/behav/xsim/compile.log\n"
+            "VMCP_SIM_DONE\n"
+        )
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(sim_out),
+                _make_tcl_result("VMCP_TARGET_SIM:XSim"),
+                _make_tcl_result(
+                    "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_BAT:scripts_only=already_present\n"
+                    "VMCP_BAT_DONE\n"
+                ),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        assert "全为空" in result
+        assert "scripts_only" in result.lower() or "scripts-only" in result.lower()
+        # 不该掉进 tail 展示路径的"加大 tail_n"死胡同
+        assert "加大 tail_n" not in result
+        assert session.execute.call_count == 3
+
+    @pytest.mark.asyncio
     async def test_third_party_simulator_guard(self):
         """target_simulator 非 XSim 时:日志拍空是预期,返回指引而不是误导诊断。"""
         from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
@@ -1722,6 +1766,67 @@ class TestSimBatFallback:
         # session.execute 共 5 次:TAIL_SIM_LOGS + QUERY_TARGET_SIMULATOR +
         # LAUNCH_SCRIPTS_AND_GLOB + 2 步 RUN_BAT_STEP
         assert session.execute.call_count == 5
+
+    def test_run_bat_step_template_renders_spawn_dead_branch(self):
+        """RUN_BAT_STEP 模板 .format 渲染不炸,且含 errorcode 三分支(issue #2)。"""
+        from vivado_mcp.tcl_scripts import RUN_BAT_STEP
+
+        tcl = RUN_BAT_STEP.format(bat_path="C:/proj/proj.sim/sim_1/behav/xsim/compile.bat")
+        assert 'eq "CHILDSTATUS"' in tcl
+        assert 'eq "NONE"' in tcl
+        assert "set __rc -4" in tcl
+        assert "Tcl exec errorcode" in tcl
+        # Linux 下 glob 到 .sh,必须按平台分派 runner(cmd /c 仅 Windows)
+        assert "$::tcl_platform(platform)" in tcl
+        assert "list sh $__bat" in tcl
+
+    @pytest.mark.asyncio
+    async def test_bat_step_killed_gives_av_conclusion_and_stops(self):
+        """compile 步被外部终止(rc=-4)→ 杀软定向结论,不出假 ✓,后续步骤跳过。"""
+        from vivado_mcp.tools.diagnostic_tools import get_critical_warnings
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_SIM:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_SIM:log_count=0\n"
+                    "VMCP_SIM_DONE\n"
+                ),
+                _make_tcl_result("VMCP_TARGET_SIM:XSim"),
+                _make_tcl_result(
+                    "VMCP_BAT:sim_dir=C:/proj/proj.sim/sim_1\n"
+                    "VMCP_BAT:scripts_only=already_present\n"
+                    "VMCP_BAT_FILE:compile|bat|C:/proj/proj.sim/sim_1/behav/xsim/compile.bat\n"
+                    "VMCP_BAT_FILE:elaborate|bat|C:/proj/proj.sim/sim_1/behav/xsim/elaborate.bat\n"
+                    "VMCP_BAT_DONE\n"
+                ),
+                # RUN_BAT_STEP compile → rc=-4(exec 的子进程被杀/spawn 失败)
+                _make_tcl_result(
+                    _bat_run_fail(
+                        -4,
+                        ["(Tcl exec errorcode: CHILDKILLED 123 SIGKILL killed)"],
+                    )
+                ),
+                # elaborate 因 stop_on_fail 跳过,不会再 execute
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.diagnostic_tools._require_session",
+            return_value=session,
+        ):
+            result = await get_critical_warnings(
+                run_name="sim_1", session_id="default", ctx=ctx
+            )
+
+        assert "未正常退出" in result
+        assert "安全软件" in result
+        assert "全部正常退出" not in result
+        # elaborate 被跳过:4 次 execute(TAIL + TARGET_SIM + GLOB + compile)
+        assert session.execute.call_count == 4
+        assert "前一步失败,跳过" in result
 
     @pytest.mark.asyncio
     async def test_compile_step_failure_surfaces_stderr(self):

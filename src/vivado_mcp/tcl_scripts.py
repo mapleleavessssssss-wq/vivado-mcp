@@ -611,13 +611,26 @@ set __rc 0
 set __orig_pwd [pwd]
 set __xsim_dir [file dirname $__bat]
 cd $__xsim_dir
-if {{[catch {{exec cmd /c $__bat}} __out __opt]}} {{
+# Windows 跑 .bat 用 cmd /c;Linux 下 glob 到的是 .sh,cmd 不存在,
+# 硬编码 cmd /c 会必然 POSIX ENOENT,被误判成"子进程失败"假结论
+if {{$::tcl_platform(platform) eq "windows"}} {{
+    set __runner [list cmd /c $__bat]
+}} else {{
+    set __runner [list sh $__bat]
+}}
+if {{[catch {{exec {{*}}$__runner}} __out __opt]}} {{
     set __ec [dict get $__opt -errorcode]
     if {{[llength $__ec] >= 3 && [lindex $__ec 0] eq "CHILDSTATUS"}} {{
         set __rc [lindex $__ec 2]
-    }} else {{
+    }} elseif {{[lindex $__ec 0] eq "NONE"}} {{
         # rc=0 但子进程写过 stderr,Tcl exec 也抛 error,errorcode=NONE
         set __rc 0
+    }} else {{
+        # POSIX(exec 自身 spawn 失败)/ CHILDKILLED(被杀,如杀软拦截)等:
+        # 子进程没有正常退出码。此前这里被并进 rc=0,fallback 会输出
+        # "全部正常退出" 的假结论,把杀软拦截误判成 wrapper 问题。
+        set __rc -4
+        append __out "\\n(Tcl exec errorcode: $__ec)"
     }}
 }}
 cd $__orig_pwd

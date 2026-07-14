@@ -18,6 +18,7 @@ from vivado_mcp.server import (
     _append_quirk_hints,
     _looks_like_project_not_found,
     _looks_like_scripts_only_regen,
+    _looks_like_spawn_failed,
     _looks_like_wcfg_bom_corrupt,
     _safe_execute,
 )
@@ -140,6 +141,56 @@ class TestB3ProjectNotFound:
         # Tcl glob 无 ** 递归语义:hint 必须教多层显式 glob,不得再出现 **/*.xpr
         assert "*/*/*.xpr" in result
         assert "**/*.xpr" not in result
+
+
+class TestSpawnFailedHint:
+    """issue #2:[Common 17-180] Spawn failed → 根因清单 + fallback 判别实验引导。"""
+
+    def test_trigger_positive(self):
+        assert _looks_like_spawn_failed(
+            "ERROR: [Common 17-180] Spawn failed: Broken pipe", "launch_simulation"
+        )
+
+    def test_trigger_negative(self):
+        assert not _looks_like_spawn_failed("INFO: launched", "launch_simulation")
+
+    def test_trigger_negative_bare_string_without_context(self):
+        # 裸 'Spawn failed' 子串(如用户 grep 无关日志)无消息 ID / 仿真上下文
+        # 不触发,避免 12 行 hint 追加到不相干输出
+        assert not _looks_like_spawn_failed(
+            "line 42: Spawn failed somewhere in an unrelated log", "puts $log"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hint_appended_on_error(self):
+        session = _session_returning(
+            "ERROR: [Common 17-180] Spawn failed: Broken pipe\n"
+            "ERROR: [USF-XSim-62] 'compile' step failed with error(s)",
+            1,
+        )
+        result = await _safe_execute(session, "launch_simulation", 30.0, "run_tcl")
+        # 根因清单 + 判别实验引导都要在
+        assert "安全软件" in result
+        assert "NoDefaultCurrentDirectoryInExePath" in result
+        assert "get_critical_warnings" in result
+
+    @pytest.mark.asyncio
+    async def test_hint_appended_on_rc0_catch_wrapped(self):
+        # AI 用 catch {launch_simulation} 包裹时 rc=0,但 ERROR 行仍在输出里,
+        # hint 不能因 rc=0 静默(error_only=False 语义)
+        session = _session_returning(
+            "ERROR: [Common 17-180] Spawn failed: Broken pipe", 0
+        )
+        result = await _safe_execute(
+            session, "catch {launch_simulation}", 30.0, "run_tcl"
+        )
+        assert "安全软件" in result
+
+    @pytest.mark.asyncio
+    async def test_no_hint_on_clean_output(self):
+        session = _session_returning("INFO: simulation launched", 0)
+        result = await _safe_execute(session, "launch_simulation", 30.0, "run_tcl")
+        assert "安全软件" not in result
 
 
 class TestA1SpuriousRc0:

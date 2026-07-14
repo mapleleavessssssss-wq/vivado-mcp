@@ -614,6 +614,9 @@ def format_bat_steps_section(
 
     all_ok = all(r.returncode == 0 for r in results if r.returncode != -1)
     failing = next((r for r in results if r.returncode > 0), None)
+    # -4:Vivado session 内 Tcl exec 的子进程未正常退出(POSIX spawn 失败 /
+    # CHILDKILLED 被杀)—— fallback 自己也被拦,是杀软场景的强信号
+    spawn_dead = next((r for r in results if r.returncode == -4), None)
 
     for r in results:
         lines.append(f"--- {r.step} ({r.bat_path}) ---")
@@ -623,6 +626,13 @@ def format_bat_steps_section(
             lines.append("  ✗ 超时(子进程未在限定时间内结束)")
         elif r.returncode == -3:
             lines.append(f"  ✗ spawn 失败: {r.stderr_tail}")
+        elif r.returncode == -4:
+            # 子进程被杀前的部分输出正是判别证据,与 rc>0 分支一致全量展示
+            lines.append("  ✗ Tcl exec 子进程未正常退出(spawn 失败或被外部终止)")
+            if r.stderr_tail.strip():
+                lines.append("  输出尾部:")
+                for ln in r.stderr_tail.splitlines():
+                    lines.append(f"    | {ln}")
         else:
             lines.append(f"  returncode = {r.returncode}")
             if r.stderr_tail.strip():
@@ -638,6 +648,14 @@ def format_bat_steps_section(
     if failing:
         lines.append(
             f"⚠ {failing.step} 步骤 returncode={failing.returncode},真错很可能就在这一步的 stderr。"
+        )
+    elif spawn_dead:
+        lines.append(
+            f"⚠ {spawn_dead.step} 步骤在 fallback 里同样 spawn 失败/被终止 —— 与"
+            " launch_simulation 的 'Spawn failed' 症状一致。先看上方 errorcode 原文"
+            "判断失败类别;Windows 上高度怀疑安全软件拦截 .bat / 子进程执行,查杀软"
+            "拦截记录(Windows 安全中心保护历史 / 360 / 火绒),把 Vivado 安装目录与"
+            "工程目录加入白名单后重试。"
         )
     elif all_ok:
         lines.append(

@@ -307,7 +307,13 @@ async def _diagnose_sim_run(session, run_name: str, tail_n: int) -> str:
     simulator = await _get_target_simulator(session)
     non_xsim = bool(simulator) and simulator.lower() != "xsim"
 
-    if not logs:
+    # 日志"存在但 tail 区间全为空白"视同未生成:spawn 秒死时 launcher 可能先
+    # touch 了空 log,一个空文件就击穿 `not logs` 会掉进"未命中关键词、加大
+    # tail_n"的死胡同。注意判据是 TAIL_SIM_LOGS 回传的 tail 区间(非文件大小),
+    # 文件有内容但尾部全空行的场景会被一并触发,reason 里给出逃生口。
+    logs_all_empty = all(not lg.body.strip() for lg in logs)
+
+    if not logs or logs_all_empty:
         if non_xsim:
             sim_lc = simulator.lower()
             return (
@@ -327,9 +333,17 @@ async def _diagnose_sim_run(session, run_name: str, tail_n: int) -> str:
         # (见 _run_sim_bat_fallback;0.3.15 的 MCP 进程 spawn 方案因 PATH
         # 假阳性已返工),把 Vivado 吞掉的真错暴露出来。
         fallback = await _run_sim_bat_fallback(session, run_name, tail_n)
+        reason = (
+            f"未找到 xsim 日志文件(预期 {sim_dir}/*/xsim/*.log)"
+            if not logs
+            else (
+                f"xsim 日志存在但 tail 区间全为空白({len(logs)} 个文件,视同未生成;"
+                "若确认文件实际有内容,改用更大 tail_n 直接查看)"
+            )
+        )
         return (
             f"仿真目录: {sim_dir}\n"
-            f"未找到 xsim 日志文件(预期 {sim_dir}/*/xsim/*.log) —— "
+            f"{reason} —— "
             "launch_simulation 可能在 spawn .bat 之前就炸了,走 scripts-only fallback:\n\n"
             f"{fallback}"
         )

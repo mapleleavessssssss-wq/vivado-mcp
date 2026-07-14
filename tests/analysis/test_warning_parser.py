@@ -779,6 +779,27 @@ class TestFormatBatStepsSection:
         out = format_bat_steps_section(results, "ok", "/x")
         assert "spawn 失败" in out
 
+    def test_spawn_dead_marker_and_av_conclusion(self):
+        """-4(issue #2):Tcl exec 的子进程未正常退出(POSIX spawn 失败/被杀软终止)。
+
+        此前该场景被并进 rc=0,输出"✓ 全部正常退出…wrapper 失败"的假结论,
+        把杀软拦截误导向改注册表。锁住:不出假 ✓,给杀软定向结论。
+        """
+        results = [
+            BatStepResult(
+                "compile",
+                "/x/c.bat",
+                -4,
+                "",
+                "partial output\n(Tcl exec errorcode: CHILDKILLED 123 SIGKILL killed)",
+            ),
+        ]
+        out = format_bat_steps_section(results, "already_present", "/x")
+        assert "未正常退出" in out
+        assert "Tcl exec errorcode" in out
+        assert "全部正常退出" not in out
+        assert "安全软件" in out
+
 
 class TestParseBatRunOutput:
     """RUN_BAT_STEP 协议(0.3.16)解析。"""
