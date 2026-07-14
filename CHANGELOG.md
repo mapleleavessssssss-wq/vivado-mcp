@@ -7,6 +7,15 @@
 > Vivado **自身 spawn 子进程失败**(最常见根因:杀软拦截 .bat / 工程在
 > Desktop-OneDrive 同步目录),非 MCP 功能 bug;但现有诊断引导有三个短板,本轮修复。
 
+### 社区贡献
+
+- **兼容 Vivado 2018.x IPDEF-only IP 元数据**(#1,@czaozhiyuan):2018.x 的 IP
+  对象只有 `IPDEF` 没有 `VLNV` 属性,`inspect_ip_params` / `get_project_info`
+  的裸 `get_property VLNV` 会报 `Common 17-39` 提前失败。现先 `list_property`
+  探测,优先 VLNV、fallback IPDEF、都没有则 `<unknown>`;VLNV 存在时(2019.1+)
+  行为不变。贡献者真机 Vivado 2018.3 验证。残余风险留档:`list_property` 在
+  2018.x IP 对象上的可靠性依赖该真机验证(旧代码在 2018.x 上从未执行到这一步)。
+
 ### 诊断链修复(issue #2)
 
 - **新增 `Spawn failed` 专项 W-hint**(`server.py`):`run_tcl` 输出含
