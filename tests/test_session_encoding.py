@@ -11,6 +11,20 @@ import pytest
 from vivado_mcp.vivado.tcl_utils import decode_vivado_output
 
 
+def _win_ansi_codepage() -> int:
+    """Windows 系统 ANSI 代码页;非 Windows 返回 0。
+
+    mbcs = 系统 ANSI 代码页:GBK 字节只有在 CP936(中文 Windows)上才能
+    经 mbcs 还原成中文。GitHub Actions 的 windows runner 是 en-US(CP1252),
+    GBK 字节会被解成 Latin 乱码——不是 bug,是别的系统语言。
+    """
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+
+    return ctypes.windll.kernel32.GetACP()
+
+
 class TestDecodeVivadoOutput:
     """字节流解码策略测试(协议层穿透,不依赖 subprocess)。"""
 
@@ -35,8 +49,9 @@ class TestDecodeVivadoOutput:
         assert decode_vivado_output(b"") == ""
 
     @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="mbcs fallback 只在 Windows 上有意义",
+        _win_ansi_codepage() != 936,
+        reason="GBK 经 mbcs 还原仅在 ANSI 代码页=CP936(中文 Windows)成立,"
+        "en-US runner(CP1252)会解成 Latin 乱码",
     )
     def test_gbk_chinese_fallback_windows(self):
         """GBK 字节流在 Windows 上 fallback 到 mbcs(CP936),完整还原。
@@ -53,8 +68,9 @@ class TestDecodeVivadoOutput:
         assert decode_vivado_output(gbk_bytes) == text
 
     @pytest.mark.skipif(
-        sys.platform != "win32",
-        reason="mbcs fallback 只在 Windows 上有意义",
+        _win_ansi_codepage() != 936,
+        reason="GBK 经 mbcs 还原仅在 ANSI 代码页=CP936(中文 Windows)成立,"
+        "en-US runner(CP1252)会解成 Latin 乱码",
     )
     def test_gbk_mixed_ascii_chinese_windows(self):
         """GBK 字节流含 ASCII + 中文混排:VMCP 前缀 + 中文 value 场景。"""

@@ -38,6 +38,13 @@
   launcher 可能留下 0 字节 xsim log,此前一个空文件就绕过 scripts-only fallback,
   掉进"未命中关键词、加大 tail_n"的死胡同。现在"日志全缺 或 全空"都触发 fallback。
 
+### CI 修复
+
+- **修 ci.yml windows 矩阵长红**(2026-05-25 起持续 failure,README 的 CI 徽章
+  一直是红的):0.3.18 加的两条 GBK→mbcs 还原测试隐含假设系统 ANSI 代码页 =
+  CP936(中文 Windows),GitHub 的 en-US runner(CP1252)把 GBK 字节解成 Latin
+  乱码必然失败。现按 `GetACP() == 936` gate,中文 Windows 开发机上仍实跑。
+
 ### 文档 / 展示页
 
 - README 首屏重排:新增「环境要求」小节 + 英文 TL;DR + 单行目录;「快速开始」
