@@ -53,9 +53,6 @@
   一直是红的):0.3.18 加的两条 GBK→mbcs 还原测试隐含假设系统 ANSI 代码页 =
   CP936(中文 Windows),GitHub 的 en-US runner(CP1252)把 GBK 字节解成 Latin
   乱码必然失败。现按 `GetACP() == 936` gate,中文 Windows 开发机上仍实跑。
-- **官方 Actions 升级到 v7**：`actions/checkout` / `actions/setup-python` 从
-  Node.js 20 版本升级到当前 Node.js 24 版本，消除 GitHub Hosted Runner 的弃用警告。
-
 ### 文档 / 展示页
 
 - README 首屏重排：明确目标用户、本地 Vivado 边界与 MCP SDK 2.x 依赖；新增
