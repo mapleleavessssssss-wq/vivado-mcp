@@ -7,15 +7,24 @@
 
 精简的 [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) Server，通过 **30 个精简工具** 控制 Xilinx Vivado EDA——少即是多。
 
+适合希望由 Claude Code、Cursor、Codex 等 MCP 客户端驱动**本地 Vivado** 的 FPGA 开发者；它不是云端综合服务，使用前需要在本机安装 Vivado。工具描述和诊断建议以中文为主。
+
 > **TL;DR (English)** — A lean MCP server that lets AI agents (Claude Code, Cursor, etc.) drive Xilinx Vivado: synthesis, implementation, XSim simulation & waveforms, timing / CRITICAL WARNING diagnostics — 30 curated tools, everything else via raw `run_tcl`. Docs and diagnostic messages are in Chinese.
 
 **目录**:[环境要求](#环境要求) · [快速开始](#快速开始) · [设计哲学](#设计哲学--为什么是-30-个工具而不是-500-个) · [特性](#特性) · [会话模式](#会话模式) · [工具列表](#工具列表) · [Hook 配置](#可选claude-code-hook-配置示例) · [使用示例](#使用示例--一轮完整的调试闭环) · [架构](#架构) · [CLI 参考](#cli-参考) · [反馈](#反馈与-bug-提交)
 
 ## 环境要求
 
-- **Python ≥ 3.10**,Windows / Linux
-- **Xilinx Vivado**:作者长期实测 **2019.1**;协议层为纯 Tcl,2018.3 / 2022.2 已有社区用户实际使用(见 issues / PR),其他版本理论兼容
-- **零额外依赖** — 仅依赖 `mcp` SDK,测试无需 Vivado
+- **Python ≥ 3.10**，Windows / Linux
+- **Xilinx Vivado**：必须安装在运行 vivado-mcp 的本机
+- **MCP Python SDK 2.x**：唯一直接运行时依赖，`pip` 会自动安装
+
+| Vivado 版本 | 验证范围 | 结论 |
+|---|---|---|
+| 2019.1 | 作者长期实测，GUI / Tcl / attach 与完整 FPGA 流程 | 主要支持基线 |
+| 2018.3 | 社区贡献者验证 IPDEF-only IP 元数据（[PR #1](https://github.com/mapleleavessssssss-wq/vivado-mcp/pull/1)） | 对应兼容路径已覆盖 |
+| 2022.2 | Windows 10 GUI/XSim 社区现场（[Issue #2](https://github.com/mapleleavessssssss-wq/vivado-mcp/issues/2)） | 已吸收诊断经验 |
+| 其他版本 | 协议层为纯 Tcl，未持续做真机矩阵 | 理论兼容，建议先跑下方冒烟验证 |
 
 ## 快速开始
 
@@ -35,7 +44,7 @@ vivado-mcp install
 
 如果 Vivado 装在受保护目录（如 `C:\Program Files\`），用管理员身份运行命令即可。
 
-### 3. 配置 Claude Code
+### 3. 配置 MCP 客户端（以 Claude Code 为例）
 
 将以下内容复制到 `~/.claude.json` 的 `mcpServers` 字段中：
 
@@ -44,7 +53,7 @@ vivado-mcp install
   "command": "python",
   "args": ["-m", "vivado_mcp"],
   "env": {
-    "VIVADO_PATH": "D:/Xilinx/Vivado/2024.1/bin/vivado.bat"
+    "VIVADO_PATH": "D:/Xilinx/Vivado/2019.1/bin/vivado.bat"
   },
   "type": "stdio"
 }
@@ -52,12 +61,24 @@ vivado-mcp install
 
 > 将 `VIVADO_PATH` 替换为你的 Vivado 实际路径：
 > - **Windows**: `"D:/Xilinx/Vivado/2019.1/bin/vivado.bat"`
-> - **Linux**: `"/opt/Xilinx/Vivado/2024.1/bin/vivado"`
+> - **Linux**: `"/opt/Xilinx/Vivado/<版本>/bin/vivado"`
 > - 也可以不设置 `VIVADO_PATH`，将 Vivado `bin` 目录加入系统 `PATH`。
+>
+> `VIVADO_PATH` 负责让 MCP server 找到 Vivado 可执行文件；上一步的 `vivado-mcp install` 负责给 GUI/attach 模式注入 TCP server。其他支持 stdio MCP 的客户端使用相同的 `command`、`args` 和 `env`，配置文件位置以客户端文档为准。
 
-### 4. 重启 Claude Code
+### 4. 重启 MCP 客户端
 
-配置完成后重启 Claude Code，即可使用 30 个 Vivado 工具。
+配置完成后重启客户端，即可加载 30 个 Vivado 工具。
+
+### 5. 冒烟验证
+
+在客户端中发送：
+
+```text
+启动一个 GUI 会话，然后执行 Tcl: version -short
+```
+
+AI 应依次调用 `start_session(mode="gui")` 和 `run_tcl("version -short")`。成功时 Vivado GUI 会启动（已有注入服务则直接 attach），并返回版本号；若失败，先检查 `VIVADO_PATH`，再运行 `vivado-mcp install` 重新注入。
 
 <details>
 <summary>从源码安装（开发/贡献）</summary>
@@ -72,7 +93,7 @@ pip install -e ".[dev]"
 <details>
 <summary><b>0.3 系列新增了什么</b>(点击展开)</summary>
 
-> - **list_sessions 不再"无中生有"(0.3.21)** ⭐:0.3.19 加的"主动探测外部 Vivado"在装了 VMware / Hyper-V 虚拟网卡的机器上会**偶发误报**——端口 10000 上其实是虚拟网卡服务凑巧回了类 JSON 的数据,被错认成 Vivado。本版给握手加**随机 token**(`puts VMCP_PROBE_<uuid>`),服务端必须把 token 原样回弹才算真 Vivado——假阳性归零
+> - **list_sessions 不再"无中生有"(0.3.21)** ⭐:0.3.19 加的"主动探测外部 Vivado"在装了 VMware / Hyper-V 虚拟网卡的机器上会**偶发误报**——端口 10000 上其实是虚拟网卡服务凑巧回了类 JSON 的数据,被错认成 Vivado。本版给握手加**随机 token**(`puts VMCP_PROBE_<uuid>`),服务端必须把 token 原样回弹才算真 Vivado,消除已知假阳性
 > - **Vivado 报错时自动多送一句"清理指南"(0.3.20)** ⭐:wave 类命令(`open_wave_database` / `add_wave` / `log_wave` 等)失败时,Vivado GUI 会留下**孤儿 simulation tab + 几百 MB 内存浪费**。本版在错误输出末尾自动追加可复制的 `close_sim` / `close_wave_config` 清理脚本片段,AI 不用主动查 quirks;同时 `run_tcl` 工具描述里塞进 4 条 XSim 写脚本静默踩坑(如 `set_property RADIX` 必须小写 `dec` 不能大写 `DEC`)。**契约**:原始 Vivado 输出**不改写,只追加**
 > - **手动开的 Vivado GUI 现在能"接力"(0.3.19)** ⭐:你自己跑 `vivado -mode gui`(`vivado-mcp install` 已注入 init.tcl 让它自动开 TCP server),之后从 AI 调 `start_session(mode="gui")` **不会再 spawn 第二个 GUI 孤儿**,而是直接 attach 到你那台——端口冲突 + 800 MB 内存浪费的老坑没了。`list_sessions` 也会把你手动开的列为 `<external@端口>`,并注明"stop_session 无权关闭,请在 GUI 内手动 exit"
 > - **中文 Windows stdio mode 输出对齐(0.3.18)** ⭐:0.3.17 及之前 `run_tcl` 在中文 Win 上返回的路径含中文时会变 `锟斤拷` / `���`(Vivado stdout 默认 CP936/GBK,但 session.py 强制 UTF-8 decode)。新增 `decode_vivado_output()` —— UTF-8 严格 decode + 含 U+FFFD 时 fallback `mbcs`(系统 code page),全链路对齐。**仅影响 tcl/stdio 模式**,GUI mode TCP UTF-8 协议本来就 OK
@@ -183,7 +204,7 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI,跑得更快
 | `verify_io_placement_tool` | 对比 XDC 约束（-dict/传统两种语法）与实际 IO 布局，GT 不匹配标为 CRITICAL |
 | `xdc_lint` | **0.3.0** 纯 Python 静态 XDC 检查(PIN_CONFLICT / 漏 IOSTANDARD / DUPLICATE_PORT / CLOCK_NO_PERIOD / 跨文件冲突),不需 Vivado |
 | `xdc_auto_fix` | **0.3.3** 自动补 IOSTANDARD + create_clock -period,dry_run 预览 + 板卡 profile(basys3/nexys-a7/arty-a7/zybo/kc705),不碰 PIN_CONFLICT |
-| `verilog_compile_check` | **0.3.4** 用 iverilog / verilator 做语法 + 连接性检查,比 Vivado 综合快 50 倍。未装返回 SKIP + 安装指引,支持 Windows+scoop 路径自动发现 |
+| `verilog_compile_check` | **0.3.4** 用 iverilog / verilator 做语法 + 连接性检查,通常远快于完整 Vivado 综合。未装返回 SKIP + 安装指引,支持 Windows+scoop 路径自动发现 |
 
 ### IP 调试
 | 工具 | 说明 |
@@ -296,7 +317,7 @@ AI: [调用 start_session(mode="tcl")] → 无 GUI,跑得更快
 
 ## 使用示例 — 一轮完整的调试闭环
 
-下面是实机(Vivado 2019.1 + basys3 + Kintex-7)跑出来的真实片段,串起 `get_critical_warnings` → XDC 修复 → `compare_with_last` 验证 → 时序自动诊断 → 烧板的完整闭环。
+下面是 Vivado 2019.1 的两组实机片段：Basys 3 工程用于演示 IO/DRC 修复，独立的 Kintex-7 PCIe XDMA 工程用于演示时序诊断。两组结果串起 `get_critical_warnings` → XDC 修复 → `compare_with_last` 验证 → 时序自动诊断 → 烧板的完整闭环。
 
 ### 起点:打开项目,立刻看 ERROR / CW 详情
 
@@ -434,7 +455,7 @@ AI Tool (Claude/Cursor/Codex) ──(stdio MCP)──▶  vivado-mcp
 **核心协议**：
 - **subprocess 模式**：`catch + UUID sentinel`（stdio 分帧，修复了 0.1.0 的行顺序 bug）
 - **GUI/attach 模式**：TCP length-prefix framing（4 字节 BE + UTF-8 payload）
-- 命令通过十六进制编码传输，防 Tcl 注入、支持任何字符
+- 命令通过十六进制编码传输，避免 Tcl 注入，并覆盖含空格、中文和特殊字符的路径
 
 ## CLI 参考
 

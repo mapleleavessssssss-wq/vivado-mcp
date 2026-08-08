@@ -1,6 +1,11 @@
 # Changelog
 
-## [未发布]
+## [0.3.24] — 2026-08-08
+
+> MCP Python SDK 2.0 发布后，PyPI 上的 `mcp>=1.0.0` 会解析到不兼容的 v2，
+> 导致 vivado-mcp 新安装环境启动即报 `ModuleNotFoundError`。本版完成 SDK v2
+> 迁移，并一并发布自 0.3.23 以来已在 main 验证的诊断、Vivado 2018.x 兼容、
+> CI 与展示页改进。测试基线 754 → 766。
 
 > GitHub issue #2(Vivado 2022.2 / Win10 GUI 模式 `launch_simulation` 报
 > `[Common 17-180] Spawn failed: Broken pipe`)触发的诊断链补强。定性:该报错是
@@ -9,6 +14,10 @@
 
 ### 社区贡献
 
+- **迁移到 MCP Python SDK 2.x**（[#3](https://github.com/mapleleavessssssss-wq/vivado-mcp/pull/3)，[@Sapient610](https://github.com/Sapient610)）：
+  `FastMCP` / v1 `Context` 导入迁移到 `MCPServer` / v2 `Context`，依赖约束改为
+  `mcp>=2.0.0,<3`。已通过真实 stdio 握手、30 工具 + 1 Resource + 5 Prompts
+  注册与调用验证，以及 Ubuntu / Windows × Python 3.10 / 3.11 / 3.12 CI 矩阵。
 - **兼容 Vivado 2018.x IPDEF-only IP 元数据**(#1,@czaozhiyuan):2018.x 的 IP
   对象只有 `IPDEF` 没有 `VLNV` 属性,`inspect_ip_params` / `get_project_info`
   的裸 `get_property VLNV` 会报 `Common 17-39` 提前失败。现先 `list_property`
@@ -44,11 +53,16 @@
   一直是红的):0.3.18 加的两条 GBK→mbcs 还原测试隐含假设系统 ANSI 代码页 =
   CP936(中文 Windows),GitHub 的 en-US runner(CP1252)把 GBK 字节解成 Latin
   乱码必然失败。现按 `GetACP() == 936` gate,中文 Windows 开发机上仍实跑。
+- **官方 Actions 升级到 v7**：`actions/checkout` / `actions/setup-python` 从
+  Node.js 20 版本升级到当前 Node.js 24 版本，消除 GitHub Hosted Runner 的弃用警告。
 
 ### 文档 / 展示页
 
-- README 首屏重排:新增「环境要求」小节 + 英文 TL;DR + 单行目录;「快速开始」
-  前移到第二屏;18 行的「0.3 系列新增了什么」折叠进 `<details>`(内容不变)
+- README 首屏重排：明确目标用户、本地 Vivado 边界与 MCP SDK 2.x 依赖；新增
+  带 PR/Issue 证据的 Vivado 兼容矩阵和首次调用冒烟验证；「快速开始」前移，
+  「0.3 系列新增了什么」折叠进 `<details>`
+- 修正展示案例把 Basys 3 与 Kintex-7 写成同一硬件环境的歧义，并收紧未注明
+  测试条件的绝对化性能/兼容性表述
 - `CONTRIBUTING.md` 新增「Tcl 协议规则」一节(sentinel 命名空间 / `__` 变量前缀 /
   花括号转义等 6 条硬规则);PR 模板死链修复(此前引用未随仓库分发的
   `.trellis/spec/` 内部路径,外部贡献者不可见,PR #1 作者实际踩到)
