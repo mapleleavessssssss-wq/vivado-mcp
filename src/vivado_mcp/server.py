@@ -1,7 +1,7 @@
-"""FastMCP 服务器实例、lifespan 管理、工具注册、Resources & Prompts。
+"""MCPServer 服务器实例、lifespan 管理、工具注册、Resources & Prompts。
 
 架构：
-  Claude Code ──(stdio)──▶ FastMCP Server
+  Claude Code ──(stdio)──▶ MCPServer
                                 │
                           SessionManager (lifespan context)
                           ├─ "default" ──▶ vivado -mode tcl
@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from vivado_mcp.config import find_vivado
 from vivado_mcp.vivado.session import VivadoSession
@@ -44,7 +44,7 @@ class AppContext:
 
 
 @asynccontextmanager
-async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     """MCP 服务器生命周期管理。
 
     启动时初始化 SessionManager，关闭时清理所有 Vivado 会话。
@@ -69,8 +69,8 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         await manager.close_all()
 
 
-# 创建 FastMCP 实例
-mcp = FastMCP(
+# 创建 MCPServer 实例
+mcp = MCPServer(
     "vivado-mcp",
     lifespan=app_lifespan,
 )

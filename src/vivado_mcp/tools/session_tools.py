@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from vivado_mcp.server import _get_manager, mcp
 

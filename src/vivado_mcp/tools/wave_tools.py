@@ -18,7 +18,7 @@ AI 极易搞砸"的本地价值：
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from vivado_mcp.analysis import wcfg_editor
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
@@ -191,7 +191,7 @@ async def set_wave_zoom(
         wcfg_editor.set_zoom_range(wcfg_path, start_ns, end_ns)
     except (OSError, ValueError) as e:
         # OSError 覆盖 FileNotFoundError/PermissionError(只读/占用/无写权限),
-        # 写回阶段的失败也要带具体原因返回,不能裸抛成 FastMCP 通用错误
+        # 写回阶段的失败也要带具体原因返回,不能裸抛成 MCPServer 通用错误
         return f"[ERROR] 改写 wcfg 缩放区间失败: {type(e).__name__}: {e}"
 
     # 路径必须过 to_tcl_path 转义(转正斜杠 + 引号包裹):含空格/$/[ 的合法

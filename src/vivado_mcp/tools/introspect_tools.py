@@ -11,7 +11,7 @@
   - parse_ltx     —— get_hw_probes 需板子在手 + 活 hw session;离线读探针清单。
 """
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from vivado_mcp.analysis.bit_header_parser import format_bit as _format_bit
 from vivado_mcp.analysis.bit_header_parser import parse_bit as _parse_bit
