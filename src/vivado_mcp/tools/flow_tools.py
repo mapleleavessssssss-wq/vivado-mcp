@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from vivado_mcp.analysis.warning_parser import parse_diag_counts, parse_pre_bitstream
 from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp

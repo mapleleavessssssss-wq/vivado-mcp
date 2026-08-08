@@ -29,7 +29,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
-dependencies = ["mcp>=1.0.0"]
+dependencies = ["mcp>=2.0.0,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.4"]

@@ -4,7 +4,7 @@ inspect_ip_params 通过 Vivado Tcl API 查询 IP 实例的所有 CONFIG.* 参�
 compare_xci 纯 Python 解析两个 XCI 文件并对比参数差异，无需 Vivado 会话。
 """
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from vivado_mcp.analysis.ip_param_parser import parse_ip_params
 from vivado_mcp.analysis.xci_parser import (

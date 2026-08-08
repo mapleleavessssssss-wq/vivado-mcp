@@ -6,7 +6,7 @@
 
 import logging
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from vivado_mcp.analysis.io_parser import parse_report_io
 from vivado_mcp.analysis.io_verifier import format_io_verification, verify_io_placement

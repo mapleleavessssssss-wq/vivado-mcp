@@ -9,7 +9,7 @@
   Windows 路径含空格 / 中文 / ``$`` / ``[]`` / ``{}`` / 反斜杠也能安全执行
 """
 
-from mcp.server.fastmcp import Context
+from mcp.server.mcpserver import Context
 
 from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
 from vivado_mcp.vivado.tcl_utils import tcl_quote
