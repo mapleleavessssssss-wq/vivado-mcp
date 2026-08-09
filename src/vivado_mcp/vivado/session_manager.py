@@ -254,7 +254,7 @@ class SessionManager:
             if (
                 port is not None
                 and entry.get("is_alive")
-                and entry.get("state") != "busy"
+                and entry.get("state") not in {"busy", "stopping"}
                 and not getattr(s, "_pending_response", False)
             ):
                 probe_targets.append((entry, port))

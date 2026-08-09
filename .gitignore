@@ -73,5 +73,8 @@ AGENTS.md
 .spec-workflow/
 vivado_mcp_requirements.md
 
+# 本地竞品评估材料（包含第三方分发包与展开内容，不进入版本控制）
+/research/synthpilot-analysis/
+
 # 本地启动脚本(含个人 API token,各自维护)
 claude-start.bat

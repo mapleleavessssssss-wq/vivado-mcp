@@ -1,6 +1,6 @@
 [project]
 name = "vivado-mcp"
-version = "0.3.24"
+version = "0.3.25"
 description = "Vivado MCP Server — AI 驱动的 FPGA 开发助手，支持 GUI 可视化 / 子进程无头双模式，自动诊断 CRITICAL WARNING"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,7 +29,10 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
 ]
-dependencies = ["mcp>=2.0.0,<3"]
+dependencies = [
+    "mcp>=2.0.0,<3",
+    "tomli>=2.0; python_version < '3.11'",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.4"]

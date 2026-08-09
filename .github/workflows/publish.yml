@@ -37,10 +37,77 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install build tool
-        run: pip install build
+      - name: Install build tools
+        run: pip install build twine
+      - name: Verify tag matches project version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          if not tag.startswith("v"):
+              raise SystemExit(f"Release tag must start with 'v': {tag}")
+
+          tag_version = tag[1:]
+          project_version = tomllib.loads(
+              Path("pyproject.toml").read_text(encoding="utf-8")
+          )["project"]["version"]
+          if project_version != tag_version:
+              raise SystemExit(
+                  f"Tag version {tag_version} does not match pyproject.toml {project_version}"
+              )
+          print(f"Release version verified: {tag_version}")
+          PY
       - name: Build
         run: python -m build
+      - name: Verify distribution metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tarfile
+          import zipfile
+          from email.parser import BytesParser
+          from pathlib import Path
+
+          expected = os.environ["RELEASE_TAG"][1:]
+          wheels = list(Path("dist").glob("*.whl"))
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit(
+                  f"Expected one wheel and one sdist, got {len(wheels)} wheel(s) "
+                  f"and {len(sdists)} sdist(s)"
+              )
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+              if len(names) != 1:
+                  raise SystemExit(f"Expected one wheel METADATA file, got {len(names)}")
+              wheel_version = BytesParser().parsebytes(archive.read(names[0]))["Version"]
+
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              members = [member for member in archive.getmembers() if member.name.endswith("/PKG-INFO")]
+              if len(members) != 1:
+                  raise SystemExit(f"Expected one sdist PKG-INFO file, got {len(members)}")
+              metadata_file = archive.extractfile(members[0])
+              if metadata_file is None:
+                  raise SystemExit("Could not read sdist PKG-INFO")
+              sdist_version = BytesParser().parsebytes(metadata_file.read())["Version"]
+
+          for artifact, version in ((wheels[0], wheel_version), (sdists[0], sdist_version)):
+              if version != expected:
+                  raise SystemExit(
+                      f"{artifact.name} metadata version {version} does not match tag {expected}"
+                  )
+              print(f"{artifact.name}: version {version}")
+          PY
+      - name: Check distribution rendering and metadata
+        run: python -m twine check dist/*
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -81,10 +148,11 @@ jobs:
         run: |
           tag="${{ steps.ver.outputs.version }}"
           for i in $(seq 1 10); do
-            got=$(curl -fsSL "https://pypi.org/pypi/vivado-mcp/json" | jq -r '.info.version')
-            echo "Attempt $i: PyPI reports $got, expected $tag"
+            got=$(curl -fsSL "https://pypi.org/pypi/vivado-mcp/${tag}/json" 2>/dev/null \
+              | jq -r '.info.version // empty' || true)
+            echo "Attempt $i: target release reports ${got:-not available}, expected $tag"
             if [ "$got" = "$tag" ]; then
-              echo "PyPI refreshed to $tag"
+              echo "PyPI release $tag is available"
               exit 0
             fi
             sleep 30

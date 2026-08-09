@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.3.25] — 2026-08-09
+
+> 本版基于同类 Vivado MCP 的协议、工作流和安装体验调研，吸收有效模式，
+> 但继续坚持“30 个精选工具 + `run_tcl`”而不是扩张到数百个 Tcl facade。
+> 测试基线 766 → 799。
+
+### 环境诊断与安装
+
+- **新增 `vivado-mcp doctor`**：默认只读检查包版本、Vivado executable、
+  `Vivado_init.tcl` 注入、第三方注入冲突、随机 token TCP 协议握手，以及
+  Claude Code / Codex MCP 配置；支持稳定 `--json` 输出。
+- **受限 `doctor --fix`**：只修复明确标记为 fixable 的项目，复用现有幂等
+  `install()`，修改客户端配置前首次备份并通过同目录临时文件原子替换。
+  不删除第三方注入、不 kill 端口占用者、不自动升级 Python/Vivado。
+- Python 3.10 增加条件依赖 `tomli`，保证 Codex TOML 配置检查/修复与
+  Python 3.11+ 的 `tomllib` 行为一致。
+
+### MCP 工作流
+
+- **5 → 8 个 Prompt**：保留 `fpga_workflow`、`debug_timing`、
+  `debug_gt_mapping`、`debug_ip_config`、`debug_pcie` 的名称和注册顺序，新增
+  `simulation_bringup`、`cdc_audit`、`ila_hardware_debug`。
+- 抽取共享的证据闭环：前置条件、新鲜 baseline、问题分类、一次一个最小安全
+  修改、同指标复测、连续两轮无改善停止、固定输出。每篇控制在约 2.2K-2.7K
+  字符，只引用现有工具或 `run_tcl`，不复制 10K+ 字符的重型方法论文档。
+
+### 协议与长任务
+
+- **修复 GUI 超时后的响应串台**：旧实现允许命令 FIRST 超时后立即发送 SECOND，
+  迟到的 FIRST 响应可能被误认成 SECOND 结果。stdio 也可能混入旧输出。两种
+  Session 现使用 single-inflight + `asyncio.shield` 保留响应所有权；旧响应完成
+  前明确拒绝下一命令，完成后自动恢复 READY。
+- **综合/实现支持启动即返回**：`run_synthesis` / `run_implementation` 新增兼容
+  参数 `wait=True`；传 `wait=False` 时返回稳定 `session_id:run_name` job id，
+  后续复用 `get_run_progress` 查询，无需新增 async facade 工具。
+- 同名 run 的 Running/Queued 检查与 `reset_run` / `launch_runs` 合并为单次 Tcl
+  原子操作，避免并发工作流重置正在运行的综合或实现。
+- 未照搬“按进程名结束全部 XSim”的 `sim_stop`。当前架构无法证明 xsim 进程对
+  session/job 的归属，贸然实现会影响其他工程；继续使用有限时运行和
+  `close_sim -force` 软停止，精确硬停留待受管仿真 job 模型。
+
+### 展示页
+
+- README 首屏重构：突出本地 Vivado 边界、30 tools / 8 prompts / 2 resources、
+  五分钟上手与 `doctor`；新增工作流门禁表、Mermaid 架构图、异步运行和协议
+  安全说明。
+- 本地 `research/synthpilot-analysis/` 加入 `.gitignore`，第三方分发包、展开内容与
+  分析材料不会进入源码仓库、wheel 或发布产物。
+
 ## [0.3.24] — 2026-08-08
 
 > MCP Python SDK 2.0 发布后，PyPI 上的 `mcp>=1.0.0` 会解析到不兼容的 v2，

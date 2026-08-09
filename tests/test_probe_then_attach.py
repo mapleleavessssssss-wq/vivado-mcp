@@ -756,6 +756,7 @@ class TestExecuteTimeoutPendingResponse:
         并置 _pending_response=True(审计 P3 + P1)。
         """
         port, stop = _serve_header_then_stall()
+        sess = None
         try:
             sess = await _manually_connected_session(port)
             assert sess._pending_response is False
@@ -768,9 +769,11 @@ class TestExecuteTimeoutPendingResponse:
             assert sess._pending_response is True
         finally:
             stop.set()
+            if sess is not None:
+                await sess.stop()
 
-    async def test_header_timeout_sets_pending_then_success_clears(self):
-        """头部读超时置 _pending_response=True;下次成功收满一帧清 False。"""
+    async def test_late_response_is_not_reused_by_next_command(self):
+        """迟到的 FIRST 响应由原任务收尾，SECOND 绝不能误收旧帧。"""
         import time as time_mod
 
         state = {"stall_next": True}
@@ -788,12 +791,77 @@ class TestExecuteTimeoutPendingResponse:
                 await sess.execute("puts FIRST", timeout=0.2)
             assert sess._pending_response is True, "超时后必须标记 pending"
 
-            # 第二条命令成功收到一帧(即便是迟到的上一帧)→ pending 清除
-            await sess.execute("puts SECOND", timeout=5.0)
-            assert sess._pending_response is False, "成功收帧后必须清除 pending"
+            first_task = sess._inflight_task
+            assert first_task is not None
+            with pytest.raises(RuntimeError, match="上一条命令仍在执行"):
+                await sess.execute("puts SECOND", timeout=5.0)
+
+            first = await asyncio.wait_for(asyncio.shield(first_task), timeout=2.0)
+            assert "FIRST" in first.output
+            await asyncio.sleep(0)
+            assert sess._pending_response is False, "迟到帧收完后必须清除 pending"
+
+            second = await sess.execute("puts SECOND", timeout=5.0)
+            assert "SECOND" in second.output
+            assert "FIRST" not in second.output
             await sess.stop()
         finally:
             stop.set()
+
+    async def test_stop_blocks_new_gui_commands_while_closing_active_reader(self):
+        from vivado_mcp.vivado.base_session import SessionState
+
+        class _BlockingWriter:
+            def __init__(self):
+                self.closed = asyncio.Event()
+                self.release = asyncio.Event()
+                self._closing = False
+
+            def is_closing(self):
+                return self._closing
+
+            def close(self):
+                self._closing = True
+                self.closed.set()
+
+            async def wait_closed(self):
+                await self.release.wait()
+
+        sess = GuiSession(
+            vivado_path="/fake/vivado",
+            session_id="closing-gui",
+            port=9999,
+            attach_only=True,
+        )
+        writer = _BlockingWriter()
+        sess._reader = object()
+        sess._writer = writer
+        sess._connected_port = 9999
+        sess._state = SessionState.READY
+        first_started = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_execute(command: str):
+            calls.append(command)
+            first_started.set()
+            await asyncio.Event().wait()
+
+        sess._execute_impl = fake_execute
+        first = asyncio.create_task(sess.execute("FIRST", timeout=10.0))
+        await first_started.wait()
+
+        stopping = asyncio.create_task(sess.stop())
+        await writer.closed.wait()
+        assert sess.state == SessionState.STOPPING
+        with pytest.raises(RuntimeError, match="正在关闭"):
+            await sess.execute("SECOND", timeout=1.0)
+        assert calls == ["FIRST"]
+
+        writer.release.set()
+        await stopping
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert sess.state == SessionState.STOPPED
 
 
 # --------------------------------------------------------------------------- #

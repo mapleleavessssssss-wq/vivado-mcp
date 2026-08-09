@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from vivado_mcp.config import find_vivado
@@ -23,6 +25,58 @@ _BEGIN_MARK = "## ===== vivado-mcp injection begin ====="
 _END_MARK = "## ===== vivado-mcp injection end ====="
 
 _BACKUP_SUFFIX = ".vmcp_backup"
+
+
+def _read_optional_bytes(path: Path) -> bytes | None:
+    """读取文件原始字节；不存在时返回 ``None``。"""
+    return path.read_bytes() if path.is_file() else None
+
+
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    expected_bytes: bytes | None,
+    backup_suffix: str = _BACKUP_SUFFIX,
+) -> None:
+    """校验原内容后，以同目录临时文件原子替换文本文件。
+
+    ``expected_bytes`` 是调用方完成解析时看到的原始内容；``None`` 表示文件
+    当时不存在。写入前再次比较，拒绝覆盖并发修改。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if _read_optional_bytes(path) != expected_bytes:
+        raise OSError(f"{path} 在修复期间发生变化，拒绝覆盖")
+
+    backup = path.with_suffix(path.suffix + backup_suffix)
+    if expected_bytes is not None and not backup.exists():
+        shutil.copy2(path, backup)
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+
+        if path.exists():
+            shutil.copymode(path, temp_path)
+        # 第二次比较紧邻 replace，缩小解析后并发更新的覆盖窗口。
+        if _read_optional_bytes(path) != expected_bytes:
+            raise OSError(f"{path} 在修复期间发生变化，拒绝覆盖")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 
 def _resolve_init_tcl(vivado_path: str | None) -> Path:
@@ -95,9 +149,8 @@ def install(vivado_path: str | None = None, port: int = 9999) -> None:
     init_tcl.parent.mkdir(parents=True, exist_ok=True)
 
     # 读取现有内容（不存在则空字符串）
-    content = ""
-    if init_tcl.is_file():
-        content = init_tcl.read_text(encoding="utf-8", errors="replace")
+    original_bytes = _read_optional_bytes(init_tcl)
+    content = original_bytes.decode("utf-8", errors="replace") if original_bytes else ""
 
     # 检测是否已注入
     if _BEGIN_MARK in content:
@@ -114,23 +167,21 @@ def install(vivado_path: str | None = None, port: int = 9999) -> None:
             f"  继续安装..."
         )
 
-    # 备份原文件（第一次）
-    backup_path = init_tcl.with_suffix(init_tcl.suffix + _BACKUP_SUFFIX)
-    if init_tcl.is_file() and not backup_path.is_file():
-        shutil.copy2(init_tcl, backup_path)
-        print(f"原文件已备份到: {backup_path}")
-
     # 写入新内容
     injection = _build_injection_block(server_script, port)
     new_content = content.rstrip() + "\n\n" + injection
+    backup_path = init_tcl.with_suffix(init_tcl.suffix + _BACKUP_SUFFIX)
+    backup_will_be_created = original_bytes is not None and not backup_path.exists()
 
     try:
-        init_tcl.write_text(new_content, encoding="utf-8")
+        _atomic_write_text(init_tcl, new_content, expected_bytes=original_bytes)
     except PermissionError:
         raise PermissionError(
             f"无权限写入 {init_tcl}。请用管理员权限运行 `vivado-mcp install`，\n"
             f"或手动将以下内容追加到该文件末尾：\n\n{injection}"
         )
+    if backup_will_be_created:
+        print(f"原文件已备份到: {backup_path}")
 
     print(f"✓ vivado-mcp 已成功注入 {init_tcl}")
     print("  下次启动 Vivado GUI 时会自动开启 TCP server。")
@@ -169,14 +220,16 @@ def uninstall(vivado_path: str | None = None) -> None:
         print(f"{init_tcl} 不存在，无需操作。")
         return
 
-    content = init_tcl.read_text(encoding="utf-8", errors="replace")
+    original_bytes = _read_optional_bytes(init_tcl)
+    assert original_bytes is not None
+    content = original_bytes.decode("utf-8", errors="replace")
     if _BEGIN_MARK not in content:
         print(f"{init_tcl} 中未发现 vivado-mcp 注入，无需操作。")
         return
 
     cleaned = _remove_injection(content).rstrip() + "\n"
     try:
-        init_tcl.write_text(cleaned, encoding="utf-8")
+        _atomic_write_text(init_tcl, cleaned, expected_bytes=original_bytes)
     except PermissionError:
         raise PermissionError(
             f"无权限写入 {init_tcl}。请用管理员权限运行 `vivado-mcp uninstall`。"

@@ -1,11 +1,163 @@
-"""session_manager.py 单元测试。
+"""session 与 session_manager 单元测试。
 
 测试 session_id 验证和基本管理逻辑（不启动实际 Vivado 进程）。
 """
 
+import asyncio
+
 import pytest
 
+from vivado_mcp.vivado.base_session import SessionState
+from vivado_mcp.vivado.session import SubprocessSession
 from vivado_mcp.vivado.session_manager import SessionManager, _validate_session_id
+from vivado_mcp.vivado.tcl_utils import TclResult
+
+
+class _AliveProcess:
+    returncode = None
+
+
+class TestSubprocessInflightOwnership:
+    """调用方超时后，原任务必须继续独占该会话的响应流。"""
+
+    @pytest.mark.asyncio
+    async def test_timeout_rejects_next_command_until_original_finishes(self):
+        session = SubprocessSession("/fake/vivado", "owned")
+        session._process = _AliveProcess()
+        session._state = SessionState.READY
+        release = asyncio.Event()
+
+        async def fake_execute(command: str) -> TclResult:
+            if command == "FIRST":
+                await release.wait()
+            return TclResult(output=command, return_code=0, is_error=False)
+
+        session._execute_impl = fake_execute
+
+        with pytest.raises(asyncio.TimeoutError, match="命令执行超时"):
+            await session.execute("FIRST", timeout=0.01)
+        first_task = session._inflight_task
+        assert first_task is not None
+        assert session.state == SessionState.BUSY
+
+        with pytest.raises(RuntimeError, match="上一条命令仍在执行"):
+            await session.execute("SECOND", timeout=1.0)
+
+        release.set()
+        first = await asyncio.wait_for(asyncio.shield(first_task), timeout=1.0)
+        assert first.output == "FIRST"
+        await asyncio.sleep(0)
+
+        second = await session.execute("SECOND", timeout=1.0)
+        assert second.output == "SECOND"
+        assert session.state == SessionState.READY
+
+    @pytest.mark.asyncio
+    async def test_same_session_serializes_but_different_sessions_overlap(self):
+        active = 0
+        max_active = 0
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_execute(command: str) -> TclResult:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            if active == 2:
+                both_started.set()
+            await release.wait()
+            active -= 1
+            return TclResult(output=command, return_code=0, is_error=False)
+
+        first = SubprocessSession("/fake/vivado", "first")
+        second = SubprocessSession("/fake/vivado", "second")
+        first._process = _AliveProcess()
+        second._process = _AliveProcess()
+        first._state = SessionState.READY
+        second._state = SessionState.READY
+        first._execute_impl = fake_execute
+        second._execute_impl = fake_execute
+
+        task_a = asyncio.create_task(first.execute("A", timeout=1.0))
+        task_b = asyncio.create_task(second.execute("B", timeout=1.0))
+        await asyncio.wait_for(both_started.wait(), timeout=1.0)
+        assert max_active == 2
+        release.set()
+        await asyncio.gather(task_a, task_b)
+
+    @pytest.mark.asyncio
+    async def test_same_session_executes_in_order(self):
+        session = SubprocessSession("/fake/vivado", "ordered")
+        session._process = _AliveProcess()
+        session._state = SessionState.READY
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_execute(command: str) -> TclResult:
+            calls.append(command)
+            if command == "FIRST":
+                first_started.set()
+                await release_first.wait()
+            return TclResult(output=command, return_code=0, is_error=False)
+
+        session._execute_impl = fake_execute
+        first = asyncio.create_task(session.execute("FIRST", timeout=1.0))
+        await first_started.wait()
+        second = asyncio.create_task(session.execute("SECOND", timeout=1.0))
+        await asyncio.sleep(0)
+        assert calls == ["FIRST"]
+
+        release_first.set()
+        await asyncio.gather(first, second)
+        assert calls == ["FIRST", "SECOND"]
+
+    @pytest.mark.asyncio
+    async def test_stop_blocks_new_commands_without_waiting_for_inflight_lock(self):
+        class _StoppingProcess:
+            def __init__(self):
+                self.returncode = None
+                self.waiting = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def wait(self):
+                self.waiting.set()
+                await self.release.wait()
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+                self.release.set()
+
+        process = _StoppingProcess()
+        session = SubprocessSession("/fake/vivado", "stopping")
+        session._process = process
+        session._state = SessionState.READY
+        first_started = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_execute(command: str) -> TclResult:
+            calls.append(command)
+            first_started.set()
+            await asyncio.Event().wait()
+
+        session._execute_impl = fake_execute
+        first = asyncio.create_task(session.execute("FIRST", timeout=10.0))
+        await first_started.wait()
+
+        stopping = asyncio.create_task(session.stop(timeout=1.0))
+        await process.waiting.wait()
+        assert session.state == SessionState.STOPPING
+        with pytest.raises(RuntimeError, match="正在关闭"):
+            await session.execute("SECOND", timeout=1.0)
+        assert calls == ["FIRST"]
+
+        process.release.set()
+        await stopping
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert session.state == SessionState.STOPPED
 
 
 class TestValidateSessionId:

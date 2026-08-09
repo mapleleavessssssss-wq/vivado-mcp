@@ -21,6 +21,7 @@ class SessionState(str, Enum):
     STARTING = "starting"
     READY = "ready"
     BUSY = "busy"
+    STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"
     DEAD = "dead"  # D4: socket 断开 / 进程崩溃 / 用户关闭 GUI

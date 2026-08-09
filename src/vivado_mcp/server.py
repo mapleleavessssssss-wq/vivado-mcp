@@ -18,9 +18,20 @@ from dataclasses import dataclass
 
 from mcp.server import MCPServer
 
+from vivado_mcp import prompts as _prompts
 from vivado_mcp.config import find_vivado
 from vivado_mcp.vivado.session import VivadoSession
 from vivado_mcp.vivado.session_manager import SessionManager
+
+# 兼容历史上从 server 模块直接导入 Prompt 函数的调用方。
+fpga_workflow = _prompts.fpga_workflow
+debug_timing = _prompts.debug_timing
+debug_gt_mapping = _prompts.debug_gt_mapping
+debug_ip_config = _prompts.debug_ip_config
+debug_pcie = _prompts.debug_pcie
+simulation_bringup = _prompts.simulation_bringup
+cdc_audit = _prompts.cdc_audit
+ila_hardware_debug = _prompts.ila_hardware_debug
 
 # 配置日志:默认 WARNING(logging-guidelines §2:INFO/DEBUG 不出现在生产用户终端,
 # 用户必须看到的信息走 WARNING+),调试时设环境变量 LOG_LEVEL=INFO/DEBUG 覆盖。
@@ -381,175 +392,8 @@ def resource_session_status(session_id: str) -> str:
 #  MCP Prompts（工作流引导）
 # --------------------------------------------------------------------------- #
 
-@mcp.prompt()
-def fpga_workflow() -> str:
-    """标准 FPGA 开发流程引导：从创建项目到生成比特流。
-
-    **0.2.0 变更**：项目操作全部用 run_tcl/safe_tcl，不再有专用 facade 工具。
-    """
-    return (
-        "请按以下标准 FPGA 开发流程操作（0.2.0 起所有项目操作走 run_tcl/safe_tcl）：\n\n"
-        "1. **启动会话**: `start_session(mode='gui')` — 默认启动 GUI Vivado 可视化。\n"
-        "   CI 批处理用 `mode='tcl'`；attach 到已有 Vivado 用 `mode='attach'`。\n"
-        "2. **创建项目**: `safe_tcl(\"create_project {0} {1} -part {2}\", \n"
-        "   args=['my_proj', 'C:/proj', 'xc7a35tcpg236-1'])`\n"
-        "3. **添加源文件**: `safe_tcl(\"add_files -fileset [get_filesets sources_1] {0}\", \n"
-        "   args=['C:/src/top.v'])`\n"
-        "4. **设置顶层**: `run_tcl(\"set_property top my_top [current_fileset]\")`\n"
-        "5. **综合**: `run_synthesis` — 完成后自动 open_run，后续 report_* 可直接用\n"
-        "6. **查看资源**: `run_tcl(\"report_utilization -return_string\")`\n"
-        "7. **实现**: `run_implementation`\n"
-        "8. **时序检查**: `get_timing_report` — 结构化中文报告，PASS/FAIL 判定\n"
-        "9. **生成比特流**: `generate_bitstream` — 前置 CRITICAL WARNING 安全检查\n"
-        "10. **编程设备**: `program_device`\n"
-        "11. **工程入库（git 版本控制）**: `run_tcl(\"write_project_tcl -force "
-        "-no_copy_sources -paths_relative_to <repo_root> C:/proj/rebuild.tcl\")`\n"
-        "    - .runs/.cache/.sim 全不入 git，重建用 `vivado -mode batch -source "
-        "rebuild.tcl`\n"
-        "    - 含 BD 的工程导出脚本会内联 BD 重建过程，但 wrapper 需重跑 "
-        "make_wrapper\n"
-        "    - IP 用户改动要确认 .xci 在 srcs 内、不在 .gen 内\n\n"
-        "查询运行状态: `run_tcl(\"get_property STATUS [get_runs synth_1]\")`\n"
-        "设计规则检查: `run_tcl(\"report_drc -return_string\")`\n"
-        "遇到 CRITICAL WARNING: `get_critical_warnings` 提取分类 + 中文修复建议。"
-    )
-
-
-@mcp.prompt()
-def debug_timing() -> str:
-    """时序违例调试引导：2019.1 验证过的系统化报告升级链。"""
-    return (
-        "时序违例调试流程（2019.1 验证过的升级链，由浅入深）：\n\n"
-        "1. **第一站**: `get_timing_report` — 结构化时序摘要，WNS < 0 即违例。\n"
-        "   违例时已自动附带 Top10 违例路径 + 5 模式分类 + 具体修复 Tcl 命令，\n"
-        "   无需再手动跑 report_timing\n"
-        "2. **时钟交互矩阵**: `run_tcl(\"report_clock_interaction -return_string\")`\n"
-        "   任何 CDC 嫌疑先看这张矩阵，重点关注 unsafe / partial 时钟对\n"
-        "3. **CDC 结构检查**: `run_tcl(\"report_cdc -details -return_string\")`\n"
-        "   定位缺同步器的跨时钟域路径（CDC-1 类结构问题）\n"
-        "4. **方法学检查**: `run_tcl(\"report_methodology -return_string\")`\n"
-        "   TIMING-6/7、XDC 约束类违例在这里暴露\n"
-        "5. **QoR 体检**: `run_tcl(\"report_qor_assessment -return_string\")`\n"
-        "   1-5 分整体评估（注意：report_qor_suggestions 需 2020.1+，2019.1 不可用）\n"
-        "6. **资源与高扇出**: `get_utilization_report` 检查是否资源过度使用；\n"
-        "   `run_tcl(\"report_high_fanout_nets -fanout_greater_than 200 "
-        "-return_string\")`\n"
-        "7. **复杂违例深挖**: `run_tcl(\"report_design_analysis -congestion "
-        "-return_string\")` 分析布线拥塞（关键路径物理特征用 -timing）\n\n"
-        "常见修复方法：\n"
-        "- 添加流水线寄存器拆分长路径\n"
-        "- 调整时钟频率约束\n"
-        "- 使用 `set_false_path` / `set_multicycle_path` 排除非关键路径\n"
-        "- 手动布局关键模块 (`set_property LOC`)"
-    )
-
-
-@mcp.prompt()
-def debug_gt_mapping() -> str:
-    """GT 高速收发器引脚映射调试引导。"""
-    return (
-        "GT 引脚映射调试流程：\n\n"
-        "当 PCIe/GTX/GTH 链路无法建立时，首先排除物理层引脚问题：\n\n"
-        "1. **检查 CRITICAL WARNING**: `get_critical_warnings` 查看是否有 "
-        "[Vivado 12-1411] 引脚冲突\n"
-        "   - 此 warning 表示 XDC 的 PACKAGE_PIN 约束与 IP 内部 GT LOC 冲突\n"
-        "   - 常见原因：XDC 引脚顺序与 IP 配置的 Lane 映射不一致\n\n"
-        "2. **验证 IO 布局**: `verify_io_placement_tool` 对比 XDC 约束与实际分配\n"
-        "   - CRITICAL 级别不匹配 = GT 引脚错误（必须修复）\n"
-        "   - WARNING 级别不匹配 = GPIO 引脚偏差（通常不影响链路）\n\n"
-        "3. **查看 IO 报告**: `get_io_report` 获取所有端口的实际引脚分配\n"
-        "   - 重点检查 rxp/rxn/txp/txn 各 lane 的 Bank 和 Site\n\n"
-        "4. **核实 Lane 映射**:\n"
-        "   - 对照 PCB 原理图确认 GT 引脚与物理走线的对应关系\n"
-        "   - 检查 IP Customization 中的 Lane Reversal 设置\n"
-        "   - 查看 GT Location 约束是否正确\n\n"
-        "修复方法：\n"
-        "- 删除 XDC 中的 GT PACKAGE_PIN 约束（让 IP 自动放置）\n"
-        "- 或修正 XDC 引脚顺序使其与 IP 内部 LOC 一致\n\n"
-        "5. **查看 IP GT 配置**: `inspect_ip_params(ip_name='<name>', filter_keyword='gt')`\n"
-        "   - 列出所有 GT 相关的 CONFIG.* 参数（含 GUI 中隐藏的参数）\n"
-        "   - 重点关注 PCIE_GT_DEVICE / GT_LOC / LANE_WIDTH 等参数\n\n"
-        "6. **生成 GT 通道映射表**: 组合 `get_io_report` + `inspect_ip_params` 数据\n"
-        "   - 将 rxp/rxn/txp/txn 各 lane 的 Bank/Site 与 IP 内部 GT Location 对照\n"
-        "   - 验证物理走线与 IP 配置的 Lane 映射是否一致\n\n"
-        "**架构差异提醒**：\n"
-        "- 7-Series `pcie_7x` 的 GT LOC 由 `.ttcl` 模板无条件生成，"
-        "`disable_gt_loc` 参数不会传递到子 IP，设了也无效\n"
-        "- 只有 UltraScale+(GT Wizard)才支持 `disable_gt_loc` 参数\n"
-        "- 7-Series 修复方法：只能删除 XDC 中 GT PACKAGE_PIN 或修正引脚顺序"
-    )
-
-
-@mcp.prompt()
-def debug_ip_config() -> str:
-    """IP 配置调试引导：诊断 Vivado IP 参数问题。"""
-    return (
-        "IP 配置调试流程：\n\n"
-        "当怀疑 IP 配置不正确时（如 PCIe 链路不通、GT 通道映射错误）：\n\n"
-        "## 1. 查看 IP 所有配置参数\n"
-        "```\n"
-        "inspect_ip_params(ip_name='xdma_0')\n"
-        "```\n"
-        "- 列出所有 CONFIG.* 参数（含 GUI 中不可见的隐藏参数）\n"
-        "- 通过 Vivado Tcl API `list_property + get_property` 直接获取\n\n"
-        "## 2. 按关键词过滤\n"
-        "```\n"
-        "inspect_ip_params(ip_name='xdma_0', filter_keyword='gt')\n"
-        "inspect_ip_params(ip_name='xdma_0', filter_keyword='lane')\n"
-        "inspect_ip_params(ip_name='xdma_0', filter_keyword='loc')\n"
-        "inspect_ip_params(ip_name='xdma_0', filter_keyword='pcie')\n"
-        "```\n\n"
-        "## 3. 对比两个 XCI 配置（无需 Vivado 会话）\n"
-        "```\n"
-        "compare_xci(\n"
-        "    file_a='path/to/golden.xci',  # 基准/正常配置\n"
-        "    file_b='path/to/suspect.xci', # 待检查/异常配置\n"
-        ")\n"
-        "```\n"
-        "- XCI 是 XML 格式，直接解析对比参数差异\n"
-        "- 适用于：版本对比、不同板卡间配置迁移验证\n\n"
-        "## 4. 查看 xgui/*.tcl 文件（高级）\n"
-        "- 位置: `<IP_DIR>/xgui/<ip_name>_v*.tcl`\n"
-        "- 包含参数的条件可见性逻辑（哪些参数在什么条件下显示/隐藏）\n"
-        "- 搜索 `PARAM_VALUE.` 可找到所有可配置参数\n\n"
-        "## 架构差异警告\n"
-        "- **`disable_gt_loc`** 仅对 UltraScale+(GT Wizard IP)有效\n"
-        "- 7-Series 使用 `pcie_7x` IP，其 `.ttcl` 模板**无条件生成** GT LOC 约束\n"
-        "- 7-Series 设置 `disable_gt_loc=true` 不会传递到子 IP，无任何效果\n\n"
-        "## 常见 IP 配置问题\n"
-        "| 问题 | 检查参数 |\n"
-        "|------|----------|\n"
-        "| Lane Width 不对 | CONFIG.PF0_DEVICE_ID, LANE_WIDTH |\n"
-        "| RefClk 频率错误 | CONFIG.REF_CLK_FREQ, CONFIG.PCIE_REFCLK_FREQ |\n"
-        "| Lane 翻转 | CONFIG.PCIE_LANE_REVERSAL |\n"
-        "| GT 位置冲突 | CONFIG.PCIE_GT_DEVICE, CONFIG.*GT_LOC* |"
-    )
-
-
-@mcp.prompt()
-def debug_pcie() -> str:
-    """PCIe 调试引导：从物理层到协议层的系统化排查。"""
-    return (
-        "PCIe 系统化调试流程（从底层到上层）：\n\n"
-        "## 第一层：物理引脚（最常见问题源）\n"
-        "1. `get_critical_warnings` — 检查 GT 引脚冲突警告\n"
-        "2. `verify_io_placement_tool` — 验证 XDC 约束与实际布局\n"
-        "3. `get_io_report` — 确认所有 GT 端口的 Bank 和 Site\n\n"
-        "## 第二层：时钟与复位\n"
-        "4. `run_tcl(\"report_clock_interaction -return_string\")` — "
-        "检查参考时钟 (REFCLK) 与时钟交互\n"
-        "5. 确认 PERST# 复位信号的 IOSTANDARD 和极性\n\n"
-        "## 第三层：时序\n"
-        "6. `get_timing_report` — 检查时序是否收敛\n"
-        "   - GT 内部时钟 (userclk2) 是否 MET\n\n"
-        "## 第四层：协议\n"
-        "7. 检查 LTSSM 状态: 使用 DRP 读取 GT 状态寄存器\n"
-        "8. 检查 Link Speed / Width 是否达到预期\n\n"
-        "关键经验：\n"
-        "- 80% 的 PCIe 链路问题源于第一层（引脚映射错误）\n"
-        "- 在检查协议层之前，务必先确认物理层无误\n"
-        "- [Vivado 12-1411] 是最需要关注的 CRITICAL WARNING"
-    )
+# 注册顺序是对外兼容契约：旧 5 项顺序不变，新工作流仅追加。
+_prompts.register_prompts(mcp)
 
 
 # --------------------------------------------------------------------------- #

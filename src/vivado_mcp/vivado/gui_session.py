@@ -268,6 +268,10 @@ class GuiSession(BaseSession):
         self._writer: asyncio.StreamWriter | None = None
         self._connected_port: int | None = None
         self._lock = asyncio.Lock()
+        self._closing = False
+        # 调用方超时不能取消底层读帧；否则迟到响应会被下一条命令误收。
+        self._inflight_task: asyncio.Task[TclResult] | None = None
+        self._response_phase: str | None = None
         self._tmp_script: str | None = None
         # 上一条 execute 超时且响应尚未收到时为 True(下次成功收到一帧即清除)。
         # list_sessions 探活守卫据此跳过 fresh probe:Vivado 单线程 event loop
@@ -372,6 +376,7 @@ class GuiSession(BaseSession):
         if self.is_alive:
             return f"会话 '{self.session_id}' 已在运行中。"
 
+        self._closing = False
         self._state = SessionState.STARTING
         logger.info(
             "启动 GUI 会话 '%s' (attach=%s, port_pref=%d)",
@@ -645,19 +650,42 @@ class GuiSession(BaseSession):
         timeout: float = 120.0,
     ) -> TclResult:
         """发送 Tcl 命令并等待响应。"""
-        if not self.is_alive:
+        if self._closing or not self.is_alive:
             raise RuntimeError(
-                f"会话 '{self.session_id}' 未连接。请先调用 start_session。"
+                f"会话 '{self.session_id}' 正在关闭或未连接。请先调用 start_session。"
             )
 
         assert self._reader and self._writer
 
         async with self._lock:
+            if self._closing:
+                raise RuntimeError(f"会话 '{self.session_id}' 正在关闭，拒绝执行新命令。")
+            if self._inflight_task is not None and not self._inflight_task.done():
+                raise RuntimeError(
+                    f"会话 '{self.session_id}' 的上一条命令仍在执行。"
+                    "请稍后重试；不会向同一 Vivado 会话并发发送新命令。"
+                )
+
             self._state = SessionState.BUSY
+            task = asyncio.create_task(self._execute_impl(tcl_command))
+            self._inflight_task = task
+            task.add_done_callback(self._on_inflight_done)
             try:
-                result = await self._execute_impl(tcl_command, timeout)
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
                 self._state = SessionState.READY
                 return result
+            except asyncio.TimeoutError:
+                # 读任务继续独占这一帧；完成前下一次 execute 会被上面的守卫拒绝。
+                self._pending_response = True
+                self._state = SessionState.BUSY
+                phase = (
+                    "读取响应体超时"
+                    if self._response_phase == "body"
+                    else "读取响应长度头超时"
+                )
+                raise asyncio.TimeoutError(
+                    f"{phase}（{timeout}s）。命令: {tcl_command[:200]}"
+                ) from None
             except (ConnectionError, asyncio.IncompleteReadError) as e:
                 # D4: 连接断开，标记为 DEAD，不自动重连
                 self._state = SessionState.DEAD
@@ -672,10 +700,25 @@ class GuiSession(BaseSession):
                     self._state = SessionState.DEAD
                 raise
 
+    def _on_inflight_done(self, task: asyncio.Task[TclResult]) -> None:
+        """收尾迟到响应，并保证同一连接始终只有一个 reader。"""
+        try:
+            exc = task.exception()
+            if exc is not None:
+                logger.debug("[%s] 在途命令结束时异常: %s", self.session_id, exc)
+        except asyncio.CancelledError:
+            pass
+
+        if self._inflight_task is task:
+            self._inflight_task = None
+            self._pending_response = False
+            self._response_phase = None
+            if self._state == SessionState.BUSY:
+                self._state = SessionState.READY if self.is_alive else SessionState.DEAD
+
     async def _execute_impl(
         self,
         tcl_command: str,
-        timeout: float,
     ) -> TclResult:
         assert self._reader and self._writer
 
@@ -686,18 +729,8 @@ class GuiSession(BaseSession):
         await self._writer.drain()
 
         # 接收：[4 字节长度][UTF-8 JSON payload]
-        try:
-            resp_hdr = await asyncio.wait_for(
-                self._reader.readexactly(4),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            # 超时 ≠ 命令失败:Vivado 多半仍在跑,响应稍后才到并残留在流上。
-            # 标记 pending,list_sessions 探活据此跳过(避免"忙=死"误判)
-            self._pending_response = True
-            raise asyncio.TimeoutError(
-                f"读取响应长度头超时（{timeout}s）。命令: {tcl_command[:200]}"
-            )
+        self._response_phase = "header"
+        resp_hdr = await self._reader.readexactly(4)
 
         resp_len = int.from_bytes(resp_hdr, "big")
         if resp_len < 0 or resp_len > _MAX_RESPONSE_BYTES:
@@ -705,20 +738,8 @@ class GuiSession(BaseSession):
                 f"非法响应长度 {resp_len}（限 {_MAX_RESPONSE_BYTES} 字节以内）。"
             )
 
-        try:
-            resp_body = await asyncio.wait_for(
-                self._reader.readexactly(resp_len),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            # 比照头部读包一层带 message 的超时:裸 TimeoutError str() 为空,
-            # 工具层只会显示 "[ERROR] 命令执行失败: "(审计 P3,缺具体原因)
-            self._pending_response = True
-            raise asyncio.TimeoutError(
-                f"读取响应体超时（{timeout}s）。命令: {tcl_command[:200]}"
-            )
-        # 成功收满一帧响应 → 清除 pending 标记(流上不再有在途残留)
-        self._pending_response = False
+        self._response_phase = "body"
+        resp_body = await self._reader.readexactly(resp_len)
         try:
             obj = json.loads(resp_body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -752,29 +773,33 @@ class GuiSession(BaseSession):
         import subprocess
         import sys
 
+        self._closing = True
+        self._state = SessionState.STOPPING
         logger.info("正在关闭 GUI 会话 '%s'...", self.session_id)
 
         # 步骤 1:尝试优雅退出 —— 发 Tcl `exit`,Vivado 自己清 pid/journal
         # attach 模式 OR probe-then-attach 命中外部 GUI 时,都是用户的 Vivado,不主动 exit
-        if (
-            not self._attach_only
-            and not self._attached_external
-            and self._writer is not None
-            and self._state in (SessionState.READY, SessionState.BUSY)
-        ):
-            try:
-                # 不走 execute()(它对 SessionState 有校验),直接裸发
-                payload = b"exit"
-                header = len(payload).to_bytes(4, "big")
-                self._writer.write(header + payload)
-                await self._writer.drain()
-                # 等 socket 被对端关闭(Vivado 退出时自动关连接)
-                await asyncio.wait_for(
-                    self._reader.read(4) if self._reader else asyncio.sleep(0),
-                    timeout=5.0,
-                )
-            except Exception as e:
-                logger.debug("优雅 exit 失败(将走强杀): %s", e)
+        inflight = self._inflight_task
+        if inflight is None or inflight.done():
+            # 没有在途 reader 时才获取 execute 的锁并执行裸协议退出；活跃命令
+            # 场景直接关连接，避免等待长命令导致 stop 死锁。
+            async with self._lock:
+                if (
+                    not self._attach_only
+                    and not self._attached_external
+                    and self._writer is not None
+                ):
+                    try:
+                        payload = b"exit"
+                        header = len(payload).to_bytes(4, "big")
+                        self._writer.write(header + payload)
+                        await self._writer.drain()
+                        await asyncio.wait_for(
+                            self._reader.read(4) if self._reader else asyncio.sleep(0),
+                            timeout=5.0,
+                        )
+                    except Exception as e:
+                        logger.debug("优雅 exit 失败(将走强杀): %s", e)
 
         # 步骤 2:关 socket
         if self._writer is not None:
@@ -843,4 +868,17 @@ class GuiSession(BaseSession):
             self._tmp_script = None
 
         self._state = SessionState.STOPPED
+        inflight = self._inflight_task
+        if inflight is not None:
+            if not inflight.done():
+                inflight.cancel()
+            try:
+                await inflight
+            except (asyncio.CancelledError, Exception):
+                pass
+            if self._inflight_task is inflight:
+                self._inflight_task = None
+        self._pending_response = False
+        self._response_phase = None
+        self._closing = False
         logger.info("GUI 会话 '%s' 已关闭。", self.session_id)

@@ -41,6 +41,10 @@ class SubprocessSession(BaseSession):
         super().__init__(vivado_path=vivado_path, session_id=session_id)
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
+        self._closing = False
+        # 调用方超时后仍由该任务继续读取到本命令的 UUID sentinel。
+        # 在任务完成前禁止发送下一条命令，避免迟到输出污染后续响应。
+        self._inflight_task: asyncio.Task[TclResult] | None = None
         # B5 修复：持续采集 stderr，失败时附加到 output（否则 Vivado 错误消息全丢）
         self._stderr_buffer: collections.deque[str] = collections.deque(
             maxlen=_STDERR_RING_SIZE
@@ -73,6 +77,7 @@ class SubprocessSession(BaseSession):
         if self.is_alive:
             return f"会话 '{self.session_id}' 已在运行中。"
 
+        self._closing = False
         self._state = SessionState.STARTING
         logger.info("启动 Vivado 会话 '%s': %s", self.session_id, self.vivado_path)
 
@@ -203,17 +208,36 @@ class SubprocessSession(BaseSession):
             RuntimeError: 会话未启动或已停止。
             asyncio.TimeoutError: 命令执行超时。
         """
-        if not self.is_alive:
+        if self._closing or not self.is_alive:
             raise RuntimeError(
-                f"会话 '{self.session_id}' 未运行。请先调用 start_session。"
+                f"会话 '{self.session_id}' 正在关闭或未运行。请先调用 start_session。"
             )
 
         async with self._lock:
+            if self._closing:
+                raise RuntimeError(f"会话 '{self.session_id}' 正在关闭，拒绝执行新命令。")
+            if self._inflight_task is not None and not self._inflight_task.done():
+                raise RuntimeError(
+                    f"会话 '{self.session_id}' 的上一条命令仍在执行。"
+                    "请稍后重试；不会向同一 Vivado 会话并发发送新命令。"
+                )
+
             self._state = SessionState.BUSY
+            task = asyncio.create_task(self._execute_impl(tcl_command))
+            self._inflight_task = task
+            task.add_done_callback(self._on_inflight_done)
             try:
-                result = await self._execute_impl(tcl_command, timeout)
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
                 self._state = SessionState.READY
                 return result
+            except asyncio.TimeoutError:
+                # shield 保证底层 reader 继续持有本命令的响应，直到读到专属 sentinel。
+                self._state = SessionState.BUSY
+                raise asyncio.TimeoutError(
+                    f"命令执行超时（{timeout}s），Vivado 可能仍在执行。\n"
+                    f"会话: {self.session_id}\n"
+                    f"命令: {tcl_command[:200]}"
+                ) from None
             except Exception:
                 # 检查进程是否还活着
                 if self.is_alive:
@@ -222,10 +246,23 @@ class SubprocessSession(BaseSession):
                     self._state = SessionState.ERROR
                 raise
 
+    def _on_inflight_done(self, task: asyncio.Task[TclResult]) -> None:
+        """收尾迟到响应；回调会取走后台异常，避免未检索异常告警。"""
+        try:
+            exc = task.exception()
+            if exc is not None:
+                logger.debug("[%s] 在途命令结束时异常: %s", self.session_id, exc)
+        except asyncio.CancelledError:
+            pass
+
+        if self._inflight_task is task:
+            self._inflight_task = None
+            if self._state == SessionState.BUSY:
+                self._state = SessionState.READY if self.is_alive else SessionState.ERROR
+
     async def _execute_impl(
         self,
         tcl_command: str,
-        timeout: float,
     ) -> TclResult:
         """内部执行实现（不加锁）。"""
         assert self._process and self._process.stdin and self._process.stdout
@@ -245,42 +282,26 @@ class SubprocessSession(BaseSession):
         output_lines: list[str] = []
         return_code = -1
 
-        try:
-            deadline = asyncio.get_event_loop().time() + timeout
-            while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError()
-
-                raw = await asyncio.wait_for(
-                    self._process.stdout.readline(),
-                    timeout=remaining,
+        while True:
+            raw = await self._process.stdout.readline()
+            if not raw:
+                raise RuntimeError(
+                    f"Vivado 进程意外终止（会话 '{self.session_id}'）。"
                 )
-                if not raw:
-                    raise RuntimeError(
-                        f"Vivado 进程意外终止（会话 '{self.session_id}'）。"
-                    )
 
-                line = decode_vivado_output(raw).rstrip("\r\n")
+            line = decode_vivado_output(raw).rstrip("\r\n")
 
-                m = pattern.search(line)
-                if m:
-                    return_code = int(m.group(1))
-                    break
+            m = pattern.search(line)
+            if m:
+                return_code = int(m.group(1))
+                break
 
-                # 过滤掉 sentinel 相关的内部变量设置行
-                if not line.startswith("VMCP_ERR:"):
-                    output_lines.append(line)
-                else:
-                    # 错误信息行，去掉前缀后保留
-                    output_lines.append(line[len("VMCP_ERR: "):])
-
-        except asyncio.TimeoutError:
-            raise asyncio.TimeoutError(
-                f"命令执行超时（{timeout}s）。\n"
-                f"会话: {self.session_id}\n"
-                f"命令: {tcl_command[:200]}"
-            )
+            # 过滤掉 sentinel 相关的内部变量设置行
+            if not line.startswith("VMCP_ERR:"):
+                output_lines.append(line)
+            else:
+                # 错误信息行，去掉前缀后保留
+                output_lines.append(line[len("VMCP_ERR: "):])
 
         output = clean_output("\n".join(output_lines))
         is_error = return_code != 0
@@ -314,6 +335,10 @@ class SubprocessSession(BaseSession):
         if not self._process:
             return
 
+        # 在第一次 await 前关闭命令入口。execute 在锁内再次检查该标志，
+        # 因而即使它已通过外层存活检查，也不能在 stop 开始后发送命令。
+        self._closing = True
+        self._state = SessionState.STOPPING
         logger.info("正在关闭 Vivado 会话 '%s'...", self.session_id)
 
         # 取消 stderr drain 任务
@@ -325,12 +350,16 @@ class SubprocessSession(BaseSession):
                 pass
             self._stderr_task = None
 
-        if self.is_alive and self._process.stdin:
-            try:
-                self._process.stdin.write(b"exit\n")
-                await self._process.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass  # 进程可能已退出
+        inflight = self._inflight_task
+        if inflight is None or inflight.done():
+            # 无在途 reader 时与 execute 共用同一把锁，完整保护 exit 的发送。
+            async with self._lock:
+                if self.is_alive and self._process.stdin:
+                    try:
+                        self._process.stdin.write(b"exit\n")
+                        await self._process.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass  # 进程可能已退出
 
         # 等待进程退出
         if self.is_alive:
@@ -348,6 +377,17 @@ class SubprocessSession(BaseSession):
 
         self._state = SessionState.STOPPED
         self._process = None
+        inflight = self._inflight_task
+        if inflight is not None:
+            if not inflight.done():
+                inflight.cancel()
+            try:
+                await inflight
+            except (asyncio.CancelledError, Exception):
+                pass
+            if self._inflight_task is inflight:
+                self._inflight_task = None
+        self._closing = False
         logger.info("Vivado 会话 '%s' 已关闭。", self.session_id)
 
 

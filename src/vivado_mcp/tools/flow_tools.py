@@ -20,6 +20,7 @@ from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
 from vivado_mcp.tcl_scripts import (
     CHECK_PRE_BITSTREAM,
     COUNT_WARNINGS,
+    LAUNCH_RUN_IF_IDLE,
     POLL_RUN_STATUS,
     QUERY_FILESET_OVERRIDES,
 )
@@ -158,11 +159,13 @@ async def _launch_and_wait(
     timeout_minutes: int,
     label: str,
     ctx: Context,
+    wait: bool = True,
 ) -> str:
-    """D5: 执行 reset_run → launch_runs → Python 轮询 → 自动 open_run → 诊断。
+    """原子启动 run；按 wait 选择立即返回或轮询、open_run、诊断。
 
     不再调用 Tcl 的 `wait_on_run`（它会阻塞 Vivado event loop，
-    GUI 模式下会冻住界面）。改用 Python 每 2 秒查一次 STATUS/PROGRESS。
+    GUI 模式下会冻住界面）。wait=True 时改用 Python 每 2 秒查一次
+    STATUS/PROGRESS；wait=False 时返回 job_id，由 get_run_progress 查询。
     """
     timeout_sec = timeout_minutes * 60.0
 
@@ -174,13 +177,50 @@ async def _launch_and_wait(
     # ------------------- 1. 启动 -------------------
     try:
         launch_result = await session.execute(
-            f"reset_run {run_name}\nlaunch_runs {run_name} -jobs {jobs}",
-            timeout=60.0,
+            LAUNCH_RUN_IF_IDLE.format(run_name=run_name, jobs=jobs), timeout=60.0
         )
         if launch_result.is_error:
             return f"[ERROR] 启动 {label} 失败:\n{launch_result.output}"
     except Exception as e:
         return f"[ERROR] 启动 {label} 失败: {e}"
+
+    launch_line = next(
+        (
+            line for line in launch_result.output.splitlines()
+            if line.startswith("VMCP_RUN_LAUNCH|")
+        ),
+        None,
+    )
+    if launch_line is None:
+        return f"[ERROR] 启动 {label} 失败: Vivado 未返回 VMCP_RUN_LAUNCH 状态标记"
+
+    launch_parts = launch_line.split("|", 2)
+    launch_state = launch_parts[1] if len(launch_parts) >= 2 else ""
+    launch_status = launch_parts[2] if len(launch_parts) >= 3 else ""
+    if launch_state == "busy":
+        return (
+            f"[BUSY] {label} run '{run_name}' 已在运行，未执行 reset_run。\n"
+            f"状态: {launch_status}\n"
+            f"请用 get_run_progress(run_name='{run_name}', "
+            f"session_id='{session.session_id}') 查询。"
+        )
+    if launch_state == "missing":
+        return f"[ERROR] 启动 {label} 失败: 找不到 run '{run_name}'"
+    if launch_state != "started":
+        return f"[ERROR] 启动 {label} 失败: 未知启动状态 {launch_state!r}"
+
+    if not wait:
+        result_parts = [
+            f"{label}已异步启动。",
+            f"job_id: {session.session_id}:{run_name}",
+            f"状态: {launch_status or '已提交'}",
+            (
+                f"查询: get_run_progress(run_name='{run_name}', "
+                f"session_id='{session.session_id}')"
+            ),
+        ]
+        result_parts.extend(override_lines)
+        return "\n".join(result_parts)
 
     # ------------------- 2. 轮询 -------------------
     try:
@@ -284,17 +324,20 @@ async def run_synthesis(
     timeout_minutes: int = 30,
     session_id: str = "default",
     ctx: Context = None,
+    wait: bool = True,
 ) -> str:
-    """运行综合。自动执行 reset_run → launch_runs → Python 侧轮询 STATUS/PROGRESS。
+    """启动综合；默认等待完成，也可异步提交后查询状态。
 
     不调用 Tcl wait_on_run(会阻塞 Vivado event loop,GUI 模式冻住界面);
-    Python 每 2 秒查一次状态,期间 GUI 保持响应,并向客户端上报进度。
+    wait=True 时 Python 每 2 秒查一次状态并上报进度；wait=False 时立即
+    返回 job_id，随后用 get_run_progress 查询。
 
     Args:
         run_name: 综合 run 名称，默认 "synth_1"。
         jobs: 并行任务数，默认 4。
         timeout_minutes: 超时分钟数，默认 30。
         session_id: 目标会话 ID。
+        wait: True 等待完成并诊断；False 启动后立即返回 job_id。
     """
     try:
         run_name = validate_identifier(run_name, "run_name")
@@ -306,7 +349,7 @@ async def run_synthesis(
         return _NO_SESSION.format(sid=session_id)
 
     return await _launch_and_wait(
-        session, run_name, jobs, timeout_minutes, "综合", ctx
+        session, run_name, jobs, timeout_minutes, "综合", ctx, wait=wait
     )
 
 
@@ -317,17 +360,20 @@ async def run_implementation(
     timeout_minutes: int = 60,
     session_id: str = "default",
     ctx: Context = None,
+    wait: bool = True,
 ) -> str:
-    """运行实现（布局布线）。自动执行 reset_run → launch_runs → Python 侧轮询。
+    """启动实现（布局布线）；默认等待完成，也可异步提交。
 
     不调用 Tcl wait_on_run(会阻塞 Vivado event loop,GUI 模式冻住界面);
-    Python 每 2 秒查一次 STATUS/PROGRESS,期间 GUI 保持响应,并上报进度。
+    wait=True 时 Python 每 2 秒查一次 STATUS/PROGRESS；wait=False 时立即
+    返回 job_id，随后用 get_run_progress 查询。
 
     Args:
         run_name: 实现 run 名称，默认 "impl_1"。
         jobs: 并行任务数，默认 4。
         timeout_minutes: 超时分钟数，默认 60。
         session_id: 目标会话 ID。
+        wait: True 等待完成并诊断；False 启动后立即返回 job_id。
     """
     try:
         run_name = validate_identifier(run_name, "run_name")
@@ -339,7 +385,7 @@ async def run_implementation(
         return _NO_SESSION.format(sid=session_id)
 
     return await _launch_and_wait(
-        session, run_name, jobs, timeout_minutes, "实现", ctx
+        session, run_name, jobs, timeout_minutes, "实现", ctx, wait=wait
     )
 
 

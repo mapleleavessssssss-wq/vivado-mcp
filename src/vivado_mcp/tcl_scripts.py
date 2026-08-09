@@ -63,6 +63,29 @@ puts "VMCP_POLL|$__s|$__p|$__e"
 """
 
 # --------------------------------------------------------------------------- #
+#  原子启动 run：同一条 Tcl 命令内检查运行态，再 reset + launch。
+#  防止两个并发 MCP 工作流在 Python 多次 execute 之间交错，重置正在运行的同名 run。
+#  输出：VMCP_RUN_LAUNCH|started/busy/missing|<STATUS>
+# --------------------------------------------------------------------------- #
+
+LAUNCH_RUN_IF_IDLE = """\
+set __r [get_runs -quiet {run_name}]
+if {{$__r eq ""}} {{
+    puts "VMCP_RUN_LAUNCH|missing|"
+}} else {{
+    set __s [get_property STATUS $__r]
+    if {{[string match -nocase "*Running*" $__s]
+         || [string match -nocase "*Queued*" $__s]}} {{
+        puts "VMCP_RUN_LAUNCH|busy|$__s"
+    }} else {{
+        reset_run {run_name}
+        launch_runs {run_name} -jobs {jobs}
+        puts "VMCP_RUN_LAUNCH|started|[get_property STATUS $__r]"
+    }}
+}}
+"""
+
+# --------------------------------------------------------------------------- #
 #  查询 sources_1 fileset 上的参数覆盖(generic / verilog_define)
 #  用途(PRD B4):_launch_and_wait 启动综合/实现前读取,把 fileset 上设置的参数
 #  明示进结果,防止"以为 set_property generic 生效了实际没设上"的隐性坑。

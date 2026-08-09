@@ -640,7 +640,7 @@ class TestLaunchAndWaitDiag:
                 # 1. QUERY_FILESET_OVERRIDES (B4)
                 _make_tcl_result(_EMPTY_OVERRIDES),
                 # 2. reset_run + launch_runs
-                _make_tcl_result("Synthesis launched"),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 # 3. 第一次 poll：已 Complete
                 _make_tcl_result(
                     "VMCP_POLL|synth_design Complete!|100%|00:05:30"
@@ -674,7 +674,7 @@ class TestLaunchAndWaitDiag:
                 # 1. QUERY_FILESET_OVERRIDES (B4)
                 _make_tcl_result(_EMPTY_OVERRIDES),
                 # 2. launch
-                _make_tcl_result("Implementation launched"),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 # 3. poll 已完成
                 _make_tcl_result(
                     "VMCP_POLL|route_design Complete!|100%|00:10:00"
@@ -709,7 +709,7 @@ class TestLaunchAndWaitDiag:
                     "VMCP_FS_OVERRIDE:generic=WIDTH=8 DEPTH=16\n"
                     "VMCP_FS_OVERRIDE:verilog_define="
                 ),
-                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
                 _make_tcl_result(""),
                 _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
@@ -736,7 +736,7 @@ class TestLaunchAndWaitDiag:
         session.execute = AsyncMock(
             side_effect=[
                 _make_tcl_result(_EMPTY_OVERRIDES),
-                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
                 _make_tcl_result(""),
                 _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
@@ -760,7 +760,7 @@ class TestLaunchAndWaitDiag:
         session.execute = AsyncMock(
             side_effect=[
                 _make_tcl_result("ERROR: no such fileset sources_1", return_code=1),
-                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
                 _make_tcl_result(""),
                 _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
@@ -787,7 +787,7 @@ class TestLaunchAndWaitDiag:
         session.execute = AsyncMock(
             side_effect=[
                 _make_tcl_result(_EMPTY_OVERRIDES),
-                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
                 _make_tcl_result(""),
                 # 诊断计数:Tcl 报错(如项目被关掉)
@@ -813,7 +813,7 @@ class TestLaunchAndWaitDiag:
         session.execute = AsyncMock(
             side_effect=[
                 _make_tcl_result(_EMPTY_OVERRIDES),
-                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
                 _make_tcl_result(""),
                 # rc=0 但输出没有 VMCP_DIAG 行 → parse 返回 (-1,-1,-1)
@@ -828,6 +828,112 @@ class TestLaunchAndWaitDiag:
 
         assert "[DEGRADED] 诊断计数不可用" in result
         assert "errors=-1" not in result
+
+    @pytest.mark.asyncio
+    async def test_wait_false_returns_job_without_polling(self):
+        """异步模式只提交 run，复用 get_run_progress，不启动后台轮询任务。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.session_id = "build-a"
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session,
+            "synth_1",
+            jobs=4,
+            timeout_minutes=30,
+            label="综合",
+            ctx=ctx,
+            wait=False,
+        )
+
+        assert "综合已异步启动" in result
+        assert "job_id: build-a:synth_1" in result
+        assert "get_run_progress" in result
+        assert session.execute.await_count == 2
+        launch_tcl = session.execute.await_args_list[1].args[0]
+        assert "*Running*" in launch_tcl
+        assert launch_tcl.index("*Running*") < launch_tcl.index("reset_run synth_1")
+        assert "launch_runs synth_1 -jobs 4" in launch_tcl
+
+    @pytest.mark.asyncio
+    async def test_running_run_is_not_reset(self):
+        """同名 run 运行中时返回 BUSY，原子 Tcl 分支不会执行 reset。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.session_id = "build-a"
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("VMCP_RUN_LAUNCH|busy|synth_design Running"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session,
+            "synth_1",
+            jobs=4,
+            timeout_minutes=30,
+            label="综合",
+            ctx=ctx,
+            wait=False,
+        )
+
+        assert result.startswith("[BUSY]")
+        assert "未执行 reset_run" in result
+        assert "get_run_progress" in result
+        assert session.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_run_synthesis_forwards_wait_false(self):
+        """公开工具保留原名，通过 wait=False 进入异步分支。"""
+        from vivado_mcp.tools.flow_tools import run_synthesis
+
+        session = AsyncMock()
+        session.session_id = "public"
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await run_synthesis(ctx=ctx, wait=False)
+
+        assert "job_id: public:synth_1" in result
+        assert session.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_run_implementation_forwards_wait_false(self):
+        """实现工具与综合工具共享相同的异步提交契约。"""
+        from vivado_mcp.tools.flow_tools import run_implementation
+
+        session = AsyncMock()
+        session.session_id = "public"
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await run_implementation(ctx=ctx, wait=False)
+
+        assert "job_id: public:impl_1" in result
+        assert session.execute.await_count == 2
 
 
 # ====================================================================== #
