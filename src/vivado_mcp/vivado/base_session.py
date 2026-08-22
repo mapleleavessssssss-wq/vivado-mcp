@@ -13,6 +13,7 @@ import time
 from abc import ABC, abstractmethod
 from enum import Enum
 
+from vivado_mcp.config import get_vivado_version
 from vivado_mcp.vivado.tcl_utils import TclResult
 
 
@@ -75,6 +76,15 @@ class BaseSession(ABC):
     async def stop(self, timeout: float = 10.0) -> None:
         """关闭会话。"""
 
+    async def detach(self) -> None:
+        """Detach during MCP shutdown.
+
+        Headless Tcl sessions have no useful independent lifetime, so the base
+        behavior stops them.  GUI sessions override this to preserve the user's
+        visible Vivado process while closing only the MCP transport.
+        """
+        await self.stop()
+
     def status_dict(self) -> dict:
         """返回会话状态信息字典。"""
         d = {
@@ -82,6 +92,7 @@ class BaseSession(ABC):
             "mode": self.mode,
             "state": self._state.value,
             "vivado_path": self.vivado_path,
+            "vivado_version": get_vivado_version(self.vivado_path),
             "is_alive": self.is_alive,
             "uptime_seconds": round(self.uptime_seconds, 1),
         }

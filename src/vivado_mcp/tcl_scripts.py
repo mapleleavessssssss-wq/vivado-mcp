@@ -63,9 +63,9 @@ puts "VMCP_POLL|$__s|$__p|$__e"
 """
 
 # --------------------------------------------------------------------------- #
-#  原子启动 run：同一条 Tcl 命令内检查运行态，再 reset + launch。
-#  防止两个并发 MCP 工作流在 Python 多次 execute 之间交错，重置正在运行的同名 run。
-#  输出：VMCP_RUN_LAUNCH|started/busy/missing|<STATUS>
+#  原子启动 run：同一条 Tcl 命令内检查状态，只允许 Not started 后 launch。
+#  防止两个并发 MCP 工作流在 Python 多次 execute 之间交错；绝不隐式 reset。
+#  输出：VMCP_RUN_LAUNCH|started/busy/not_ready/missing|<STATUS>
 # --------------------------------------------------------------------------- #
 
 LAUNCH_RUN_IF_IDLE = """\
@@ -77,8 +77,9 @@ if {{$__r eq ""}} {{
     if {{[string match -nocase "*Running*" $__s]
          || [string match -nocase "*Queued*" $__s]}} {{
         puts "VMCP_RUN_LAUNCH|busy|$__s"
+    }} elseif {{![string equal -nocase $__s "Not started"]}} {{
+        puts "VMCP_RUN_LAUNCH|not_ready|$__s"
     }} else {{
-        reset_run {run_name}
         launch_runs {run_name} -jobs {jobs}
         puts "VMCP_RUN_LAUNCH|started|[get_property STATUS $__r]"
     }}
@@ -98,6 +99,51 @@ QUERY_FILESET_OVERRIDES = """\
 set __fs [get_filesets sources_1]
 puts "VMCP_FS_OVERRIDE:generic=[get_property generic $__fs]"
 puts "VMCP_FS_OVERRIDE:verilog_define=[get_property verilog_define $__fs]"
+"""
+
+
+# --------------------------------------------------------------------------- #
+#  启动 run 前的轻量状态门禁。只读 STATUS/PROGRESS/NEEDS_REFRESH；
+#  由 Python 决定 UP_TO_DATE / ALREADY_RUNNING / OUT_OF_DATE / 可启动。
+# --------------------------------------------------------------------------- #
+
+QUERY_RUN_LAUNCH_STATE = """\
+set __runs [get_runs -quiet {run_name}]
+if {{[llength $__runs] != 1}} {{
+    puts "VMCP_LAUNCH_STATE|found=0|count=[llength $__runs]"
+}} else {{
+    set __run [lindex $__runs 0]
+    set __status [get_property STATUS $__run]
+    set __progress [get_property PROGRESS $__run]
+    set __needs_refresh ""
+    catch {{set __needs_refresh [get_property NEEDS_REFRESH $__run]}}
+    set __launch_state [join [list "VMCP_LAUNCH_STATE" "found=1" \
+        "status=$__status" "progress=$__progress" \
+        "needs_refresh=$__needs_refresh"] "|"]
+    puts $__launch_state
+}}
+"""
+
+
+# --------------------------------------------------------------------------- #
+#  读取 run 已生成报告前的来源/新鲜度上下文。
+# --------------------------------------------------------------------------- #
+
+QUERY_RUN_REPORT_CONTEXT = """\
+set __runs [get_runs -quiet {run_name}]
+if {{[llength $__runs] != 1}} {{
+    puts "VMCP_REPORT_CONTEXT|found=0|count=[llength $__runs]"
+}} else {{
+    set __run [lindex $__runs 0]
+    set __status [get_property STATUS $__run]
+    set __directory [get_property DIRECTORY $__run]
+    set __needs_refresh ""
+    catch {{set __needs_refresh [get_property NEEDS_REFRESH $__run]}}
+    set __report_context [join [list "VMCP_REPORT_CONTEXT" "found=1" \
+        "status=$__status" "directory=$__directory" \
+        "needs_refresh=$__needs_refresh"] "|"]
+    puts $__report_context
+}}
 """
 
 # --------------------------------------------------------------------------- #

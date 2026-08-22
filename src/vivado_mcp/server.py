@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from mcp.server import MCPServer
 
+from vivado_mcp import __version__
 from vivado_mcp import prompts as _prompts
 from vivado_mcp.config import find_vivado
 from vivado_mcp.vivado.session import VivadoSession
@@ -66,9 +67,12 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     try:
         vivado_path = find_vivado()
         logger.info("检测到 Vivado: %s", vivado_path)
-    except FileNotFoundError as e:
-        logger.warning("Vivado 路径检测失败: %s", e)
-        logger.warning("工具仍可使用，但需要在 start_session 时手动指定路径。")
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.warning(
+            "Vivado auto-discovery is unavailable or ambiguous; "
+            "use start_session(vivado_version=...) or an absolute vivado_path."
+        )
+        logger.debug("Vivado discovery detail: %s", e)
         vivado_path = ""
 
     manager = SessionManager(vivado_path=vivado_path)
@@ -77,12 +81,30 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
         yield AppContext(session_manager=manager)
     finally:
         _manager_ref = None
-        await manager.close_all()
+        # Codex/MCP 生命周期结束不等于用户授权关闭可见 Vivado GUI。
+        # GuiSession.detach() 只断传输；无头 Tcl session 仍按基类 stop 清理。
+        await manager.detach_all()
 
 
 # 创建 MCPServer 实例
 mcp = MCPServer(
     "vivado-mcp",
+    version=__version__,
+    instructions=(
+        "仅用于 FPGA、RTL、Vivado 与 AMD/Xilinx 任务。任何写入或状态变化前，"
+        "必须报告并核对完整 .xpr、project、part、top、Vivado version、session。"
+        "多实例或身份不一致时停止。不得自动 reset_runs、覆盖 XDC、升级 IP、"
+        "修改 Block Design、生成 bitstream、program FPGA、写 Flash 或执行来源不明 Tcl。"
+        "综合成功不代表实现/时序通过，bitstream 成功不授权烧录。硬件、网络、"
+        "run_tcl/safe_tcl 及副作用不明操作始终需要用户确认。本 server 只控制 "
+        "Vivado，不把 Vitis/SDK/XSCT/XSDB 命令交给 Vivado run_tcl。调用版本敏感的 "
+        "Vivado Tcl 前先用 get_vivado_capabilities；gate=FAIL/UNKNOWN 时停止。"
+        "默认采用快速证据路径：同一 run/设计状态不重复报告；综合、实现和 Bitstream "
+        "启动后按需低频查进度；成功路径不自动扫描完整日志。只有失败、明确诊断或 "
+        "signoff 才展开 warning、Top10 path、methodology/DRC 等深度检查。"
+        "report_methodology 仅在首次综合或重要模块/XDC/clock 变化后重跑；"
+        "report_qor_suggestions 还必须核对 fully routed、器件族和 baseline strategy。"
+    ),
     lifespan=app_lifespan,
 )
 
@@ -400,10 +422,13 @@ _prompts.register_prompts(mcp)
 #  导入工具模块，触发 @mcp.tool() 装饰器注册
 # --------------------------------------------------------------------------- #
 
+import vivado_mcp.tools.compile_tools  # noqa: E402, F401
 import vivado_mcp.tools.diagnostic_tools  # noqa: E402, F401
 import vivado_mcp.tools.flow_tools  # noqa: E402, F401
+import vivado_mcp.tools.ila_tools  # noqa: E402, F401
 import vivado_mcp.tools.introspect_tools  # noqa: E402, F401
 import vivado_mcp.tools.ip_tools  # noqa: E402, F401
+import vivado_mcp.tools.project_tools  # noqa: E402, F401
 import vivado_mcp.tools.report_tools  # noqa: E402, F401
 import vivado_mcp.tools.session_tools  # noqa: E402, F401
 import vivado_mcp.tools.tcl_tools  # noqa: E402, F401

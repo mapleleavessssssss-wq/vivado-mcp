@@ -5,31 +5,50 @@
 [![License](https://img.shields.io/github/license/mapleleavessssssss-wq/vivado-mcp)](LICENSE)
 [![CI](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mapleleavessssssss-wq/vivado-mcp/actions/workflows/ci.yml)
 
-**让 Claude Code、Cursor、Codex 等 AI Agent 安全驱动本地 Xilinx Vivado。**
+**让 Claude Code、Cursor、Codex 等 AI Agent 安全驱动本地 AMD/Xilinx Vivado。**
 
-30 个精选 MCP 工具覆盖会话、综合、实现、时序、XDC、IP、波形与烧录；其余 Vivado 能力由通用 `run_tcl` 承载。相比把每条 Tcl 命令包装成工具，这种设计占用更少上下文，也更容易跨 Vivado 版本维护。
+39 个精选 MCP 工具覆盖会话、综合、实现、时序、XDC、IP、波形与烧录；其余 Vivado 能力由通用 `run_tcl` 承载。相比把每条 Tcl 命令包装成工具，这种设计占用更少上下文，也更容易跨 Vivado 版本维护。
 
-| 30 个精选工具 | 8 个证据驱动工作流 | 2 个实时 Resources | GUI / Tcl / attach 三种会话 |
+| 39 个精选工具 | 8 个证据驱动工作流 | 2 个实时 Resources | GUI / Tcl / attach 三种会话 |
 |---:|---:|---:|---:|
 
 > 本项目控制的是**你本机安装的 Vivado**，不是云端综合服务。命令在当前用户权限下执行；工具说明和诊断建议以中文为主。
 >
-> **English:** A lean MCP server for driving local Xilinx Vivado from AI agents. It provides 30 curated tools, 8 evidence-gated workflow prompts, GUI/headless/attach sessions, and raw Tcl escape hatches.
+> **English:** A lean MCP server for driving local AMD/Xilinx Vivado from AI agents, with 39 curated tools, eight evidence-gated workflow prompts, explicit multi-version selection, and conservative side-effect annotations.
 
-**导航**：[快速开始](#快速开始) · [为什么是 30 个工具](#设计哲学--为什么是-30-个工具而不是-500-个) · [工作流 Prompts](#工作流-prompts) · [工具列表](#工具列表) · [会话模式](#会话模式) · [架构](#架构) · [CLI](#cli-参考) · [反馈](#反馈与-bug-提交)
+**导航**：[快速开始](#快速开始) · [产品边界](#产品边界vivado-不是-vitis) · [为什么是 39 个工具](#设计哲学--为什么是-39-个工具而不是-500-个) · [工作流 Prompts](#工作流-prompts) · [工具列表](#工具列表) · [会话模式](#会话模式) · [架构](#架构) · [CLI](#cli-参考) · [反馈](#反馈与-bug-提交)
 
 ## 环境要求
 
 - **Python ≥ 3.10**，Windows / Linux
-- **Xilinx Vivado**：必须安装在运行 vivado-mcp 的本机
+- **AMD/Xilinx Vivado**：必须安装在运行 vivado-mcp 的本机
 - **MCP Python SDK 2.x**：唯一直接运行时依赖，`pip` 会自动安装
 
 | Vivado 版本 | 支持等级 | 验证范围 |
 |---|---|---|
+| 2018.3 | **重点兼容 profile** | 本机空 GUI、隔离工程 synth/route、报告解析 |
 | 2019.1 | **主要支持基线** | 作者长期实测 GUI / Tcl / attach 与完整 FPGA 流程 |
-| 2018.3 | **部分路径验证** | 社区贡献者验证 IPDEF-only IP 元数据（[PR #1](https://github.com/mapleleavessssssss-wq/vivado-mcp/pull/1)） |
-| 2022.2 | **社区现场验证** | Windows 10 GUI/XSim 问题现场（[Issue #2](https://github.com/mapleleavessssssss-wq/vivado-mcp/issues/2)），不代表完整回归 |
-| 其他版本 | **实验性兼容** | 协议层为纯 Tcl，但未持续做真机矩阵；请先跑下方冒烟验证 |
+| 2020.2 | **重点兼容 profile** | 本机空 GUI、隔离工程 synth/route、报告解析 |
+| 2024.2 | **重点兼容 profile** | 本机空 GUI、隔离工程 synth/route、报告解析 |
+| 2022.2 | **社区现场验证** | Windows 10 GUI/XSim 问题现场（[Issue #2](https://github.com/mapleleavessssssss-wq/vivado-mcp/issues/2)） |
+| 其他版本 | **实验性兼容** | 先运行 doctor、显式选择版本并做只读冒烟验证 |
+
+## 产品边界：Vivado 不是 Vitis
+
+本 MCP 只连接 **Vivado Tcl 解释器**。范围包括 Vivado 工程、综合、实现、XSim、
+Bitstream、Vivado Hardware Manager/ILA，以及 XPR/XCI/BIT/LTX/XDC 离线检查。
+它不管理 SDK/Vitis workspace、platform、domain、BSP、application、ELF 或处理器
+调试，也不会把独立的 XSCT/XSDB 命令伪装成 Vivado `run_tcl`。
+
+- 2018.3 的软件侧是 Xilinx SDK + XSCT Tcl。
+- 2020.2 的软件侧主要是 Vitis Classic + XSCT Tcl。
+- 2024.2 Vitis Unified 的工程自动化主要使用 Vitis Python API；XSDB、HLS、
+  `vitis-run` 和 `v++` 也有各自入口，不能概括成同一个 Vivado Tcl surface。
+
+推荐边界是：Vivado MCP 生成 Bitstream/XSA，独立 Vitis MCP 显式消费 XSA并生成或
+调试 ELF。版本敏感的 **Vivado** Tcl 命令先调用 `get_vivado_capabilities`；返回
+`FAIL` 或 `UNKNOWN` 时停止，不用版本号猜测。详见
+[版本兼容矩阵](docs/VIVADO_VERSION_COMPATIBILITY.md)。
 
 ## 快速开始
 
@@ -47,31 +66,53 @@ python -m pip install vivado-mcp
 vivado-mcp doctor
 ```
 
-`doctor` 默认完全只读，检查 Vivado 路径、init Tcl 注入、9999 端口协议、Claude Code/Codex 配置，并给出精确的修复计划。CI 或 Agent 可使用结构化输出：
+`doctor` 默认完全只读，检查 Vivado 路径、init Tcl、9999 端口协议和客户端配置。CI 或 Agent 可使用 `vivado-mcp doctor --json` 获取结构化输出。
 
-```bash
-vivado-mcp doctor --json
+### 3. 配置 MCP client
+
+推荐直接让 client 启动 MCP；正常的 `start_session(mode="gui")` 会使用一次性 `-source` bootstrap，不要求修改任何 `Vivado_init.tcl`。多版本并存时在工具调用中显式传 `vivado_version`，例如 `2024.2`。
+
+Codex 用户级配置建议使用虚拟环境绝对路径：
+
+```toml
+[mcp_servers.vivado]
+command = "C:\\absolute\\path\\vivado-mcp\\.venv\\Scripts\\python.exe"
+args = ["-m", "vivado_mcp"]
+cwd = "C:\\absolute\\path\\vivado-mcp"
+enabled = true
+required = false
+startup_timeout_sec = 30
+tool_timeout_sec = 3600
+default_tools_approval_mode = "prompt"
 ```
 
-### 3. 注入 Vivado（一次性）
+### 4. 可选：为手工启动的 GUI 注入（高级兼容方式）
 
 ```bash
 vivado-mcp install
 ```
 
-这会修改你 Vivado 的 `Vivado_init.tcl`，让以后启动 GUI 时自动开启 TCP server（绑定 install 指定的单一端口，默认 9999；被占即退出，不会滑动到其他端口）。**原文件会备份**，`vivado-mcp uninstall` 可恢复。
+只有“先手工启动 GUI、以后再 attach”才需要它。该命令会修改指定 Vivado 安装的
+`scripts/Vivado_init.tcl`；AMD 文档明确说明安装目录初始化脚本会影响从该安装启动的
+全部会话，并非 GUI-only。它绑定 install 指定的单一 localhost 端口（默认 9999），
+被占即退出，不会滑动到其他端口。**原文件会备份**，`vivado-mcp uninstall` 可移除
+注入块。普通 Codex 使用不要执行此步骤。
 
 如果 Vivado 装在受保护目录（如 `C:\Program Files\`），用管理员身份运行命令即可。
 
-也可以让 doctor 执行安全修复：
+### 5. 其他客户端与自动配置
+
+也可以让 doctor 在备份后写入选定客户端配置：
 
 ```bash
 vivado-mcp doctor --fix --client all
 ```
 
-`--fix` 才会写文件：复用幂等的 Vivado 注入，并在备份后原子更新选定客户端配置；不会删除第三方注入、终止占用端口的进程或自动升级软件。
+`--fix` 才会写文件：默认只在备份后原子更新选定客户端配置，不修改
+`Vivado_init.tcl`。只有“先手工启动 GUI、以后再 attach”的场景才额外传
+`--install-init`；doctor 不会删除第三方注入、终止占用端口的进程或自动升级软件。
 
-### 4. 配置 MCP 客户端
+### 6. 配置其他 MCP 客户端
 
 `doctor --fix` 可自动配置 Claude Code 和 Codex。手动配置时，Claude Code 使用 `~/.claude.json`，Cursor 使用项目级 `.cursor/mcp.json` 或用户级 `~/.cursor/mcp.json`；两者都在 `mcpServers` 中加入：
 
@@ -102,21 +143,24 @@ VIVADO_PATH = "D:/Xilinx/Vivado/2019.1/bin/vivado.bat"
 > - **Linux**: `"/opt/Xilinx/Vivado/<版本>/bin/vivado"`
 > - 也可以不设置 `VIVADO_PATH`，将 Vivado `bin` 目录加入系统 `PATH`。
 >
-> `VIVADO_PATH` 负责让 MCP server 找到 Vivado 可执行文件；上一步的 `vivado-mcp install` 负责给 GUI/attach 模式注入 TCP server。其他支持 stdio MCP 的客户端使用相同的 `command`、`args` 和 `env`，配置文件位置以客户端文档为准。
+> `VIVADO_PATH` 负责让 MCP server 找到 Vivado 可执行文件。普通 GUI 模式由
+> `start_session` 一次性启动 TCP endpoint；只有手工 GUI 的后续 attach 才需要
+> 可选的 `vivado-mcp install`。其他 stdio MCP 客户端使用相同的 `command`、
+> `args` 和 `env`，配置文件位置以客户端文档为准。
 
-### 5. 重启 MCP 客户端
+### 7. 重启 MCP 客户端
 
-配置完成后重启客户端，即可加载 30 个工具、8 个工作流 Prompt 和 2 个会话状态 Resource。
+配置完成后重启客户端，即可加载 39 个工具、8 个工作流 Prompt 和 2 个会话状态 Resource。
 
-### 6. 冒烟验证
+### 8. 冒烟验证
 
 在客户端中发送：
 
 ```text
-启动一个 GUI 会话，然后执行 Tcl: version -short
+启动一个 2024.2 GUI 空会话，然后执行只读版本查询
 ```
 
-AI 应依次调用 `start_session(mode="gui")` 和 `run_tcl("version -short")`。成功时 Vivado GUI 会启动（已有注入服务则直接 attach），并返回版本号。失败时直接运行 `vivado-mcp doctor`，无需逐项猜配置。
+AI 应调用 `start_session(mode="gui", vivado_version="2024.2")`，随后只读查询 `version -short`。失败时先运行 `vivado-mcp doctor`，不要反复修改工程或 init Tcl。
 
 <details>
 <summary>从源码安装（开发/贡献）</summary>
@@ -130,7 +174,7 @@ pip install -e ".[dev]"
 
 各版本的完整变更和迁移说明见 [CHANGELOG](CHANGELOG.md)。
 
-## 设计哲学 — 为什么是 30 个工具而不是 500 个？
+## 设计哲学 — 为什么是 39 个工具而不是 500 个？
 
 部分同类 Vivado MCP 采用数百个细粒度工具，其中许多只是单条 Tcl 的包装。问题是：
 
@@ -145,23 +189,53 @@ pip install -e ".[dev]"
 3. **跨命令协议**：sentinel、会话管理、超时、比特流前置安全检查
 4. **跨会话工具**：`compare_xci` 纯 Python 对比两个 XCI 文件，不需要 Vivado
 
-其他（BD / 仿真 / XSCT / 硬件调试 / IP 配置等）全部交给 `run_tcl`，让大模型自己拼 Tcl。
+其他 Vivado 内部操作（BD / 仿真 / Vivado Hardware Manager / IP 配置等）可在审批后
+交给 `run_tcl`。SDK、Vitis、XSCT 和 XSDB 是独立工具环境，不属于该入口。
 
 ## 特性
 
 - **三种会话模式**：GUI 可视化、Tcl 无头运行，以及只连接现有 GUI 的 attach
-- **30 个精选工具** — 覆盖完整 FPGA 开发流程、智能诊断、离线解析和外部工具链联动
+- **39 个精选工具 + 显式副作用注解** — 覆盖完整 FPGA 开发流程、智能诊断、离线解析和外部工具链联动
 - **8 个证据驱动工作流** — 每个流程都要求新鲜基线、最小安全修改、复测门禁与明确停止条件
-- **一条命令自检** — `doctor` 只读定位环境问题，`doctor --fix` 才执行受限、可备份的修复
-- **可靠的长任务协议** — 综合/实现支持 `wait=False` 立即返回 job id，再由 `get_run_progress` 查询
-- **超时响应不串台** — 每个 session 保留在途响应所有权；旧响应完成前拒绝下一命令，不会把 FIRST 的结果交给 SECOND
+- **一条命令自检** — `doctor` 默认只读；显式 `--fix` 只执行受限、可备份的修复
+- **可靠的长任务协议** — 综合/实现默认异步返回 job id，也兼容显式等待并由 `get_run_progress` 查询
+- **超时响应不串台** — 每个 session 保留在途响应所有权；旧响应完成前拒绝下一命令
 - **智能诊断** — 综合/实现后自动提取 CRITICAL WARNING / ERROR 分类 + 中文修复建议（含 18+ 种已知 ID）
 - **IO 验证** — XDC 约束（**支持 -dict 和传统两种语法**）对比实际引脚分配，GT 端口不匹配标记为 CRITICAL
 - **IP 调试** — 查询 IP 所有 CONFIG.* 参数（含 GUI 隐藏参数）、纯 Python 对比两个 XCI 文件
 - **Bitstream 安全检查** — 生成比特流前自动检测 CRITICAL WARNING 并阻止（可 force 跳过）
 - **结构化报告** — IO 和时序报告解析为 JSON，便于 AI 精确提取数值（**不再有"假 PASS"陷阱**）
 - **安全转义** — `safe_tcl` 自动对路径/标识符做 Tcl list 转义，Windows 含空格/中文/$ 的路径也能用
-- **多会话支持** — 默认复用端口 9999 的单个 GUI（不同 session_id 也 attach 同一台）；传 `port=0` 自动分配空闲端口启动独立实例；server 只绑单一端口，被占即退出不滑动
+- **多会话支持** — GUI 默认 `port=0` 自动分配回环端口并启动独立实例；显式非零端口才探测/attach；握手核对 endpoint 类型和 Vivado 版本
+
+### 编译性能默认值
+
+MCP 默认采用“一个决定、一份证据”，不把所有可用报告串成固定流水线：
+
+| 阶段 | 默认行为 | 只有何时才深查 |
+|---|---|---|
+| `get_compile_profile` | 一次只读查询拿 project/run 状态、策略、线程、已有报告与 checkpoint | 需要决定是否 launch、是否复用报告或是否考虑增量编译时调用 |
+| `run_synthesis` | 先拒绝已完成、运行中、失败或过期的 run；只对 `Not started` 查询一次 generic/define 后启动并返回 | `post_check="always"` 才在完成后扫描完整日志 |
+| `run_implementation` | 同样只启动 `Not started` run，不重复查询只影响综合的 generic/define | 资源超限或拥塞是当前问题时再查 utilization |
+| `get_timing_report` | `source="auto"` 优先复用已完成且未过期 run 的现有 timing summary | 没有有效生成报告时才 live 生成；FAIL 且要定位根因时再展开 Top10 |
+| `generate_bitstream` | 实现状态/CW fail-closed 检查后启动并返回 | 只有明确需要同步等待时传 `wait_for_completion=True` |
+| `get_pre_commit_summary` | 不属于编译固定步骤 | 只有确实要形成提交/签收摘要时调用 |
+
+同一 run 状态下不要连续调用 `get_timing_report`、`check_bitstream_readiness` 和
+`get_pre_commit_summary`；三者包含重叠的 timing/CW/资源采样。默认轮询间隔为 5 秒，
+长任务优先让 Vivado 自己运行，按需低频调用 `get_run_progress`。
+
+`launch_runs -jobs N` 表示可同时调度的 run 槽位，不是单个综合/实现 run 的 CPU
+线程数。需要控制单个 run 时，先读 `get_compile_profile`，再显式给
+`run_synthesis(..., max_threads=1..8)` 或 `run_implementation(..., max_threads=1..8)`；
+默认 `max_threads=0` 继承当前 Vivado 设置。显式值只写入本次 launch 的子 run，
+随后恢复父 GUI 会话参数。
+
+`configure_incremental_compile` 默认 `apply=False`，只给计划；`apply=True` 也必须核对
+完整 `.xpr`、project、part、top 和 Vivado version，且只切换 implementation run 的
+automatic incremental checkpoint，不 reset、不 launch。小设计或大幅 RTL/XDC/时钟变化
+不应机械启用增量模式。Methodology 与 QoR Suggestions 也只在对应阶段运行，不是每轮
+编译的固定检查。
 
 ## 工作流 Prompts
 
@@ -184,18 +258,18 @@ Prompts 解决的是“按什么顺序做、什么证据才算完成”，不会
 
 | mode | 效果 | 适合 |
 |---|---|---|
-| `"gui"` (默认) | **先 probe 端口**(0.3.19+):已有 vmcp server 直接 attach,没有才 spawn `vivado -mode gui` | 交互开发、实时观察波形/原理图;**支持复用你手动开的 GUI**(只要装过 `vivado-mcp install`) |
+| `"gui"` (默认) | `port=0` 时分配独立 localhost 端口并 spawn；显式非零端口才先做强身份 probe | 交互开发、实时观察波形/原理图 |
 | `"tcl"` | `vivado -mode tcl` 无头子进程 | CI、批处理、不需要 GUI |
-| `"attach"` | 只 attach,不 spawn(端口无 server 时直接报错) | 严格保证不会启新 GUI 进程的场景 |
+| `"attach"` | 只 attach,不 spawn；必须传显式非零端口 | 严格保证不会启新 GUI 进程的场景 |
 
 ```
 用户: 启动 GUI 会话
 AI: [调用 start_session(mode="gui")]
-    → 端口空 → spawn 新 Vivado;端口已有 → attach 到现有 GUI(0.3.19+)
+    → auto-alloc localhost 端口 → spawn 新 Vivado → 强身份握手
     
 用户: 我刚自己手动开了 Vivado GUI,直接接管
 AI: [调用 list_sessions]   → 看到 <external@9999>(你手动开的)
-    [调用 start_session(mode="gui")]   → 自动 attach,不会再开第二个 GUI
+    [调用 start_session(mode="attach", port=9999)] → 显式 attach
 
 用户: 批处理跑 10 个项目
 AI: [调用 start_session(mode="tcl")] → 无 GUI,跑得更快
@@ -224,7 +298,10 @@ get_run_progress(run_name="synth_1", session_id="default")
 | 工具 | 说明 |
 |------|------|
 | `start_session` | 启动 Vivado 会话（gui/tcl/attach 三种模式） |
+| `list_vivado_installations` | 离线列出全部安装、路径和已知 Tcl compatibility profile |
+| `get_vivado_capabilities` | 只读使用 `info commands` 检查当前解释器的精确命令能力；不执行目标命令 |
 | `stop_session` | 关闭指定会话(B13 修复:taskkill /T 递归杀进程树 + 清 vivado_pid*.str) |
+| `detach_session` | 只断开 MCP transport，保留可见 Vivado GUI |
 | `list_sessions` | 列出所有活跃会话 |
 
 ### Tcl 执行（核心）
@@ -233,14 +310,28 @@ get_run_progress(run_name="synth_1", session_id="default")
 | `run_tcl` | 执行任意 Vivado Tcl 命令——**AI 拼命令的主力** |
 | `safe_tcl` | 带参数模板，自动 Tcl 转义，路径含空格/中文/$ 时使用 |
 
+### Live GUI 工程同步
+| 工具 | 说明 |
+|------|------|
+| `sync_project_files` | 身份校验后把本次新增 RTL/XDC/TB 加入已打开工程；默认 dry-run，`apply=True` 执行 `add_files` 并刷新 compile order，无需重开 GUI |
+| `setup_debug_after_synth` | 默认只核对身份并输出 PLAN_ONLY；`apply=True` 才打开综合 run、校验网表并重建 ILA/Debug Hub、保存目标 Debug XDC |
+
 ### 设计流程
 | 工具 | 说明 |
 |------|------|
-| `run_synthesis` | 运行综合，Python 轮询不阻塞，完成后自动 open_run + 诊断 |
-| `run_implementation` | 运行实现（布局布线） |
+| `get_compile_profile` | 一次只读获取项目/run 状态、策略、线程、timing stats 和已有 `.rpt`/`.dcp` |
+| `configure_incremental_compile` | 默认 PLAN_ONLY；核对工程身份后才可显式切换 automatic incremental checkpoint，不 reset/launch |
+| `run_synthesis` | 启动综合，不隐式 reset/open；默认立即返回且不扫完整日志；`max_threads` 与并行 run 槽位 `jobs` 分离 |
+| `run_implementation` | 启动实现，不隐式 reset/open；默认立即返回，不重复查询综合 generic；支持显式 `max_threads` |
+| `reset_project_run` | 显式删除指定 run 的既有结果；永不被其他流程工具自动调用 |
 | `get_run_progress` | **0.3.2** 查 run 实时进度:Phase 序列 + log 尾部 + mtime,log 超 2 分钟不更新自动提示可能卡住 |
-| `generate_bitstream` | 生成比特流（默认前置 CRITICAL WARNING 安全检查） |
+| `generate_bitstream` | 前置检查失败时 fail-closed；默认启动后返回，显式 `wait_for_completion=True` 才等待 |
 | `program_device` | 编程 FPGA 设备（封装 open_hw_manager → connect → program） |
+
+### Hardware Manager / ILA
+| 工具 | 说明 |
+|------|------|
+| `capture_hw_ila_to_csv` | 连接/刷新硬件并采集 ILA 到独立 CSV；属于硬件状态变化，远程 hw_server 默认阻断 |
 
 ### 新手引导 & 工程摸底
 | 工具 | 说明 |
@@ -277,7 +368,7 @@ get_run_progress(run_name="synth_1", session_id="default")
 | 工具 | 说明 |
 |------|------|
 | `get_io_report` | IO 引脚报告（JSON），自动判定 GT/GPIO 类型 |
-| `get_timing_report` | 时序报告,含 PASS/FAIL 判定、**数据来源标注**(post-synth 估算 vs post-route 最终)、关键路径详情。**0.3.9** 违例时自动附 Top N 违例路径 + 5 种模式分类(CDC/HIGH_FANOUT/LONG_COMBO/IO_UNREGISTERED/UNKNOWN)+ 具体 Tcl 修复命令 |
+| `get_timing_report` | 时序 summary，含 PASS/FAIL 与 post-synth/post-route 来源；默认不展开路径，`include_violating_paths=True` 才追加 Top N + 模式分类 |
 | `get_utilization_report` | **0.3.0** 结构化资源占用(LUT/FF/BRAM/DSP/IOB),> 90% 标 CRITICAL,70-90% 标 WARN |
 
 > 通用报告（power / drc / clock / methodology / cdc 等）请直接用
@@ -301,7 +392,7 @@ get_run_progress(run_name="synth_1", session_id="default")
 
 | Hook | 触发事件 | 作用 |
 |---|---|---|
-| `bitstream-guard` | AI 调 `generate_bitstream` 前 | 弹确认框(permissionDecision: ask):提醒先跑 `check_bitstream_readiness`,由你决定放行或拒绝,不会硬阻断流程 |
+| `bitstream-guard` | AI 调 `generate_bitstream` 前 | 弹确认框(permissionDecision: ask)：确认当前 route 的 timing 证据；工具内部仍执行状态/CW 门禁，不额外要求重复 readiness |
 | `xdc-lint` | 保存任意 `.xdc` 文件后 | 纯 Python 静态检查:PIN_CONFLICT / 漏 IOSTANDARD / create_clock 缺 -period 等,无需等综合 |
 | `verilog-lint` | 保存任意 `.v` / `.sv` 文件后 | 零依赖预检:module 名匹配文件名 / endmodule 存在 / 括号配对 |
 | `iverilog-check` | 保存任意 `.v` / `.sv` 文件后 | **0.3.4** iverilog 或 verilator 语法+连接性检查,未装静默跳过,有 error 时阻断 |
@@ -320,7 +411,7 @@ get_run_progress(run_name="synth_1", session_id="default")
           {
             "type": "command",
             "statusMessage": "bitstream-guard",
-            "command": "python -c \"import json; print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'ask', 'permissionDecisionReason': '烧板前确认已跑 check_bitstream_readiness 且结论为 READY(时序违例/未布线状态下生成的是无效比特流)'}}))\""
+            "command": "python -c \"import json; print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'ask', 'permissionDecisionReason': '生成 Bitstream 前确认当前 route 的 timing 证据；工具内部会再次执行实现状态和 CRITICAL WARNING 门禁'}}))\""
           }
         ]
       }
@@ -462,10 +553,11 @@ AI:  [get_timing_report]
 
 ```
 用户: 修好后准备烧板
-AI:  [check_bitstream_readiness]
-     结论: READY — route_design Complete / WNS +0.026 ns / CW=8 (GT_LOC 都是 IP 内部,可忽略)
+AI:  [get_timing_report]
+     结论: PASS — post-route WNS +0.026 ns
 
-     [generate_bitstream]          # 自动拦截:有 CW 会阻止,可 force=True 跳过
+     [generate_bitstream]          # 内置状态/CW 门禁，默认启动后返回
+     → 若因已人工核对的 CW 被阻止，再单独确认后使用 force=True
      [program_device(bitstream_path="impl_1/top.bit")]
 ```
 
@@ -520,7 +612,8 @@ flowchart LR
 | `vivado-mcp install [path] [--port 9999]` | 注入 Vivado_init.tcl |
 | `vivado-mcp uninstall [path]` | 从 Vivado_init.tcl 移除 |
 | `vivado-mcp doctor [path] [--port 9999] [--json]` | 只读检查环境与连接 |
-| `vivado-mcp doctor --fix [--client all\|claude-code\|codex]` | 备份后修复可安全自动处理的配置 |
+| `vivado-mcp doctor --fix [--client all\|claude-code\|codex]` | 备份后修复客户端配置，默认不注入 Vivado init |
+| `vivado-mcp doctor --fix --install-init` | 显式安装高级兼容 init 注入，普通 GUI 流程不需要 |
 | `vivado-mcp version` | 显示版本 |
 
 ## 开发

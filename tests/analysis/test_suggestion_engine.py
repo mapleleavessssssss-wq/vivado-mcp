@@ -157,6 +157,7 @@ def test_ready_to_impl():
     sug = suggest_next(info)
     assert sug.stage == "ready_to_impl"
     assert any("run_implementation" in a for a in sug.actions)
+    assert not sug.actions[0].startswith("get_utilization_report")
 
 
 def test_ready_to_impl_not_started():
@@ -189,7 +190,11 @@ def test_ready_to_bitstream():
     sug = suggest_next(info)
     assert sug.stage == "ready_to_bitstream"
     assert any("generate_bitstream" in a for a in sug.actions)
-    assert any("check_bitstream_readiness" in a for a in sug.actions)
+    assert any("get_timing_report" in a for a in sug.actions)
+    assert not any(
+        action.strip().startswith("check_bitstream_readiness")
+        for action in sug.actions
+    )
 
 
 def test_ready_to_program():

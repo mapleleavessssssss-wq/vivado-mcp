@@ -11,6 +11,7 @@ import logging
 import re
 from typing import Literal
 
+from vivado_mcp.config import resolve_vivado
 from vivado_mcp.vivado.base_session import BaseSession
 from vivado_mcp.vivado.gui_session import (
     _PENDING_SPAWN_PORTS,
@@ -84,6 +85,7 @@ class SessionManager:
         self,
         session_id: str = "default",
         vivado_path: str | None = None,
+        vivado_version: str | None = None,
         timeout: float = 120.0,
         mode: str = "gui",
         port: int = 0,
@@ -93,6 +95,8 @@ class SessionManager:
         Args:
             session_id: 会话标识符。
             vivado_path: 可选的自定义 Vivado 路径（覆盖默认值）。
+            vivado_version: 可选的明确版本（如 ``2024.2``）。与显式路径同时
+                提供时会验证二者一致；多版本并存时不按目录名自动选择。
             timeout: 启动超时秒数（GUI 模式建议 120s+）。
             mode: 会话模式，``"gui"`` / ``"tcl"`` / ``"attach"``。
             port: 端口哨兵(B 方案)。
@@ -110,6 +114,10 @@ class SessionManager:
             raise ValueError(
                 f"无效的 mode: {mode!r}。支持: {_VALID_MODES}"
             )
+        if mode == "attach" and port <= 0:
+            raise ValueError("attach 模式必须提供 1..65535 的显式非零端口。")
+        if port < 0 or port > 65535:
+            raise ValueError("port 必须在 0..65535 范围内。")
 
         existing = self.get(session_id)
         if existing:
@@ -117,7 +125,20 @@ class SessionManager:
                 f"会话 '{session_id}' 已在运行中（mode={existing.mode}）。"
             )
 
-        path = vivado_path or self._default_vivado_path
+        if vivado_path:
+            path = resolve_vivado(
+                vivado_version=vivado_version,
+                vivado_path=vivado_path,
+            )
+        elif vivado_version:
+            path = resolve_vivado(vivado_version=vivado_version)
+        elif self._default_vivado_path:
+            # Lifespan resolved this once at MCP startup; retain the exact value.
+            # Re-validating here would make a later filesystem race look like a
+            # version-selection decision and complicate deterministic tests.
+            path = self._default_vivado_path
+        else:
+            path = resolve_vivado()
 
         session: BaseSession
         if mode == "tcl":
@@ -168,6 +189,7 @@ class SessionManager:
         self,
         session_id: str = "default",
         vivado_path: str | None = None,
+        vivado_version: str | None = None,
         mode: str = "gui",
     ) -> BaseSession:
         """获取已有会话，若不存在则自动启动。"""
@@ -178,6 +200,7 @@ class SessionManager:
         session, _ = await self.start_session(
             session_id=session_id,
             vivado_path=vivado_path,
+            vivado_version=vivado_version,
             mode=mode,
         )
         return session
@@ -214,6 +237,29 @@ class SessionManager:
                     logger.error("关闭会话 '%s' 失败: %s", sid, e)
 
         logger.info("所有 Vivado 会话已清理完毕。")
+
+    async def detach_session(self, session_id: str) -> str:
+        """Detach one session without terminating a visible GUI process."""
+        session = self._sessions.get(session_id)
+        if not session:
+            return f"会话 '{session_id}' 不存在。"
+        await session.detach()
+        self._sessions.pop(session_id, None)
+        self._port_map.pop(session_id, None)
+        return f"会话 '{session_id}' 已断开；Vivado GUI 保持运行。"
+
+    async def detach_all(self) -> None:
+        """MCP shutdown cleanup: detach GUIs, stop non-persistent Tcl sessions."""
+        session_ids = list(self._sessions.keys())
+        for sid in session_ids:
+            session = self._sessions.pop(sid, None)
+            self._port_map.pop(sid, None)
+            if session:
+                try:
+                    await session.detach()
+                except Exception as exc:
+                    logger.error("detach 会话 '%s' 失败: %s", sid, exc)
+        logger.info("所有 Vivado 会话已 detach/清理完毕。")
 
     async def list_sessions(self, probe_external: bool = True) -> list[dict]:
         """列出所有会话的状态信息(含死会话,标记 is_alive=False)。

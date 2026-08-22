@@ -53,6 +53,12 @@ from vivado_mcp.tcl_scripts import (
     TAIL_RUNME_LOG,
     TAIL_SIM_LOGS,
 )
+from vivado_mcp.tools.annotations import (
+    LOCAL_EXECUTION,
+    LOCAL_WRITE,
+    PROJECT_WRITE,
+    READ_ONLY_SESSION,
+)
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
 logger = logging.getLogger(__name__)
@@ -396,7 +402,7 @@ async def _diagnose_sim_run(session, run_name: str, tail_n: int) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_WRITE)
 async def get_critical_warnings(
     run_name: str = "impl_1",
     compare_with_last: bool = False,
@@ -569,7 +575,7 @@ async def get_critical_warnings(
     return main
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def verify_io_placement_tool(
     session_id: str = "default",
     ctx: Context = None,
@@ -639,7 +645,7 @@ async def verify_io_placement_tool(
     return format_io_verification(verification)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def xdc_lint(
     xdc_paths: list[str] | None = None,
     session_id: str = "default",
@@ -678,7 +684,7 @@ async def xdc_lint(
     return format_lint_report(report)
 
 
-@mcp.tool()
+@mcp.tool(annotations=PROJECT_WRITE)
 async def xdc_auto_fix(
     xdc_paths: list[str] | None = None,
     board: str = "",
@@ -735,7 +741,7 @@ async def xdc_auto_fix(
     return format_fix_report(plan)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_EXECUTION)
 async def verilog_compile_check(
     files: list[str],
     tool: str = "auto",

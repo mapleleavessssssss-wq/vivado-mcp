@@ -4,11 +4,12 @@
 """
 
 import asyncio
+from unittest.mock import patch
 
 import pytest
 
 from vivado_mcp.vivado.base_session import SessionState
-from vivado_mcp.vivado.session import SubprocessSession
+from vivado_mcp.vivado.session import SubprocessSession, vivado_process_argv
 from vivado_mcp.vivado.session_manager import SessionManager, _validate_session_id
 from vivado_mcp.vivado.tcl_utils import TclResult
 
@@ -160,6 +161,36 @@ class TestSubprocessInflightOwnership:
         assert session.state == SessionState.STOPPED
 
 
+class TestVivadoProcessArgv:
+    def test_windows_batch_uses_comspec(self):
+        with patch("vivado_mcp.vivado.session.sys.platform", "win32"), patch.dict(
+            "os.environ", {"COMSPEC": "C:/Windows/System32/cmd.exe"}
+        ):
+            argv = vivado_process_argv("C:/Xilinx/Vivado/2024.2/bin/vivado.bat", "-mode", "tcl")
+        assert argv[:4] == ("C:/Windows/System32/cmd.exe", "/d", "/s", "/c")
+        assert len(argv) == 5
+        assert argv[4] == "C:/Xilinx/Vivado/2024.2/bin/vivado.bat -mode tcl"
+
+    def test_windows_batch_preserves_one_vendor_command_line(self):
+        with patch("vivado_mcp.vivado.session.sys.platform", "win32"), patch.dict(
+            "os.environ", {"COMSPEC": "C:/Windows/System32/cmd.exe"}
+        ):
+            argv = vivado_process_argv(
+                "C:/Program Files/Xilinx/Vivado/2024.2/bin/vivado.bat",
+                "-source",
+                "C:/Temp/a b/bootstrap.tcl",
+            )
+        assert argv[4] == (
+            '"C:/Program Files/Xilinx/Vivado/2024.2/bin/vivado.bat" '
+            '-source "C:/Temp/a b/bootstrap.tcl"'
+        )
+
+    def test_native_executable_is_unchanged(self):
+        with patch("vivado_mcp.vivado.session.sys.platform", "win32"):
+            argv = vivado_process_argv("C:/Xilinx/Vivado/2024.2/bin/vivado.exe", "-mode", "gui")
+        assert argv == ("C:/Xilinx/Vivado/2024.2/bin/vivado.exe", "-mode", "gui")
+
+
 class TestValidateSessionId:
     """session_id 格式验证测试。"""
 
@@ -258,6 +289,14 @@ class TestSessionManager:
         assert captured["port"] == 0, "默认 gui 应透传 port=0 走 auto-alloc 独立实例"
         assert captured["attach_only"] is False
 
+    async def test_attach_requires_explicit_nonzero_port(self, session_manager):
+        with pytest.raises(ValueError, match="显式非零端口"):
+            await session_manager.start_session(mode="attach", port=0)
+
+    async def test_rejects_port_out_of_range(self, session_manager):
+        with pytest.raises(ValueError, match="0..65535"):
+            await session_manager.start_session(mode="gui", port=65536)
+
     async def test_port_map_records_and_clears(
         self, session_manager: SessionManager, monkeypatch
     ):
@@ -292,6 +331,27 @@ class TestSessionManager:
 
         await session_manager.stop_session("rec")
         assert "rec" not in session_manager._port_map
+
+    async def test_detach_all_preserves_gui_via_detach(self, session_manager):
+        calls = {"detach": 0, "stop": 0}
+
+        class _PersistentGui:
+            @property
+            def is_alive(self):
+                return True
+
+            async def detach(self):
+                calls["detach"] += 1
+
+            async def stop(self):
+                calls["stop"] += 1
+
+        session_manager._sessions["gui"] = _PersistentGui()
+        session_manager._port_map["gui"] = (54321, 1234)
+        await session_manager.detach_all()
+        assert calls == {"detach": 1, "stop": 0}
+        assert session_manager._sessions == {}
+        assert session_manager._port_map == {}
 
 
 class TestAsciiPathCheck:

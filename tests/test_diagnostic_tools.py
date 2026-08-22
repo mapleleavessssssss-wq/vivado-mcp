@@ -620,13 +620,16 @@ class TestVerifyIoPlacement:
 
 # B4: QUERY_FILESET_OVERRIDES 的"无覆盖"标准输出
 _EMPTY_OVERRIDES = "VMCP_FS_OVERRIDE:generic=\nVMCP_FS_OVERRIDE:verilog_define="
+_NOT_STARTED = (
+    "VMCP_LAUNCH_STATE|found=1|status=Not started|progress=0%|needs_refresh=0"
+)
 
 
 class TestLaunchAndWaitDiag:
     """测试 _launch_and_wait 中的自动诊断逻辑。
 
-    D5 重写后的流程：overrides 查询(B4) → reset+launch → poll STATUS/PROGRESS
-    → open_run → 诊断。mock 需要按这个顺序提供返回值。
+    等待模式流程：overrides 查询(B4) → launch → poll STATUS/PROGRESS → 诊断。
+    工具不会隐式 reset run 或 open design。
     """
 
     @pytest.mark.asyncio
@@ -639,15 +642,13 @@ class TestLaunchAndWaitDiag:
             side_effect=[
                 # 1. QUERY_FILESET_OVERRIDES (B4)
                 _make_tcl_result(_EMPTY_OVERRIDES),
-                # 2. reset_run + launch_runs
+                # 2. 原子检查 Not started 后 launch，不执行 reset_run
                 _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 # 3. 第一次 poll：已 Complete
                 _make_tcl_result(
                     "VMCP_POLL|synth_design Complete!|100%|00:05:30"
                 ),
-                # 4. open_run（自动）
-                _make_tcl_result(""),
-                # 5. COUNT_WARNINGS 诊断
+                # 4. COUNT_WARNINGS 诊断
                 _make_tcl_result(
                     "VMCP_DIAG:errors=0,critical_warnings=16,warnings=3"
                 ),
@@ -657,7 +658,8 @@ class TestLaunchAndWaitDiag:
         ctx = _mock_context(session)
 
         result = await _launch_and_wait(
-            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx,
+            post_check="always",
         )
 
         assert "!! 发现 16 条 CRITICAL WARNING !!" in result
@@ -679,9 +681,7 @@ class TestLaunchAndWaitDiag:
                 _make_tcl_result(
                     "VMCP_POLL|route_design Complete!|100%|00:10:00"
                 ),
-                # 4. open_run
-                _make_tcl_result(""),
-                # 5. 诊断
+                # 4. 诊断
                 _make_tcl_result(
                     "VMCP_DIAG:errors=0,critical_warnings=0,warnings=5"
                 ),
@@ -691,7 +691,8 @@ class TestLaunchAndWaitDiag:
         ctx = _mock_context(session)
 
         result = await _launch_and_wait(
-            session, "impl_1", jobs=4, timeout_minutes=60, label="实现", ctx=ctx
+            session, "impl_1", jobs=4, timeout_minutes=60, label="实现", ctx=ctx,
+            post_check="always",
         )
 
         assert "CRITICAL WARNING" not in result
@@ -711,14 +712,14 @@ class TestLaunchAndWaitDiag:
                 ),
                 _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
-                _make_tcl_result(""),
                 _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
             ]
         )
         ctx = _mock_context(session)
 
         result = await _launch_and_wait(
-            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx,
+            post_check="always",
         )
 
         assert "applied_generic: WIDTH=8 DEPTH=16" in result
@@ -738,14 +739,14 @@ class TestLaunchAndWaitDiag:
                 _make_tcl_result(_EMPTY_OVERRIDES),
                 _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
-                _make_tcl_result(""),
                 _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
             ]
         )
         ctx = _mock_context(session)
 
         result = await _launch_and_wait(
-            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx,
+            post_check="always",
         )
 
         assert "applied_generic: (无)" in result
@@ -762,14 +763,14 @@ class TestLaunchAndWaitDiag:
                 _make_tcl_result("ERROR: no such fileset sources_1", return_code=1),
                 _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
-                _make_tcl_result(""),
                 _make_tcl_result("VMCP_DIAG:errors=0,critical_warnings=0,warnings=0"),
             ]
         )
         ctx = _mock_context(session)
 
         result = await _launch_and_wait(
-            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx,
+            post_check="always",
         )
 
         assert "[DEGRADED]" in result
@@ -789,7 +790,6 @@ class TestLaunchAndWaitDiag:
                 _make_tcl_result(_EMPTY_OVERRIDES),
                 _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
-                _make_tcl_result(""),
                 # 诊断计数:Tcl 报错(如项目被关掉)
                 _make_tcl_result("ERROR: [Common 17-53] No open project", return_code=1),
             ]
@@ -797,7 +797,8 @@ class TestLaunchAndWaitDiag:
         ctx = _mock_context(session)
 
         result = await _launch_and_wait(
-            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx,
+            post_check="always",
         )
 
         assert "[DEGRADED] 诊断计数不可用" in result
@@ -815,9 +816,59 @@ class TestLaunchAndWaitDiag:
                 _make_tcl_result(_EMPTY_OVERRIDES),
                 _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
                 _make_tcl_result("VMCP_POLL|synth_design Complete!|100%|00:01:00"),
-                _make_tcl_result(""),
                 # rc=0 但输出没有 VMCP_DIAG 行 → parse 返回 (-1,-1,-1)
                 _make_tcl_result("some unrelated output"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx,
+            post_check="always",
+        )
+
+        assert "[DEGRADED] 诊断计数不可用" in result
+        assert "errors=-1" not in result
+
+    @pytest.mark.asyncio
+    async def test_launch_only_is_default_user_visible_behavior(self):
+        """默认只启动并返回，不轮询、不诊断、不 reset/open design。"""
+        from vivado_mcp.tools.flow_tools import run_synthesis
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_NOT_STARTED),
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await run_synthesis(ctx=ctx)
+
+        assert result.startswith("[STARTED]")
+        assert "get_run_progress" in result
+        assert session.execute.await_count == 3
+        launch_tcl = session.execute.await_args_list[2].args[0]
+        assert "launch_runs synth_1" in launch_tcl
+        assert "reset_run" not in launch_tcl
+        assert "open_run" not in launch_tcl
+
+    @pytest.mark.asyncio
+    async def test_wait_default_skips_full_log_diagnostic_scan(self):
+        """等待成功 run 时默认只读终态，不再扫描完整 runme.log。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
+                _make_tcl_result(
+                    "VMCP_POLL|synth_design Complete!|100%|00:01:00"
+                ),
             ]
         )
         ctx = _mock_context(session)
@@ -826,8 +877,129 @@ class TestLaunchAndWaitDiag:
             session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
         )
 
-        assert "[DEGRADED] 诊断计数不可用" in result
-        assert "errors=-1" not in result
+        assert session.execute.await_count == 3
+        assert "后置日志扫描: NOT_RUN" in result
+
+    @pytest.mark.asyncio
+    async def test_explicit_max_threads_is_scoped_to_launch(self):
+        """显式线程数写入 launch 快照，并在同一 Tcl 调用中恢复父会话。"""
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result(
+                    "VMCP_THREAD_CONTROL|requested=8|previous=2|"
+                    "launch_rc=0|restore_rc=0\n"
+                    "VMCP_RUN_LAUNCH|started|Running"
+                ),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        result = await _launch_and_wait(
+            session,
+            "synth_1",
+            jobs=1,
+            timeout_minutes=30,
+            label="综合",
+            ctx=ctx,
+            wait_for_completion=False,
+            max_threads=8,
+        )
+
+        launch_tcl = session.execute.await_args_list[1].args[0]
+        assert "set_param general.maxThreads 8" in launch_tcl
+        assert "launch_runs synth_1 -jobs 1" in launch_tcl
+        assert "set_param general.maxThreads $__vmcp_prev_threads" in launch_tcl
+        assert "单 run CPU 线程请求: 8" in result
+
+    @pytest.mark.asyncio
+    async def test_max_threads_rejects_values_outside_common_range(self):
+        from vivado_mcp.tools.flow_tools import _launch_and_wait
+
+        session = AsyncMock()
+        result = await _launch_and_wait(
+            session,
+            "synth_1",
+            jobs=1,
+            timeout_minutes=30,
+            label="综合",
+            ctx=_mock_context(session),
+            max_threads=9,
+        )
+
+        assert result.startswith("[ERROR]")
+        session.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_implementation_launch_skips_synthesis_override_query(self):
+        """实现启动不重复读取只影响综合的 generic/verilog_define。"""
+        from vivado_mcp.tools.flow_tools import run_implementation
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(_NOT_STARTED),
+                _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.flow_tools._require_session", return_value=session
+        ):
+            result = await run_implementation(ctx=ctx)
+
+        assert result.startswith("[STARTED]")
+        assert session.execute.await_count == 2
+        assert "launch_runs impl_1" in session.execute.await_args_list[1].args[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (
+                "VMCP_LAUNCH_STATE|found=1|status=synth_design Complete!|"
+                "progress=100%|needs_refresh=0",
+                "[UP_TO_DATE]",
+            ),
+            (
+                "VMCP_LAUNCH_STATE|found=1|status=synth_design Running|"
+                "progress=50%|needs_refresh=0",
+                "[ALREADY_RUNNING]",
+            ),
+            (
+                "VMCP_LAUNCH_STATE|found=1|status=synth_design ERROR|"
+                "progress=20%|needs_refresh=0",
+                "[BLOCKED]",
+            ),
+            (
+                "VMCP_LAUNCH_STATE|found=1|status=synth_design Complete!|"
+                "progress=100%|needs_refresh=1",
+                "[OUT_OF_DATE]",
+            ),
+        ],
+    )
+    async def test_launch_plan_never_relaunches_non_startable_run(
+        self, state, expected
+    ):
+        """完成、运行中、错误和过期 run 都不会进入 launch_runs。"""
+        from vivado_mcp.tools.flow_tools import run_synthesis
+
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=_make_tcl_result(state))
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.flow_tools._require_session", return_value=session
+        ):
+            result = await run_synthesis(ctx=ctx)
+
+        assert result.startswith(expected)
+        session.execute.assert_awaited_once()
+        assert "launch_runs" not in session.execute.await_args.args[0]
 
     @pytest.mark.asyncio
     async def test_wait_false_returns_job_without_polling(self):
@@ -851,7 +1023,7 @@ class TestLaunchAndWaitDiag:
             timeout_minutes=30,
             label="综合",
             ctx=ctx,
-            wait=False,
+            wait_for_completion=False,
         )
 
         assert "综合已异步启动" in result
@@ -860,7 +1032,8 @@ class TestLaunchAndWaitDiag:
         assert session.execute.await_count == 2
         launch_tcl = session.execute.await_args_list[1].args[0]
         assert "*Running*" in launch_tcl
-        assert launch_tcl.index("*Running*") < launch_tcl.index("reset_run synth_1")
+        assert 'string equal -nocase $__s "Not started"' in launch_tcl
+        assert "reset_run" not in launch_tcl
         assert "launch_runs synth_1 -jobs 4" in launch_tcl
 
     @pytest.mark.asyncio
@@ -885,7 +1058,7 @@ class TestLaunchAndWaitDiag:
             timeout_minutes=30,
             label="综合",
             ctx=ctx,
-            wait=False,
+            wait_for_completion=False,
         )
 
         assert result.startswith("[BUSY]")
@@ -902,6 +1075,7 @@ class TestLaunchAndWaitDiag:
         session.session_id = "public"
         session.execute = AsyncMock(
             side_effect=[
+                _make_tcl_result(_NOT_STARTED),
                 _make_tcl_result(_EMPTY_OVERRIDES),
                 _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
             ]
@@ -912,7 +1086,7 @@ class TestLaunchAndWaitDiag:
             result = await run_synthesis(ctx=ctx, wait=False)
 
         assert "job_id: public:synth_1" in result
-        assert session.execute.await_count == 2
+        assert session.execute.await_count == 3
 
     @pytest.mark.asyncio
     async def test_run_implementation_forwards_wait_false(self):
@@ -923,7 +1097,7 @@ class TestLaunchAndWaitDiag:
         session.session_id = "public"
         session.execute = AsyncMock(
             side_effect=[
-                _make_tcl_result(_EMPTY_OVERRIDES),
+                _make_tcl_result(_NOT_STARTED),
                 _make_tcl_result("VMCP_RUN_LAUNCH|started|Running"),
             ]
         )
@@ -964,12 +1138,39 @@ class TestGenerateBitstreamSafety:
 
         with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
             result = await generate_bitstream(
-                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+                impl_run="impl_1", force=False, wait_for_completion=True,
+                session_id="default", ctx=ctx
             )
 
         assert "安全检查未通过" in result
         assert "16 条 CRITICAL WARNING" in result
         assert "force=True" in result
+
+    @pytest.mark.asyncio
+    async def test_default_starts_and_returns_without_polling(self):
+        """默认只做 CW 门禁并启动，不在 MCP 调用内轮询完整 Bitstream。"""
+        from vivado_mcp.tools.flow_tools import generate_bitstream
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_PRE_BIT:status=route_design Complete,critical_warnings=0\n"
+                    "VMCP_PRE_BIT_DONE"
+                ),
+                _make_tcl_result("launched"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.flow_tools._require_session", return_value=session
+        ):
+            result = await generate_bitstream(ctx=ctx)
+
+        assert result.startswith("[STARTED]")
+        assert "不要高频轮询" in result
+        assert session.execute.await_count == 2
 
     @pytest.mark.asyncio
     async def test_allows_with_force(self):
@@ -994,7 +1195,8 @@ class TestGenerateBitstreamSafety:
 
         with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
             result = await generate_bitstream(
-                impl_run="impl_1", force=True, session_id="default", ctx=ctx
+                impl_run="impl_1", force=True, wait_for_completion=True,
+                session_id="default", ctx=ctx
             )
 
         assert "安全检查未通过" not in result
@@ -1005,8 +1207,36 @@ class TestGenerateBitstreamSafety:
         assert "[DEGRADED]" not in result
 
     @pytest.mark.asyncio
-    async def test_precheck_tcl_error_appends_degraded(self):
-        """安全检查 Tcl 报错(run 不存在/日志不可读)→ 放行但成功返回带 [DEGRADED]。"""
+    async def test_waits_past_stale_route_complete_status(self):
+        """launch 后旧 route Complete 不能被误判为 bitstream 已完成。"""
+        from vivado_mcp.tools.flow_tools import generate_bitstream
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result("launched"),
+                _make_tcl_result("VMCP_POLL|route_design Complete!|100%|00:00:35"),
+                _make_tcl_result("VMCP_POLL|Running write_bitstream...|83.33%|00:00:36"),
+                _make_tcl_result("VMCP_POLL|write_bitstream Complete!|100%|00:00:42"),
+                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session), patch(
+            "vivado_mcp.tools.flow_tools.asyncio.sleep", new=AsyncMock()
+        ):
+            result = await generate_bitstream(
+                impl_run="impl_1", force=True, wait_for_completion=True,
+                session_id="default", ctx=ctx
+            )
+
+        assert "write_bitstream Complete" in result
+        assert session.execute.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_precheck_tcl_error_blocks_launch(self):
+        """安全检查 Tcl 报错时 fail-closed，且不执行 launch_runs。"""
         from vivado_mcp.tools.flow_tools import generate_bitstream
 
         session = AsyncMock()
@@ -1016,29 +1246,24 @@ class TestGenerateBitstreamSafety:
                 _make_tcl_result(
                     "ERROR: [Common 17-53] No open project", return_code=1
                 ),
-                # 2. launch_runs
-                _make_tcl_result("launched"),
-                # 3. poll 完成
-                _make_tcl_result("VMCP_POLL|write_bitstream Complete!|100%|00:05:00"),
-                # 4. 查比特流目录
-                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
             ]
         )
         ctx = _mock_context(session)
 
         with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
             result = await generate_bitstream(
-                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+                impl_run="impl_1", force=False, wait_for_completion=True,
+                session_id="default", ctx=ctx
             )
 
-        assert "比特流生成结果" in result
-        assert "[DEGRADED] 前置 CW 安全检查未能执行" in result
+        assert "[BLOCKED] 前置 CW 安全检查未能执行" in result
         assert "Common 17-53" in result
-        assert "未经 CRITICAL WARNING 门禁" in result
+        assert "未启动 bitstream" in result
+        session.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_precheck_sentinel_missing_appends_degraded(self):
-        """安全检查输出无 VMCP_PRE_BIT 标记(cw_count=-1 哨兵)→ 同样显式 [DEGRADED]。"""
+    async def test_precheck_sentinel_missing_blocks_launch(self):
+        """安全检查缺少标记时 fail-closed。"""
         from vivado_mcp.tools.flow_tools import generate_bitstream
 
         session = AsyncMock()
@@ -1046,44 +1271,42 @@ class TestGenerateBitstreamSafety:
             side_effect=[
                 # 1. CHECK_PRE_BITSTREAM:rc=0 但没有 VMCP_PRE_BIT 行
                 _make_tcl_result("garbage output without marker"),
-                _make_tcl_result("launched"),
-                _make_tcl_result("VMCP_POLL|write_bitstream Complete!|100%|00:05:00"),
-                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
             ]
         )
         ctx = _mock_context(session)
 
         with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
             result = await generate_bitstream(
-                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+                impl_run="impl_1", force=False, wait_for_completion=True,
+                session_id="default", ctx=ctx
             )
 
-        assert "[DEGRADED] 前置 CW 安全检查未能执行" in result
+        assert "[BLOCKED] 前置 CW 安全检查未能执行" in result
         assert "VMCP_PRE_BIT" in result
+        session.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_precheck_exception_appends_degraded(self):
-        """安全检查 execute 抛异常(如超时)→ 放行但成功返回带 [DEGRADED] + 原因。"""
+    async def test_precheck_exception_blocks_launch(self):
+        """安全检查 execute 抛异常时 fail-closed。"""
         from vivado_mcp.tools.flow_tools import generate_bitstream
 
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
                 TimeoutError("命令执行超时（30.0s）"),
-                _make_tcl_result("launched"),
-                _make_tcl_result("VMCP_POLL|write_bitstream Complete!|100%|00:05:00"),
-                _make_tcl_result("VMCP_BITDIR:/project/impl_1"),
             ]
         )
         ctx = _mock_context(session)
 
         with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
             result = await generate_bitstream(
-                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+                impl_run="impl_1", force=False, wait_for_completion=True,
+                session_id="default", ctx=ctx
             )
 
-        assert "[DEGRADED] 前置 CW 安全检查失败" in result
+        assert "[BLOCKED] 前置 CW 安全检查失败" in result
         assert "超时" in result
+        session.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_precheck_clean_no_degraded(self):
@@ -1106,7 +1329,8 @@ class TestGenerateBitstreamSafety:
 
         with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
             result = await generate_bitstream(
-                impl_run="impl_1", force=False, session_id="default", ctx=ctx
+                impl_run="impl_1", force=False, wait_for_completion=True,
+                session_id="default", ctx=ctx
             )
 
         assert "比特流生成结果" in result
@@ -1167,6 +1391,23 @@ class TestProgramDeviceValidation:
         session.execute.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_remote_hw_server_requires_explicit_opt_in(self, tmp_path):
+        from vivado_mcp.tools.flow_tools import program_device
+
+        session = AsyncMock()
+        ctx = _mock_context(session)
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await program_device(
+                bitstream_path=self._make_bit(tmp_path),
+                hw_server_url="192.0.2.10:3121",
+                ctx=ctx,
+            )
+
+        assert result.startswith("[BLOCKED]")
+        assert "allow_remote_hw_server=True" in result
+        session.execute.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_default_params_pass_validation(self, tmp_path):
         """默认 target='*' + localhost:3121 合法,正常走到 Tcl 执行。"""
         from vivado_mcp.tools.flow_tools import program_device
@@ -1183,6 +1424,31 @@ class TestProgramDeviceValidation:
             )
 
         assert "编程完成" in result
+        session.execute.assert_awaited_once()
+        tcl = session.execute.await_args.args[0]
+        assert "get_hw_servers -quiet" in tcl
+        assert "__vmcp_select_exact $__vmcp_targets" in tcl
+        assert "__vmcp_select_exact $__vmcp_devs" in tcl
+        assert "[lindex [get_hw_targets] 0]" not in tcl
+        assert 'set __vmcp_device_name ""' in tcl
+        assert "PROBES.FILE" in tcl
+        assert "file isfile" in tcl
+
+    @pytest.mark.asyncio
+    async def test_ipv6_loopback_hw_server_is_allowed(self, tmp_path):
+        from vivado_mcp.tools.flow_tools import program_device
+
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=_make_tcl_result("ok"))
+        ctx = _mock_context(session)
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await program_device(
+                bitstream_path=self._make_bit(tmp_path),
+                hw_server_url="[::1]:3121",
+                ctx=ctx,
+            )
+
+        assert "ERROR" not in result
         session.execute.assert_awaited_once()
 
 
@@ -1240,7 +1506,9 @@ class TestGetTimingReport:
         ctx = _mock_context(session)
 
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_timing_report(session_id="default", ctx=ctx)
+            result = await get_timing_report(
+                source="live", session_id="default", ctx=ctx
+            )
 
         assert "PASS" in result
         assert "WNS" in result
@@ -1248,7 +1516,7 @@ class TestGetTimingReport:
 
 
 class TestGetTimingReportWithPaths:
-    """测试 get_timing_report 在 timing_met=False 时自动追加违例路径详情。"""
+    """测试 get_timing_report 的快速 summary 与显式路径详情模式。"""
 
     # 构造一份 WNS 为负的 report_timing_summary 最小文本
     _VIOLATED_SUMMARY = """\
@@ -1261,6 +1529,34 @@ class TestGetTimingReportWithPaths:
     -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------
      -1.234       -5.000                      5                  200       -0.080       -0.200                      2                  200
 """  # noqa: E501
+
+    @pytest.mark.asyncio
+    async def test_default_fail_returns_summary_without_expensive_paths(self):
+        """默认 FAIL 只返回 summary，并明确告知如何进入深度路径诊断。"""
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            side_effect=[
+                _make_tcl_result(
+                    "VMCP_STAGE:stage=post-route"
+                    "|synth_status=synth_design Complete!"
+                    "|impl_status=route_design Complete!"
+                ),
+                _make_tcl_result(self._VIOLATED_SUMMARY),
+            ]
+        )
+        ctx = _mock_context(session)
+
+        with patch(
+            "vivado_mcp.tools.report_tools._require_session", return_value=session
+        ):
+            result = await get_timing_report(source="live", ctx=ctx)
+
+        assert "FAIL" in result
+        assert "[FAST]" in result
+        assert "include_violating_paths=True" in result
+        assert session.execute.await_count == 2
 
     @pytest.mark.asyncio
     async def test_triggers_violating_paths_query_on_fail(self):
@@ -1289,7 +1585,10 @@ class TestGetTimingReportWithPaths:
         ctx = _mock_context(session)
 
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_timing_report(session_id="default", ctx=ctx)
+            result = await get_timing_report(
+                include_violating_paths=True, source="live",
+                session_id="default", ctx=ctx
+            )
 
         # 调用序列 = stage + summary + violating_paths
         assert session.execute.call_count == 3
@@ -1329,7 +1628,9 @@ class TestGetTimingReportWithPaths:
         ctx = _mock_context(session)
 
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_timing_report(session_id="default", ctx=ctx)
+            result = await get_timing_report(
+                source="live", session_id="default", ctx=ctx
+            )
 
         # 只调两次:stage + summary
         assert session.execute.call_count == 2
@@ -1358,7 +1659,10 @@ class TestGetTimingReportWithPaths:
         ctx = _mock_context(session)
 
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_timing_report(session_id="default", ctx=ctx)
+            result = await get_timing_report(
+                include_violating_paths=True, source="live",
+                session_id="default", ctx=ctx
+            )
 
         # 主报告仍然返回,但末尾有失败提示
         assert "FAIL" in result

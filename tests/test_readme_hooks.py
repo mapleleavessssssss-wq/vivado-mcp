@@ -98,7 +98,10 @@ class TestBitstreamGuard:
         spec = out["hookSpecificOutput"]
         assert spec["hookEventName"] == "PreToolUse"
         assert spec["permissionDecision"] == "ask"
-        assert "check_bitstream_readiness" in spec["permissionDecisionReason"]
+        reason = spec["permissionDecisionReason"]
+        assert "timing" in reason
+        assert "CRITICAL WARNING" in reason
+        assert "check_bitstream_readiness" not in reason
 
 
 class TestPostToolUseHooks:

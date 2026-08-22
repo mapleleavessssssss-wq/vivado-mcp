@@ -12,6 +12,9 @@ subprocess 实现（两种会话模式之一）。负责：
 import asyncio
 import collections
 import logging
+import os
+import subprocess
+import sys
 import time
 
 from vivado_mcp.vivado.base_session import BaseSession, SessionState
@@ -25,6 +28,25 @@ from vivado_mcp.vivado.tcl_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def vivado_process_argv(vivado_path: str, *args: str) -> tuple[str, ...]:
+    """Return a Windows-safe argv for Vivado launchers.
+
+    ``asyncio.create_subprocess_exec`` cannot execute a batch file directly.
+    More subtly, passing ``/c``, the batch path and its arguments as separate
+    argv values lets Windows/Python quote the outer ``cmd.exe`` command line a
+    second time.  Build the vendor invocation once with ``list2cmdline`` and
+    pass that complete command as the single argument following ``/c``.
+
+    Do not replace ``vivado.bat`` with the internal ``unwrapped`` executable:
+    the vendor launcher establishes Tcl, Java and DLL search paths.
+    """
+    if sys.platform == "win32" and vivado_path.lower().endswith((".bat", ".cmd")):
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        vendor_command = subprocess.list2cmdline((vivado_path, *args))
+        return (comspec, "/d", "/s", "/c", vendor_command)
+    return (vivado_path, *args)
 
 # stderr 缓冲区保留的最近行数（避免内存无限增长）
 _STDERR_RING_SIZE = 200
@@ -83,9 +105,10 @@ class SubprocessSession(BaseSession):
 
         try:
             self._process = await asyncio.create_subprocess_exec(
-                self.vivado_path,
-                "-mode", "tcl",
-                "-nojournal", "-nolog",
+                *vivado_process_argv(
+                    self.vivado_path,
+                    "-mode", "tcl", "-nojournal", "-nolog",
+                ),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

@@ -14,10 +14,11 @@ from vivado_mcp.analysis.xci_parser import (
 )
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 from vivado_mcp.tcl_scripts import INSPECT_IP_PARAMS
+from vivado_mcp.tools.annotations import READ_ONLY_LOCAL, READ_ONLY_SESSION
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL)
 async def compare_xci(
     file_a: str,
     file_b: str,
@@ -50,7 +51,7 @@ async def compare_xci(
     return format_xci_compare(result, show_all=show_all)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def inspect_ip_params(
     ip_name: str,
     filter_keyword: str = "",

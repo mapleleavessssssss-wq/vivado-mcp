@@ -138,12 +138,19 @@ def install(vivado_path: str | None = None, port: int = 9999) -> None:
         FileNotFoundError: 无法定位 Vivado 安装或 server 脚本。
         PermissionError: 没有写 init.tcl 的权限（需管理员运行）。
     """
+    if not 1 <= port <= 65535:
+        raise ValueError("port 必须在 1..65535 范围内。")
+
     init_tcl = _resolve_init_tcl(vivado_path)
     server_script = _locate_server_script()
 
     print(f"Vivado init.tcl: {init_tcl}")
     print(f"Server 脚本:     {server_script}")
     print(f"监听端口:        {port}")
+    print(
+        "警告: 这是安装级初始化脚本，会影响从该 Vivado 安装启动的所有模式，"
+        "不是 GUI-only。普通 start_session(mode='gui') 不需要执行 install。"
+    )
 
     # 确保目标目录存在
     init_tcl.parent.mkdir(parents=True, exist_ok=True)

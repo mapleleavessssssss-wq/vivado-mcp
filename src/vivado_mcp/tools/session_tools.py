@@ -1,4 +1,4 @@
-"""会话管理工具：start_session / stop_session / list_sessions。"""
+"""会话管理工具：启动、停止、列举与只读 capability 探测。"""
 
 import json
 import logging
@@ -7,7 +7,19 @@ import sys
 
 from mcp.server.mcpserver import Context
 
+from vivado_mcp.config import discover_vivado_installations, get_vivado_compatibility
 from vivado_mcp.server import _get_manager, mcp
+from vivado_mcp.tools.annotations import (
+    READ_ONLY_LOCAL,
+    READ_ONLY_SESSION,
+    SESSION_CHANGE,
+    SESSION_STOP,
+)
+from vivado_mcp.vivado.capabilities import (
+    group_capabilities,
+    normalize_capability_commands,
+    probe_command_capabilities,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,11 +165,12 @@ def _check_ascii_paths(vivado_path: str | None) -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=SESSION_CHANGE)
 async def start_session(
     session_id: str = "default",
     mode: str = "gui",
-    port: int = 9999,
+    port: int = 0,
+    vivado_version: str = "",
     vivado_path: str = "",
     timeout: int = 120,
     ctx: Context = None,
@@ -169,8 +182,8 @@ async def start_session(
       并实时观察 Tcl Console / Block Design / 波形等 GUI 内容。首次使用会自动
       通过 ``-source`` 注入 TCP server，或先运行一次 ``vivado-mcp install`` 持久化。
     - ``"tcl"`` — ``vivado -mode tcl`` 无头子进程（无 GUI，适合 CI / 批处理）。
-    - ``"attach"`` — 连接到用户已手动打开的 Vivado GUI（需先运行 ``vivado-mcp install``
-      让 init.tcl 自动开启 TCP server）。
+    - ``"attach"`` — 连接到已由专用 launcher/bootstrap 开启 VMCP endpoint 的
+      持久 Vivado GUI。MCP 退出只 detach，不关闭该 GUI。
 
     每个 session_id 对应一个独立的会话句柄；同 session_id 再次调用会复用现有会话
     (会话模式自动复用)。**多开独立 GUI 实例**见下方 ``port`` 说明。
@@ -179,13 +192,13 @@ async def start_session(
         session_id: 会话标识符，默认 "default"。
         mode: ``"gui"`` / ``"tcl"`` / ``"attach"``，默认 ``"gui"``。
         port: TCP 端口语义(B 方案):
-            - ``gui`` 默认 ``9999``：先 probe 9999，命中现有 vmcp server 则直接复用/
-              attach(单 GUI 自动复用，也避免抢端口产生孤儿)；无则 spawn 并绑 9999。
-            - **多开独立实例**：传 ``port=0`` 自动分配一个空闲端口启动全新实例(零手动
-              配端口、跳过 probe)，或给不同端口的显式值。注意:不传 port 时即便换
-              session_id 也会 probe/attach 到 9999 的同一个 GUI(不会自动多开)，要独立
-              实例就传 ``port=0`` 或显式不同端口。
-            - ``attach`` 模式：要连接的现有 GUI 的显式端口(默认 9999)。
+            - ``gui`` 默认 ``0``：自动分配本机回环端口并启动独立实例，不探测固定
+              9999，避免误接到 batch/OOC Vivado。
+            - 传显式非零端口时，只有握手身份确认 ``kind=gui`` 且 Vivado 版本匹配
+              才允许复用；否则拒绝 attach。
+            - ``attach`` 模式：必须提供要连接的现有 GUI 的显式非零端口。
+        vivado_version: 明确版本，如 ``2018.3``、``2020.2`` 或 ``2024.2``。
+            多版本并存时优先使用本字段，禁止按目录名猜测。
         vivado_path: 可选，自定义 Vivado 可执行文件路径。留空则自动检测。
         timeout: 启动超时秒数，GUI 模式建议 120+。默认 120。
     """
@@ -196,6 +209,7 @@ async def start_session(
         session, banner = await manager.start_session(
             session_id=session_id,
             vivado_path=path,
+            vivado_version=vivado_version or None,
             timeout=float(timeout),
             mode=mode,
             port=int(port),
@@ -217,7 +231,89 @@ async def start_session(
         return f"[ERROR] 启动会话 '{session_id}' 失败: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL)
+async def list_vivado_installations() -> str:
+    """离线列出本机发现的全部 Vivado 版本和官方 launcher 绝对路径。
+
+    本工具不启动 Vivado、不连接会话、不读取工程。发现多个版本时只列出，
+    不选择默认版本。
+    """
+    items = []
+    for item in discover_vivado_installations():
+        profile = get_vivado_compatibility(item.version)
+        record: dict[str, object] = {"version": item.version, "path": item.path}
+        if profile is not None:
+            record["compatibility"] = {
+                "support_level": profile.support_level,
+                "tcl_runtime": profile.tcl_runtime,
+                "notes": list(profile.notes),
+            }
+        else:
+            record["compatibility"] = {
+                "support_level": "unprofiled",
+                "tcl_runtime": "unknown",
+                "notes": ["Requires explicit read-only validation before use."],
+            }
+        items.append(record)
+    return json.dumps(items, indent=2, ensure_ascii=False)
+
+
+@mcp.tool(annotations=READ_ONLY_SESSION)
+async def get_vivado_capabilities(
+    commands: list[str] | None = None,
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """只读检查当前 Vivado Tcl 解释器是否注册了指定命令。
+
+    不传 ``commands`` 时返回项目、run、报告、仿真、硬件交接和 Hardware Manager
+    的默认能力矩阵。传入命令时只检查这些精确命令名。实现仅执行 Tcl
+    ``info commands``，不会执行被检查的命令，也不会打开或修改工程。
+
+    ``gate`` 含义：全部存在为 ``PASS``；任一不存在为 ``FAIL``；探测输出不完整
+    为 ``UNKNOWN``。调用版本敏感的 Vivado Tcl 前，应先让本工具通过。
+    """
+    manager = _get_manager(ctx)
+    session = manager.get(session_id)
+    if session is None:
+        return f"[ERROR] 会话 '{session_id}' 不存在。请先调用 start_session。"
+
+    try:
+        selected = normalize_capability_commands(commands)
+        availability = await probe_command_capabilities(session, selected)
+    except (RuntimeError, ValueError) as exc:
+        return f"[ERROR] capability 探测失败: {exc}"
+
+    unavailable = [
+        command for command, available in availability.items() if available is False
+    ]
+    unknown = [
+        command for command, available in availability.items() if available is None
+    ]
+    gate = "UNKNOWN" if unknown else ("FAIL" if unavailable else "PASS")
+    status = session.status_dict()
+    matrix = (
+        group_capabilities(availability)
+        if not commands
+        else {"requested": availability}
+    )
+    return json.dumps(
+        {
+            "gate": gate,
+            "probe": "Tcl info commands (exact name; target command not executed)",
+            "session_id": session_id,
+            "vivado_version": status.get("vivado_version", "unknown"),
+            "vivado_path": status.get("vivado_path", ""),
+            "capabilities": matrix,
+            "unavailable": unavailable,
+            "unknown": unknown,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool(annotations=SESSION_STOP)
 async def stop_session(
     session_id: str = "default",
     ctx: Context = None,
@@ -240,7 +336,23 @@ async def stop_session(
         )
 
 
-@mcp.tool()
+@mcp.tool(annotations=SESSION_CHANGE)
+async def detach_session(
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """仅断开 MCP 传输，保留可见 Vivado GUI 与其当前工程/会话状态。"""
+    manager = _get_manager(ctx)
+    try:
+        return await manager.detach_session(session_id)
+    except Exception as exc:
+        return (
+            f"[ERROR] detach 会话 '{session_id}' 失败: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def list_sessions(ctx: Context = None) -> str:
     """列出所有活跃的 Vivado 会话及其状态。"""
     manager = _get_manager(ctx)
