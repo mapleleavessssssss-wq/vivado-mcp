@@ -70,7 +70,28 @@ vivado-mcp doctor
 
 ### 3. 配置 MCP client
 
-推荐直接让 client 启动 MCP；正常的 `start_session(mode="gui")` 会使用一次性 `-source` bootstrap，不要求修改任何 `Vivado_init.tcl`。多版本并存时在工具调用中显式传 `vivado_version`，例如 `2024.2`。
+推荐直接让 client 启动 MCP；正常的 `start_session(mode="gui")` 会使用一次性 `-source` bootstrap，不要求修改任何 `Vivado_init.tcl`。多版本并存时在工具调用中显式传 `vivado_version`，例如 `2024.2`。涉及 Block Design 时同时传准确 XPR 和 IP Integrator 门禁：
+
+```text
+start_session(
+    mode="gui",
+    vivado_version="2024.2",
+    project_path="E:/absolute/project/design.xpr",
+    require_ip_integrator=True,
+)
+```
+
+该路径让 Vivado 先 `open_project`，随后才执行 VMCP `-source` bootstrap；握手还会
+核对实际 XPR，并确认 `open_bd_design`、`get_bd_pins` 已注册。未满足时拒绝进入
+READY，不允许 AI 在缺少 IP Integrator commands 的会话里猜测修改 BD。
+
+需要独立无头会话时同样可用 `mode="tcl" + project_path`。Tcl session 会在返回
+READY 前核对 exact XPR/IP Integrator commands；Windows 仍通过 AMD `vivado.bat`
+建立官方环境。MCP 会在进程创建前拒绝内部 `bin/unwrapped/.../vivado.exe`，避免
+绕过 loader 后触发 `xv_common.dll` 缺失 / `0xC0000135` 系统错误。
+
+连接已有 endpoint 时可用 `mode="attach" + port + project_path`；此路径不会打开或
+修改工程，只在握手中核对 exact XPR，并可同时要求 IP Integrator commands READY。
 
 Codex 用户级配置建议使用虚拟环境绝对路径：
 
@@ -207,6 +228,8 @@ pip install -e ".[dev]"
 - **结构化报告** — IO 和时序报告解析为 JSON，便于 AI 精确提取数值（**不再有"假 PASS"陷阱**）
 - **安全转义** — `safe_tcl` 自动对路径/标识符做 Tcl list 转义，Windows 含空格/中文/$ 的路径也能用
 - **多会话支持** — GUI 默认 `port=0` 自动分配回环端口并启动独立实例；显式非零端口才探测/attach；握手核对 endpoint 类型和 Vivado 版本
+- **外部端点先辨身份** — `list_sessions` 对 9999–10003 的只读探测直接返回
+  `identity.project/xpr/vivado/ip_integrator`；attach 前即可看出端口属于哪个工程
 
 ### 编译性能默认值
 
@@ -331,6 +354,7 @@ get_run_progress(run_name="synth_1", session_id="default")
 ### Hardware Manager / ILA
 | 工具 | 说明 |
 |------|------|
+| `configure_hw_ila_basic_trigger` | 默认 PLAN_ONLY；精确核对 bit/LTX、device/ILA/probe、IDLE 状态、位宽和属性可写性后配置语义化 basic trigger，永不写 `CONTROL.TRIGGER_MODE`、不 arm |
 | `capture_hw_ila_to_csv` | 连接/刷新硬件并采集 ILA 到独立 CSV；属于硬件状态变化，远程 hw_server 默认阻断 |
 
 ### 新手引导 & 工程摸底

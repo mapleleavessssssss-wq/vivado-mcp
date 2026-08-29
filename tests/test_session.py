@@ -4,13 +4,23 @@
 """
 
 import asyncio
+import sys
 from unittest.mock import patch
 
 import pytest
 
 from vivado_mcp.vivado.base_session import SessionState
-from vivado_mcp.vivado.session import SubprocessSession, vivado_process_argv
-from vivado_mcp.vivado.session_manager import SessionManager, _validate_session_id
+from vivado_mcp.vivado.session import (
+    SubprocessSession,
+    _quote_windows_batch_arg,
+    create_vivado_subprocess,
+    windows_batch_command,
+)
+from vivado_mcp.vivado.session_manager import (
+    SessionManager,
+    _resolve_startup_project,
+    _validate_session_id,
+)
 from vivado_mcp.vivado.tcl_utils import TclResult
 
 
@@ -161,34 +171,266 @@ class TestSubprocessInflightOwnership:
         assert session.state == SessionState.STOPPED
 
 
-class TestVivadoProcessArgv:
-    def test_windows_batch_uses_comspec(self):
-        with patch("vivado_mcp.vivado.session.sys.platform", "win32"), patch.dict(
-            "os.environ", {"COMSPEC": "C:/Windows/System32/cmd.exe"}
-        ):
-            argv = vivado_process_argv("C:/Xilinx/Vivado/2024.2/bin/vivado.bat", "-mode", "tcl")
-        assert argv[:4] == ("C:/Windows/System32/cmd.exe", "/d", "/s", "/c")
-        assert len(argv) == 5
-        assert argv[4] == "C:/Xilinx/Vivado/2024.2/bin/vivado.bat -mode tcl"
-
-    def test_windows_batch_preserves_one_vendor_command_line(self):
-        with patch("vivado_mcp.vivado.session.sys.platform", "win32"), patch.dict(
-            "os.environ", {"COMSPEC": "C:/Windows/System32/cmd.exe"}
-        ):
-            argv = vivado_process_argv(
-                "C:/Program Files/Xilinx/Vivado/2024.2/bin/vivado.bat",
-                "-source",
-                "C:/Temp/a b/bootstrap.tcl",
-            )
-        assert argv[4] == (
+class TestVivadoProcessLauncher:
+    def test_windows_batch_command_preserves_raw_flags_and_quotes_values(self):
+        command = windows_batch_command(
+            "C:/Program Files/Xilinx/Vivado/2024.2/bin/vivado.bat",
+            "-mode",
+            "tcl",
+            "-source",
+            "C:/Temp/a b/bootstrap.tcl",
+            "meta&|<>()^%PATH%",
+        )
+        assert command == (
             '"C:/Program Files/Xilinx/Vivado/2024.2/bin/vivado.bat" '
-            '-source "C:/Temp/a b/bootstrap.tcl"'
+            '-mode tcl -source "C:/Temp/a b/bootstrap.tcl" '
+            '"meta^&^|^<^>^(^)^^^%PATH^%"'
         )
 
-    def test_native_executable_is_unchanged(self):
+    def test_windows_batch_rejects_quote_and_control_chars(self):
+        for bad in ('a"b', "a!b", "a\nb", "a\rb", "a\x00b"):
+            with pytest.raises(ValueError, match="不支持"):
+                _quote_windows_batch_arg(bad)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows cmd integration")
+    async def test_windows_batch_roundtrip_through_real_cmd(self):
+        from pathlib import Path
+
+        probe = str(
+            (
+                Path(__file__).resolve().parent
+                / "fixtures"
+                / "windows launcher probe.cmd"
+            ).resolve()
+        )
+        proc = await create_vivado_subprocess(
+            probe,
+            "-mode",
+            "tcl",
+            "C:/Temp/a b/bootstrap.tcl",
+            "meta&|<>()^%PATH%",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        text = stdout.decode(errors="replace")
+        assert proc.returncode == 0
+        assert "RAW1=[-mode]" in text
+        assert "RAW2=[tcl]" in text
+        assert "ARG3=[C:/Temp/a b/bootstrap.tcl]" in text
+        assert "ARG4=[meta&|<>()^%PATH%]" in text
+        assert "PROBE_STDERR" in stderr.decode(errors="replace")
+
+    async def test_native_executable_uses_exact_exec_argv(self, monkeypatch):
+        captured: dict[str, object] = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return object()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
         with patch("vivado_mcp.vivado.session.sys.platform", "win32"):
-            argv = vivado_process_argv("C:/Xilinx/Vivado/2024.2/bin/vivado.exe", "-mode", "gui")
-        assert argv == ("C:/Xilinx/Vivado/2024.2/bin/vivado.exe", "-mode", "gui")
+            result = await create_vivado_subprocess(
+                "C:/Xilinx/Vivado/2024.2/bin/vivado.exe",
+                "-mode",
+                "gui",
+            )
+        assert captured["args"] == (
+            "C:/Xilinx/Vivado/2024.2/bin/vivado.exe",
+            "-mode",
+            "gui",
+        )
+        assert result is not None
+
+    async def test_unwrapped_is_rejected_before_any_process_creation(
+        self, monkeypatch
+    ):
+        async def must_not_run(*args, **kwargs):
+            raise AssertionError("process creation must not be reached")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", must_not_run)
+        monkeypatch.setattr(asyncio, "create_subprocess_shell", must_not_run)
+        with pytest.raises(ValueError, match="unwrapped.*xv_common.dll"):
+            await create_vivado_subprocess(
+                "C:/Xilinx/Vivado/2024.2/bin/unwrapped/win64.o/vivado.exe",
+                "-mode",
+                "gui",
+            )
+
+
+class TestSubprocessForcedStop:
+    async def test_taskkill_failure_is_bounded_and_reported(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from vivado_mcp.vivado import session as session_mod
+
+        class _HungProcess:
+            returncode = None
+            pid = 7070
+            stdin = None
+
+            async def wait(self):
+                await asyncio.Event().wait()
+
+        monkeypatch.setattr(session_mod.sys, "platform", "win32")
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=5,
+                stdout=b"",
+                stderr=b"Access denied",
+            ),
+        )
+        session = SubprocessSession("C:/Xilinx/Vivado/2024.2/bin/vivado.bat")
+        session._process = _HungProcess()
+        session._state = SessionState.READY
+
+        with pytest.raises(RuntimeError, match="taskkill.*Access denied"):
+            await session.stop(timeout=0.01)
+
+
+class _StartupStdin:
+    def __init__(self):
+        self.written = bytearray()
+
+    def write(self, data: bytes):
+        self.written.extend(data)
+
+    async def drain(self):
+        return None
+
+
+class _StartupProcess:
+    def __init__(self, stdout: asyncio.StreamReader, returncode=None):
+        self.stdin = _StartupStdin()
+        self.stdout = stdout
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_eof()
+        self.returncode = returncode
+        self.pid = 6060
+
+    async def wait(self):
+        return self.returncode
+
+
+class TestSubprocessStartupEvidence:
+    def test_startup_probe_clears_current_project_errors(self):
+        from vivado_mcp.vivado.session import _TCL_STARTUP_PROBE
+
+        assert "catch {current_project} __vmcp_project" in _TCL_STARTUP_PROBE
+        assert 'set __vmcp_project ""' in _TCL_STARTUP_PROBE
+
+    async def test_project_identity_and_ipi_gate_pass(self, monkeypatch, tmp_path):
+        from vivado_mcp.vivado import session as session_mod
+
+        xpr = (tmp_path / "project.xpr").resolve()
+        xpr.write_text("fixture", encoding="utf-8")
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"Startup banner\n")
+        reader.feed_data(
+            (
+                "VMCP_TCL_ID|project=project|"
+                f"xpr={xpr.as_posix()}|ip_integrator=1\n"
+            ).encode()
+        )
+        reader.feed_data(b"<<<VMCP_START_RC=0>>>\n")
+        process = _StartupProcess(reader)
+
+        monkeypatch.setattr(
+            session_mod, "generate_sentinel", lambda: "VMCP_START"
+        )
+        session = SubprocessSession(
+            "/fake/vivado",
+            "project-first-tcl",
+            startup_project_path=xpr.as_posix(),
+            require_ip_integrator=True,
+        )
+        session._process = process
+
+        banner = await session._read_startup_banner(timeout=1.0)
+        assert banner == "Startup banner"
+        assert session.status_dict()["identity"]["ip_integrator"] == "1"
+        assert b"current_project" not in process.stdin.written
+        # Commands are hex encoded by wrap_command; raw paths/Tcl never cross
+        # the wrapper boundary unescaped.
+        assert b"binary format H*" in process.stdin.written
+
+    async def test_project_identity_mismatch_is_rejected(
+        self, monkeypatch, tmp_path
+    ):
+        from vivado_mcp.vivado import session as session_mod
+
+        expected = (tmp_path / "expected.xpr").resolve()
+        expected.write_text("fixture", encoding="utf-8")
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            b"VMCP_TCL_ID|project=wrong|xpr=C:/wrong.xpr|ip_integrator=1\n"
+        )
+        reader.feed_data(b"<<<VMCP_START_RC=0>>>\n")
+        process = _StartupProcess(reader)
+        monkeypatch.setattr(
+            session_mod, "generate_sentinel", lambda: "VMCP_START"
+        )
+        session = SubprocessSession(
+            "/fake/vivado",
+            startup_project_path=expected.as_posix(),
+        )
+        session._process = process
+
+        with pytest.raises(RuntimeError, match="身份不匹配"):
+            await session._read_startup_banner(timeout=1.0)
+
+    async def test_code1_reports_launcher_and_stderr(self, monkeypatch):
+        from vivado_mcp.vivado import session as session_mod
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"ERROR: vendor loader rejected one startup option\n")
+        reader.feed_eof()
+        process = _StartupProcess(reader, returncode=1)
+        monkeypatch.setattr(
+            session_mod, "generate_sentinel", lambda: "VMCP_START"
+        )
+        session = SubprocessSession(
+            "C:/Xilinx/Vivado/2024.2/bin/vivado.bat",
+            "code1",
+        )
+        session._process = process
+        session._launch_args = ("-mode", "tcl", "-nojournal", "-nolog")
+        session._stderr_buffer.extend(
+            ["loader detail", "ERROR: representative launcher failure"]
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await session._read_startup_banner(timeout=1.0)
+        message = str(exc_info.value)
+        assert "returncode=1" in message
+        assert "vivado.bat" in message
+        assert "-nolog" in message
+        assert "vendor loader rejected one startup option" in message
+        assert "representative launcher failure" in message
+
+    async def test_start_drains_stderr_before_waiting_for_ready(self, monkeypatch):
+        from vivado_mcp.vivado import session as session_mod
+
+        stdout = asyncio.StreamReader()
+        process = _StartupProcess(stdout)
+        observed: dict[str, bool] = {}
+
+        async def fake_create(*args, **kwargs):
+            return process
+
+        async def fake_banner(self, timeout):
+            observed["stderr_task_started"] = self._stderr_task is not None
+            return "banner"
+
+        monkeypatch.setattr(session_mod, "create_vivado_subprocess", fake_create)
+        monkeypatch.setattr(SubprocessSession, "_read_startup_banner", fake_banner)
+        session = SubprocessSession("/fake/vivado", "drain-first")
+        assert await session.start(timeout=1.0) == "banner"
+        assert observed["stderr_task_started"] is True
+        await session.stop(timeout=1.0)
 
 
 class TestValidateSessionId:
@@ -232,6 +474,17 @@ class TestSessionManager:
     def test_get_nonexistent(self, session_manager: SessionManager):
         """获取不存在的会话返回 None。"""
         assert session_manager.get("nonexistent") is None
+
+    def test_public_tool_exposes_project_first_startup_gate(self):
+        import inspect
+
+        from vivado_mcp.tools.session_tools import start_session
+
+        params = inspect.signature(start_session).parameters
+        assert "project_path" in params
+        assert "require_ip_integrator" in params
+        # Keep the historical positional timeout slot stable for Python callers.
+        assert list(params).index("timeout") < list(params).index("project_path")
 
     async def test_list_empty(self, session_manager: SessionManager):
         """空管理器列表为空(关闭外部 probe,只看 MCP 自己管的)。
@@ -296,6 +549,249 @@ class TestSessionManager:
     async def test_rejects_port_out_of_range(self, session_manager):
         with pytest.raises(ValueError, match="0..65535"):
             await session_manager.start_session(mode="gui", port=65536)
+
+    def test_startup_project_requires_absolute_xpr(self, tmp_path):
+        relative = tmp_path.name + "/project.xpr"
+        with pytest.raises(ValueError, match="绝对路径"):
+            _resolve_startup_project(relative)
+
+    def test_startup_project_requires_existing_xpr(self, tmp_path):
+        wrong_suffix = tmp_path / "project.dcp"
+        wrong_suffix.write_text("fixture", encoding="utf-8")
+        with pytest.raises(ValueError, match=".xpr"):
+            _resolve_startup_project(str(wrong_suffix))
+        with pytest.raises(FileNotFoundError, match="XPR 不存在"):
+            _resolve_startup_project(str(tmp_path / "missing.xpr"))
+
+    async def test_gui_receives_exact_startup_project_and_ipi_gate(
+        self, session_manager: SessionManager, monkeypatch, tmp_path
+    ):
+        from vivado_mcp.vivado import session_manager as sm_mod
+
+        xpr = tmp_path / "exact project.xpr"
+        xpr.write_text("fixture", encoding="utf-8")
+        captured: dict[str, object] = {}
+
+        class _FakeSession:
+            mode = "gui"
+            connected_port = 43210
+            pid = 111
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.vivado_path = str(kwargs["vivado_path"])
+                self.startup_project_path = kwargs.get("startup_project_path")
+                self._identity = {"ip_integrator": "1"}
+
+            async def start(self, timeout):
+                return "banner"
+
+            @property
+            def is_alive(self):
+                return True
+
+            def status_dict(self):
+                return {"mode": "gui", "state": "ready"}
+
+        monkeypatch.setattr(sm_mod, "GuiSession", _FakeSession)
+
+        await session_manager.start_session(
+            session_id="project-aware",
+            mode="gui",
+            project_path=str(xpr),
+            require_ip_integrator=True,
+        )
+
+        assert captured["startup_project_path"] == xpr.resolve().as_posix()
+        assert captured["require_ip_integrator"] is True
+
+    async def test_tcl_receives_exact_startup_project_and_ipi_gate(
+        self, session_manager: SessionManager, monkeypatch, tmp_path
+    ):
+        from vivado_mcp.vivado import session_manager as sm_mod
+
+        xpr = tmp_path / "exact_tcl.xpr"
+        xpr.write_text("fixture", encoding="utf-8")
+        captured: dict[str, object] = {}
+
+        class _FakeTclSession:
+            mode = "tcl"
+            pid = 112
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.vivado_path = str(kwargs["vivado_path"])
+                self.startup_project_path = kwargs.get("startup_project_path")
+                self._identity = {"ip_integrator": "1"}
+
+            async def start(self, timeout):
+                return "banner"
+
+            @property
+            def is_alive(self):
+                return True
+
+            def status_dict(self):
+                return {"mode": "tcl", "state": "ready"}
+
+        monkeypatch.setattr(sm_mod, "SubprocessSession", _FakeTclSession)
+        await session_manager.start_session(
+            session_id="project-aware-tcl",
+            mode="tcl",
+            project_path=str(xpr),
+            require_ip_integrator=True,
+        )
+        assert captured["startup_project_path"] == xpr.resolve().as_posix()
+        assert captured["require_ip_integrator"] is True
+
+    async def test_attach_receives_exact_project_identity_gate(
+        self, session_manager: SessionManager, monkeypatch, tmp_path
+    ):
+        from vivado_mcp.vivado import session_manager as sm_mod
+
+        xpr = tmp_path / "attach_exact.xpr"
+        xpr.write_text("fixture", encoding="utf-8")
+        captured: dict[str, object] = {}
+
+        class _FakeAttachSession:
+            mode = "attach"
+            connected_port = 45678
+            pid = None
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.vivado_path = str(kwargs["vivado_path"])
+                self.startup_project_path = kwargs.get("startup_project_path")
+                self._identity = {"ip_integrator": "1"}
+
+            async def start(self, timeout):
+                return "attached"
+
+            @property
+            def is_alive(self):
+                return True
+
+            def status_dict(self):
+                return {"mode": "attach", "state": "ready"}
+
+        monkeypatch.setattr(sm_mod, "GuiSession", _FakeAttachSession)
+        await session_manager.start_session(
+            session_id="project-aware-attach",
+            mode="attach",
+            port=45678,
+            project_path=str(xpr),
+            require_ip_integrator=True,
+        )
+        assert captured["attach_only"] is True
+        assert captured["startup_project_path"] == xpr.resolve().as_posix()
+        assert captured["require_ip_integrator"] is True
+
+    async def test_ipi_gate_requires_project(
+        self, session_manager: SessionManager
+    ):
+        with pytest.raises(ValueError, match="必须同时提供"):
+            await session_manager.start_session(
+                mode="gui", require_ip_integrator=True
+            )
+
+    async def test_same_session_concurrent_start_spawns_once(
+        self, session_manager: SessionManager, monkeypatch
+    ):
+        from vivado_mcp.vivado import session_manager as sm_mod
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        constructed: list[object] = []
+
+        class _FakeSession:
+            mode = "gui"
+            connected_port = 41000
+            pid = 222
+
+            def __init__(self, **kwargs):
+                self.vivado_path = str(kwargs["vivado_path"])
+                constructed.append(self)
+
+            async def start(self, timeout):
+                entered.set()
+                await release.wait()
+                return "banner"
+
+            @property
+            def is_alive(self):
+                return True
+
+            def status_dict(self):
+                return {"mode": "gui", "state": "ready"}
+
+        monkeypatch.setattr(sm_mod, "GuiSession", _FakeSession)
+
+        first = asyncio.create_task(
+            session_manager.start_session(session_id="same", mode="gui")
+        )
+        await entered.wait()
+        second = asyncio.create_task(
+            session_manager.start_session(session_id="same", mode="gui")
+        )
+        await asyncio.sleep(0)
+        assert len(constructed) == 1
+
+        release.set()
+        (first_session, _), (second_session, _) = await asyncio.gather(
+            first, second
+        )
+        assert first_session is second_session
+        assert len(constructed) == 1
+
+    def test_explicit_attach_is_not_reused_as_gui(
+        self, session_manager: SessionManager
+    ):
+        class _ExplicitAttach:
+            mode = "attach"
+            _attach_only = True
+            connected_port = 45678
+            vivado_path = "C:/Xilinx/Vivado/2024.2/bin/vivado.bat"
+
+        with pytest.raises(ValueError, match="mode 不匹配"):
+            session_manager._validate_existing_request(
+                _ExplicitAttach(),
+                mode="gui",
+                port=0,
+                vivado_path=None,
+                vivado_version=None,
+                project_path=None,
+                require_ip_integrator=False,
+            )
+
+    def test_gui_auto_attach_can_reuse_same_gui_request(
+        self, session_manager: SessionManager
+    ):
+        class _AutoAttach:
+            mode = "attach"
+            _attach_only = False
+            connected_port = 45678
+            vivado_path = "C:/Xilinx/Vivado/2024.2/bin/vivado.bat"
+
+        session_manager._validate_existing_request(
+            _AutoAttach(),
+            mode="gui",
+            port=0,
+            vivado_path=None,
+            vivado_version=None,
+            project_path=None,
+            require_ip_integrator=False,
+        )
+
+    def test_get_dead_session_clears_port_map(
+        self, session_manager: SessionManager
+    ):
+        class _DeadSession:
+            is_alive = False
+
+        session_manager._sessions["dead"] = _DeadSession()
+        session_manager._port_map["dead"] = (40123, 333)
+        assert session_manager.get("dead") is None
+        assert "dead" not in session_manager._port_map
 
     async def test_port_map_records_and_clears(
         self, session_manager: SessionManager, monkeypatch

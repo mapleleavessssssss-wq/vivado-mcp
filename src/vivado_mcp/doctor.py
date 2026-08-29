@@ -385,7 +385,7 @@ def _collect_checks(
             )
         )
         init_tcl = _resolve_init_tcl(resolved_vivado)
-    except (FileNotFoundError, OSError) as exc:
+    except (FileNotFoundError, OSError, ValueError) as exc:
         checks.append(
             _check(
                 "vivado_executable",

@@ -4,6 +4,42 @@
 
 ### 多版本、GUI 生命周期与安全门禁
 
+- `start_session` 新增 GUI/Tcl/attach `project_path` 与 `require_ip_integrator`：准确 XPR
+  作为 Vivado 位置参数在 VMCP `-source` 之前加载，握手核对实际 XPR，并可强制
+  `open_bd_design` / `get_bd_pins` 已注册后才进入 READY。修复 endpoint 在 GUI
+  启动过早阶段接管 Tcl、后续打开 Block Design 时命令面缺失的真实故障；attach
+  只核对现有 endpoint，不打开或改写工程。
+- 同一 `session_id` 的 start/stop/detach 现按会话串行化；并发双发不会 spawn 两个
+  Vivado 后覆盖 registry。复用现有会话时会拒绝 mode、port、launcher/version、
+  startup project 不一致。死亡会话清理同步移除 port map。
+- GUI 启动新增独立 launcher stdout/stderr 日志；vendor `.bat` / `loader.bat` 层错误
+  不再被 DEVNULL 吞掉，同时继续保留 AMD 支持的 vendor launcher 环境初始化链。
+- 修复 Windows batch 真正执行层：不再把 `subprocess.list2cmdline` 的 C-runtime
+  引号规则误用于 `cmd.exe`；AMD launcher 依赖原始 `%1/%2` 的 `-mode tcl/gui`
+  tokens 保持不带引号，仅对路径和特殊值按需引用。带空格路径和 `&|<>()^%`
+  参数已通过同时模拟 AMD 原始参数判断和 delayed expansion 的真实 fake-batch
+  roundtrip；`!` 因 vendor `%*` 转发会静默改值而明确拒绝。Tcl session 从进程
+  创建起即排空 stderr，code 1/timeout 会返回 launcher、returncode 与 stderr tail；
+  超时强制清理使用确切 PID 的 `taskkill /T`。
+- `project_path` / `require_ip_integrator` 扩展到 `mode="tcl"`；无头会话同样先打开
+  exact XPR，再完成 READY/project/IP Integrator 身份门禁。
+- `list_sessions` 不再把外部 9999–10003 endpoint 只列成匿名端口；只读 probe
+  直接保留 `project/xpr/vivado/ip_integrator` 身份，attach 前即可拒绝错误工程。
+- Tcl launcher 在 READY 前 EOF/timeout 时同时返回 bounded startup stdout/stderr tail
+  与实际启动参数；修复 vendor batch 把原因写 stdout 时只看到裸 `returncode=1` 的
+  诊断盲区。
+- 配置解析和最终进程创建增加双重 launcher 硬门：拒绝任何
+  `bin/unwrapped/.../vivado[.exe]`，不再允许智能体在 `vivado.bat` 失败后绕过 AMD
+  loader；避免 `xv_common.dll` 缺失 / Windows `0xC0000135` 弹窗。
+- 新增 `configure_hw_ila_basic_trigger`：以 bit/LTX 和 exact hardware object 为身份
+  门禁，将 `falling/rising/low/high` 等语义安全转换为 probe comparator；默认
+  PLAN_ONLY，所有对象、IDLE 状态、位宽、depth/window/position 和属性可写性在
+  首次写入前完成 preflight。`CONTROL.TRIGGER_MODE` 只比较当前值、不解析只读格式也
+  不写；未参与的 data-only probe 不误阻断，并完整支持 `AND/OR/NAND/NOR`。标准
+  basic trigger 不再依赖智能体手拼 `run_tcl`。ILA 配置/采集还会按 `HW_SERVER.SID`
+  锁定请求的 server，再逐级限定 target/device/ILA，已连接的其他 server 不会绕过
+  remote opt-in 或混入对象选择；`program_device` 同步使用相同的 exact-server 门禁。
+
 - 编译默认路径改为按决策取证：成功的综合/实现不再自动扫描完整 `runme.log`；
   `post_check=on_failure/always` 可显式恢复。实现启动不再读取只影响综合的
   generic/define。`get_timing_report` 默认只取 summary，Top10 违例路径改为

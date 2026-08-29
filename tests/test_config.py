@@ -17,6 +17,7 @@ from vivado_mcp.config import (
     get_vivado_version,
     normalize_path,
     resolve_vivado,
+    validate_vivado_launcher,
     vivado_versions_match,
 )
 
@@ -32,6 +33,28 @@ class TestNormalizePath:
 
     def test_empty_string(self):
         assert normalize_path("") == ""
+
+
+class TestValidateVivadoLauncher:
+    def test_vendor_launchers_are_allowed(self):
+        assert validate_vivado_launcher(
+            "C:/Xilinx/Vivado/2024.2/bin/vivado.bat"
+        ).endswith("/bin/vivado.bat")
+        assert validate_vivado_launcher(
+            "/opt/Xilinx/Vivado/2024.2/bin/vivado"
+        ).endswith("/bin/vivado")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "C:/Xilinx/Vivado/2024.2/bin/unwrapped/win64.o/vivado.exe",
+            "C:\\Xilinx\\Vivado\\2024.2\\bin\\unwrapped\\win64.o\\vivado.exe",
+            "/opt/Xilinx/Vivado/2024.2/bin/unwrapped/lnx64.o/vivado",
+        ],
+    )
+    def test_unwrapped_executable_is_rejected(self, path):
+        with pytest.raises(ValueError, match="unwrapped.*xv_common.dll"):
+            validate_vivado_launcher(path)
 
 
 class TestDefaultInstallGlobs:
@@ -72,6 +95,29 @@ class TestFindVivado:
         with patch.dict(os.environ, {"VIVADO_PATH": str(fake)}):
             result = find_vivado()
             assert "vivado" in result
+
+    def test_explicit_unwrapped_path_is_rejected(self, tmp_path):
+        internal = (
+            tmp_path
+            / "Vivado"
+            / "2024.2"
+            / "bin"
+            / "unwrapped"
+            / "win64.o"
+            / "vivado.exe"
+        )
+        internal.parent.mkdir(parents=True)
+        internal.write_text("fake", encoding="utf-8")
+        with pytest.raises(ValueError, match="unwrapped"):
+            find_vivado(str(internal))
+
+    def test_env_unwrapped_path_is_rejected(self, tmp_path):
+        internal = tmp_path / "bin" / "unwrapped" / "win64.o" / "vivado.exe"
+        internal.parent.mkdir(parents=True)
+        internal.write_text("fake", encoding="utf-8")
+        with patch.dict(os.environ, {"VIVADO_PATH": str(internal)}):
+            with pytest.raises(ValueError, match="unwrapped"):
+                find_vivado()
 
     def test_not_found_raises(self):
         """全部搜索失败时抛出 FileNotFoundError。"""
@@ -142,6 +188,21 @@ class TestVivadoProfiles:
         launcher.write_text("@echo off\n", encoding="utf-8")
         with pytest.raises(ValueError, match="不匹配"):
             resolve_vivado(vivado_version="2020.2", vivado_path=str(launcher))
+
+    def test_resolve_unwrapped_rejects_before_version_or_process(self, tmp_path):
+        internal = (
+            tmp_path
+            / "Vivado"
+            / "2024.2"
+            / "bin"
+            / "unwrapped"
+            / "win64.o"
+            / "vivado.exe"
+        )
+        internal.parent.mkdir(parents=True)
+        internal.write_text("fake", encoding="utf-8")
+        with pytest.raises(ValueError, match="unwrapped"):
+            resolve_vivado(vivado_version="2024.2", vivado_path=str(internal))
 
 
 class TestGetVivadoVersion:

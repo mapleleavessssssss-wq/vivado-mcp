@@ -67,7 +67,7 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     try:
         vivado_path = find_vivado()
         logger.info("检测到 Vivado: %s", vivado_path)
-    except (FileNotFoundError, RuntimeError) as e:
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
         logger.warning(
             "Vivado auto-discovery is unavailable or ambiguous; "
             "use start_session(vivado_version=...) or an absolute vivado_path."
@@ -98,6 +98,8 @@ mcp = MCPServer(
         "综合成功不代表实现/时序通过，bitstream 成功不授权烧录。硬件、网络、"
         "run_tcl/safe_tcl 及副作用不明操作始终需要用户确认。本 server 只控制 "
         "Vivado，不把 Vitis/SDK/XSCT/XSDB 命令交给 Vivado run_tcl。调用版本敏感的 "
+        "Vivado 前必须使用 vendor bin/vivado.bat 或 bin/vivado，禁止直接启动 "
+        "bin/unwrapped 下的内部 executable。"
         "Vivado Tcl 前先用 get_vivado_capabilities；gate=FAIL/UNKNOWN 时停止。"
         "默认采用快速证据路径：同一 run/设计状态不重复报告；综合、实现和 Bitstream "
         "启动后按需低频查进度；成功路径不自动扫描完整日志。只有失败、明确诊断或 "

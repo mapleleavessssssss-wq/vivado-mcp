@@ -28,7 +28,9 @@ from vivado_mcp.tcl_scripts import (
 from vivado_mcp.tools._hardware_safety import (
     is_loopback_hw_server,
     is_valid_hw_server_url,
+    parse_hw_server_url,
     select_exact_tcl_proc,
+    select_hw_server_tcl_proc,
 )
 from vivado_mcp.tools.annotations import HARDWARE_CHANGE, PROJECT_WRITE
 from vivado_mcp.vivado.tcl_utils import tcl_quote, to_tcl_path, validate_identifier
@@ -821,6 +823,8 @@ async def program_device(
 
     bit_tcl = to_tcl_path(bitstream_path)
     server_tcl = tcl_quote(hw_server_url)
+    server_host, server_port = parse_hw_server_url(hw_server_url)
+    server_host_tcl = tcl_quote(server_host)
     hw_target_tcl = tcl_quote(hw_target_name)
     # Backward-compatible '*' no longer means "silently take index 0".  It
     # means no selector was supplied, so the exact-selection helper requires
@@ -829,18 +833,23 @@ async def program_device(
 
     tcl = (
         f'{select_exact_tcl_proc()}\n'
+        f'{select_hw_server_tcl_proc()}\n'
         f'set __vmcp_server_url {server_tcl}\n'
+        f'set __vmcp_server_host {server_host_tcl}\n'
+        f'set __vmcp_server_port {server_port}\n'
         f'set __vmcp_target_name {hw_target_tcl}\n'
         f'set __vmcp_device_name {device_tcl}\n'
         f'open_hw_manager\n'
-        f'if {{[llength [get_hw_servers -quiet]] == 0}} {{ '
-        f'connect_hw_server -url $__vmcp_server_url }}\n'
-        f'set __vmcp_targets [get_hw_targets -quiet]\n'
+        f'set __vmcp_server [__vmcp_select_hw_server '
+        f'$__vmcp_server_url $__vmcp_server_host $__vmcp_server_port]\n'
+        f'set __vmcp_targets [get_hw_targets -quiet '
+        f'-of_objects $__vmcp_server]\n'
         f'set __vmcp_target [__vmcp_select_exact $__vmcp_targets '
         f'$__vmcp_target_name hw_target]\n'
         f'if {{![get_property IS_OPENED $__vmcp_target]}} {{ '
         f'open_hw_target $__vmcp_target }}\n'
-        f'set __vmcp_devs [get_hw_devices -quiet]\n'
+        f'set __vmcp_devs [get_hw_devices -quiet '
+        f'-of_objects $__vmcp_target]\n'
         f'set dev [__vmcp_select_exact $__vmcp_devs '
         f'$__vmcp_device_name hw_device]\n'
         f'current_hw_device $dev\n'

@@ -8,14 +8,22 @@
 
 import asyncio
 import logging
+import os
 import re
+from pathlib import Path
 from typing import Literal
 
-from vivado_mcp.config import resolve_vivado
+from vivado_mcp.config import (
+    get_vivado_version,
+    normalize_path,
+    resolve_vivado,
+    vivado_versions_match,
+)
 from vivado_mcp.vivado.base_session import BaseSession
 from vivado_mcp.vivado.gui_session import (
     _PENDING_SPAWN_PORTS,
     GuiSession,
+    probe_vmcp_endpoint,
     probe_vmcp_server,
 )
 from vivado_mcp.vivado.session import SubprocessSession
@@ -51,6 +59,27 @@ def _validate_session_id(session_id: str) -> str:
     return session_id
 
 
+def _resolve_startup_project(project_path: str | None) -> str | None:
+    """Validate an exact absolute XPR without opening or modifying the project."""
+    if not project_path:
+        return None
+    candidate = Path(project_path).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("project_path 必须是准确 XPR 的绝对路径。")
+    if candidate.suffix.casefold() != ".xpr":
+        raise ValueError("project_path 必须指向 .xpr 文件。")
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Vivado XPR 不存在: {project_path}")
+    return normalize_path(str(candidate.resolve()))
+
+
+def _same_local_path(left: str, right: str) -> bool:
+    """Compare local paths using the host platform's case-sensitivity rules."""
+    return os.path.normcase(os.path.normpath(left)) == os.path.normcase(
+        os.path.normpath(right)
+    )
+
+
 class SessionManager:
     """管理多个 Vivado 会话实例。"""
 
@@ -65,6 +94,10 @@ class SessionManager:
         # 主清理路径仍是 GuiSession 自持 pid + 自洽 stop;这里只做"self._proc
         # 引用失联时仍知道该清哪个端口/进程"的二级记录。
         self._port_map: dict[str, tuple[int | None, int | None]] = {}
+        # Serialize start/stop/detach for the same logical session.  Without this,
+        # two concurrent start_session calls can both pass the registry check,
+        # spawn two Vivado processes and overwrite one registry entry.
+        self._lifecycle_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def default_vivado_path(self) -> str:
@@ -78,6 +111,7 @@ class SessionManager:
             # 会话存在但进程已死，清理掉
             logger.warning("会话 '%s' 已失效，自动清理。", session_id)
             del self._sessions[session_id]
+            self._port_map.pop(session_id, None)
             return None
         return session
 
@@ -89,6 +123,8 @@ class SessionManager:
         timeout: float = 120.0,
         mode: str = "gui",
         port: int = 0,
+        project_path: str | None = None,
+        require_ip_integrator: bool = False,
     ) -> tuple[BaseSession, str]:
         """启动新会话或返回已有会话。
 
@@ -105,6 +141,10 @@ class SessionManager:
                   否则 spawn 并绑该确切端口。
                 - attach 模式 port 是要连的显式端口(attach 本就需知道连哪;
                   传 0 会去连 0 端口失败,attach 调用方应显式给端口)。
+            project_path: GUI/Tcl/attach 模式可选的准确 XPR 绝对路径。GUI/Tcl
+                会先打开它再建立 READY；attach 只核对现有 endpoint 的 XPR。
+            require_ip_integrator: 要求握手证明 ``open_bd_design`` 和
+                ``get_bd_pins`` 已注册；必须与 ``project_path`` 同用。
 
         Returns:
             (会话实例, 启动横幅/状态消息) 元组。
@@ -119,8 +159,62 @@ class SessionManager:
         if port < 0 or port > 65535:
             raise ValueError("port 必须在 0..65535 范围内。")
 
+        startup_project = _resolve_startup_project(project_path)
+        project_modes = ("gui", "tcl", "attach")
+        if startup_project is not None and mode not in project_modes:
+            raise ValueError(
+                "project_path 只允许 mode='gui'、mode='tcl' 或 mode='attach'。"
+            )
+        if require_ip_integrator and mode not in project_modes:
+            raise ValueError(
+                "require_ip_integrator 只允许 mode='gui'、mode='tcl' 或 "
+                "mode='attach'。"
+            )
+        if require_ip_integrator and startup_project is None:
+            raise ValueError(
+                "require_ip_integrator=True 时必须同时提供准确 project_path。"
+            )
+
+        lifecycle_lock = self._lifecycle_locks.setdefault(
+            session_id, asyncio.Lock()
+        )
+        async with lifecycle_lock:
+            return await self._start_session_locked(
+                session_id=session_id,
+                vivado_path=vivado_path,
+                vivado_version=vivado_version,
+                timeout=timeout,
+                mode=mode,
+                port=port,
+                project_path=startup_project,
+                require_ip_integrator=require_ip_integrator,
+            )
+
+    async def _start_session_locked(
+        self,
+        *,
+        session_id: str,
+        vivado_path: str | None,
+        vivado_version: str | None,
+        timeout: float,
+        mode: str,
+        port: int,
+        project_path: str | None,
+        require_ip_integrator: bool,
+    ) -> tuple[BaseSession, str]:
+        """Start/reuse one session while its per-id lifecycle lock is held."""
+
         existing = self.get(session_id)
         if existing:
+            self._validate_existing_request(
+                existing,
+                mode=mode,
+                port=port,
+                vivado_path=vivado_path,
+                vivado_version=vivado_version,
+                project_path=project_path,
+                require_ip_integrator=require_ip_integrator,
+            )
             return existing, (
                 f"会话 '{session_id}' 已在运行中（mode={existing.mode}）。"
             )
@@ -142,21 +236,41 @@ class SessionManager:
 
         session: BaseSession
         if mode == "tcl":
-            session = SubprocessSession(vivado_path=path, session_id=session_id)
+            tcl_kwargs: dict[str, object] = {
+                "vivado_path": path,
+                "session_id": session_id,
+            }
+            if project_path is not None:
+                tcl_kwargs["startup_project_path"] = project_path
+            if require_ip_integrator:
+                tcl_kwargs["require_ip_integrator"] = True
+            session = SubprocessSession(**tcl_kwargs)
         elif mode == "gui":
+            gui_kwargs: dict[str, object] = {
+                "vivado_path": path,
+                "session_id": session_id,
+                "port": port,
+                "attach_only": False,
+            }
+            if project_path is not None:
+                gui_kwargs["startup_project_path"] = project_path
+            if require_ip_integrator:
+                gui_kwargs["require_ip_integrator"] = True
             session = GuiSession(
-                vivado_path=path,
-                session_id=session_id,
-                port=port,
-                attach_only=False,
+                **gui_kwargs,
             )
         else:  # attach
-            session = GuiSession(
-                vivado_path=path,
-                session_id=session_id,
-                port=port,
-                attach_only=True,
-            )
+            attach_kwargs: dict[str, object] = {
+                "vivado_path": path,
+                "session_id": session_id,
+                "port": port,
+                "attach_only": True,
+            }
+            if project_path is not None:
+                attach_kwargs["startup_project_path"] = project_path
+            if require_ip_integrator:
+                attach_kwargs["require_ip_integrator"] = True
+            session = GuiSession(**attach_kwargs)
 
         try:
             banner = await session.start(timeout=timeout)
@@ -185,6 +299,80 @@ class SessionManager:
 
         return session, banner
 
+    def _validate_existing_request(
+        self,
+        existing: BaseSession,
+        *,
+        mode: str,
+        port: int,
+        vivado_path: str | None,
+        vivado_version: str | None,
+        project_path: str | None,
+        require_ip_integrator: bool,
+    ) -> None:
+        """Reject silent reuse when the requested Vivado identity differs."""
+        actual_mode = existing.mode
+        incompatible_mode = (
+            (mode == "tcl" and actual_mode != "tcl")
+            or (mode == "attach" and actual_mode != "attach")
+            or (
+                mode == "gui"
+                and (
+                    actual_mode == "tcl"
+                    or getattr(existing, "_attach_only", False)
+                )
+            )
+        )
+        if incompatible_mode:
+            raise ValueError(
+                "同名会话 mode 不匹配: "
+                f"requested={mode}, existing={actual_mode}。请换 session_id。"
+            )
+
+        if vivado_version:
+            actual_version = get_vivado_version(existing.vivado_path)
+            if not vivado_versions_match(vivado_version, actual_version):
+                raise ValueError(
+                    "同名会话 Vivado version 不匹配: "
+                    f"requested={vivado_version}, existing={actual_version}。"
+                )
+
+        if vivado_path:
+            requested_launcher = resolve_vivado(
+                vivado_version=vivado_version,
+                vivado_path=vivado_path,
+            )
+            if not _same_local_path(requested_launcher, existing.vivado_path):
+                raise ValueError(
+                    "同名会话 Vivado launcher 不匹配: "
+                    f"requested={requested_launcher}, existing={existing.vivado_path}。"
+                )
+
+        if port > 0:
+            existing_port = getattr(existing, "connected_port", None)
+            if existing_port != port:
+                raise ValueError(
+                    "同名会话 port 不匹配: "
+                    f"requested={port}, existing={existing_port}。"
+                )
+
+        if project_path is not None:
+            existing_project = getattr(existing, "startup_project_path", None)
+            if not existing_project or not _same_local_path(
+                project_path, existing_project
+            ):
+                raise ValueError(
+                    "同名会话 startup project 不匹配: "
+                    f"requested={project_path}, existing={existing_project or '<无>'}。"
+                )
+
+        if require_ip_integrator:
+            identity = getattr(existing, "_identity", {})
+            if identity.get("ip_integrator") != "1":
+                raise ValueError(
+                    "同名会话未证明 IP Integrator commands 已就绪。"
+                )
+
     async def get_or_start(
         self,
         session_id: str = "default",
@@ -211,18 +399,23 @@ class SessionManager:
         Returns:
             操作结果描述。
         """
-        session = self._sessions.get(session_id)
-        if not session:
-            return f"会话 '{session_id}' 不存在。"
+        _validate_session_id(session_id)
+        lifecycle_lock = self._lifecycle_locks.setdefault(
+            session_id, asyncio.Lock()
+        )
+        async with lifecycle_lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return f"会话 '{session_id}' 不存在。"
 
-        # stop 成功后再 pop:stop 抛异常时会话保留在 _sessions/_port_map,
-        # AI 看到 [ERROR] 后可重试 stop_session。pop-before-stop 会让重试
-        # 拿到"会话不存在"而 Vivado 进程仍在跑(审计 P3:孤儿失联)。
-        # 异常原样上抛,工具层 wrapper 兜底成 [ERROR] 文案。
-        await session.stop()
-        self._sessions.pop(session_id, None)
-        self._port_map.pop(session_id, None)
-        return f"会话 '{session_id}' 已关闭。"
+            # stop 成功后再 pop:stop 抛异常时会话保留在 _sessions/_port_map,
+            # AI 看到 [ERROR] 后可重试 stop_session。pop-before-stop 会让重试
+            # 拿到"会话不存在"而 Vivado 进程仍在跑(审计 P3:孤儿失联)。
+            # 异常原样上抛,工具层 wrapper 兜底成 [ERROR] 文案。
+            await session.stop()
+            self._sessions.pop(session_id, None)
+            self._port_map.pop(session_id, None)
+            return f"会话 '{session_id}' 已关闭。"
 
     async def close_all(self) -> None:
         """关闭所有会话（lifespan cleanup）。"""
@@ -240,13 +433,18 @@ class SessionManager:
 
     async def detach_session(self, session_id: str) -> str:
         """Detach one session without terminating a visible GUI process."""
-        session = self._sessions.get(session_id)
-        if not session:
-            return f"会话 '{session_id}' 不存在。"
-        await session.detach()
-        self._sessions.pop(session_id, None)
-        self._port_map.pop(session_id, None)
-        return f"会话 '{session_id}' 已断开；Vivado GUI 保持运行。"
+        _validate_session_id(session_id)
+        lifecycle_lock = self._lifecycle_locks.setdefault(
+            session_id, asyncio.Lock()
+        )
+        async with lifecycle_lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return f"会话 '{session_id}' 不存在。"
+            await session.detach()
+            self._sessions.pop(session_id, None)
+            self._port_map.pop(session_id, None)
+            return f"会话 '{session_id}' 已断开；Vivado GUI 保持运行。"
 
     async def detach_all(self) -> None:
         """MCP shutdown cleanup: detach GUIs, stop non-persistent Tcl sessions."""
@@ -328,7 +526,10 @@ class SessionManager:
             ],
             *[
                 asyncio.to_thread(
-                    probe_vmcp_server, "127.0.0.1", port, _EXTERNAL_PROBE_TIMEOUT
+                    probe_vmcp_endpoint,
+                    "127.0.0.1",
+                    port,
+                    _EXTERNAL_PROBE_TIMEOUT,
                 )
                 for port in external_ports
             ],
@@ -349,24 +550,31 @@ class SessionManager:
                 )
 
         external = []
-        for port, ok in zip(external_ports, ext_results):
+        for port, result in zip(external_ports, ext_results):
+            ok, identity = result
             if not ok:
                 continue
-            external.append({
+            entry = {
                 "session_id": f"<external@{port}>",
                 "mode": "external",
                 "state": "ready",
                 "vivado_path": "<unknown, not managed by MCP>",
+                "vivado_version": identity.get("vivado", "unknown"),
                 "is_alive": True,
                 "uptime_seconds": None,
                 "port": port,
                 "owner": "external",
                 "note": (
                     "未由 MCP 启动的 Vivado(可能是手动启动并装过 init.tcl)。"
-                    "调 start_session(mode='gui') 会自动 attach 上去;"
+                    "attach 前先核对 identity.project/xpr/vivado;"
                     "stop_session 无权关闭 —— 请在 GUI 内手动 exit。"
                 ),
-            })
+            }
+            if identity:
+                entry["identity"] = identity
+                entry["project"] = identity.get("project", "")
+                entry["xpr"] = identity.get("xpr", "")
+            external.append(entry)
 
         return known + external
 

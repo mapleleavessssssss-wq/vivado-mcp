@@ -269,7 +269,7 @@ def ila_hardware_debug() -> str:
             "Build impact：通过 `run_tcl` 检查/创建 debug core 和连接，仅按已批准计划修改；重新综合/实现后调用 `get_utilization_report` 与 `get_timing_report`，确认 ILA 未造成新的拥塞或违例。",
             "Artifact gate：调用 `check_bitstream_readiness` 后才 `generate_bitstream`。分别用 `parse_bit_header` 和 `parse_ltx` 核对器件、时间/来源及 probe，固定记录 bit/ltx/commit 三元组；任何一项不匹配即 BLOCKED。",
             "Program gate：列出目标 hardware server/device 与 DNA/part 等可核对信息；用户明确确认后才调用 `program_device`。不得仅按列表第一个 target 编程。",
-            "Capture：通过 `run_tcl` 使用 Vivado hardware manager 命令选择明确的 device/ILA，配置触发、arm、等待和上传；每次采集记录触发配置、采样时钟、depth、bit/ltx 标识与环境条件。",
+            "Capture：标准 basic trigger 先调用 `configure_hw_ila_basic_trigger(apply=False)` 完成 bit/LTX、device/ILA/probe、位宽和属性门禁，再经批准以 `apply=True` 配置；随后调用 `capture_hw_ila_to_csv(trigger_now=False)` arm/wait/upload。只有专用工具无法表达的 advanced trigger 才使用 `run_tcl`，并先读取运行时 property。每次采集记录触发配置、采样时钟、depth、bit/ltx 标识与环境条件。",
             "Re-measure：根据一次采集只更新一个假设或探针计划。若两轮采集均不能区分假设，停止并说明缺少的可观测性，而不是不断扩大 probe 集。",
         ),
         pass_condition="实现与 post-route timing 通过；bitstream、LTX、器件和 commit 可证明配对；触发条件可重复命中；采集证据能支持或否定明确假设。成功下载但没有有效采集不算 PASS。",

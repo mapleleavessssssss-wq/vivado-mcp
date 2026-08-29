@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _VERSION_RE = re.compile(r"^20\d{2}\.\d+$")
+_UNWRAPPED_LAUNCHER_SEGMENT = "/bin/unwrapped/"
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,26 @@ def normalize_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def validate_vivado_launcher(path: str) -> str:
+    """Reject vendor-internal executables that require loader-owned state.
+
+    AMD's public ``bin/vivado.bat`` (Windows) / ``bin/vivado`` (Linux)
+    establishes PATH/LD_LIBRARY_PATH, Java, Tcl and patch-area state before it
+    invokes ``bin/unwrapped/<platform>/vivado[.exe]``.  Launching the internal
+    binary directly can fail before Tcl with missing libraries such as
+    ``xv_common.dll`` (Windows status ``0xC0000135``).
+    """
+    normalized = normalize_path(path)
+    if _UNWRAPPED_LAUNCHER_SEGMENT in normalized.casefold():
+        raise ValueError(
+            "拒绝直接启动 Vivado 内部 unwrapped executable: "
+            f"{normalized}。该路径绕过 AMD loader 环境，可能报 "
+            "xv_common.dll 缺失/0xC0000135。Windows 请使用 "
+            "<Vivado>/<version>/bin/vivado.bat；Linux 请使用 bin/vivado。"
+        )
+    return normalized
+
+
 def _version_key(version: str) -> tuple[int, ...]:
     """Return a numeric release key; never compare Vivado versions as strings."""
     try:
@@ -150,7 +171,7 @@ def resolve_vivado(
     if vivado_path:
         if not os.path.isfile(vivado_path):
             raise FileNotFoundError(f"Vivado launcher 不存在: {vivado_path}")
-        normalized = normalize_path(str(Path(vivado_path).resolve()))
+        normalized = validate_vivado_launcher(str(Path(vivado_path).resolve()))
         actual_version = get_vivado_version(normalized)
         if vivado_version and actual_version != vivado_version:
             raise ValueError(
@@ -193,22 +214,22 @@ def find_vivado(vivado_path: str | None = None) -> str:
     """
     # 1. 显式传入
     if vivado_path and os.path.isfile(vivado_path):
-        return normalize_path(vivado_path)
+        return validate_vivado_launcher(vivado_path)
 
     # 2. 环境变量 VIVADO_PATH
     env_path = os.environ.get("VIVADO_PATH")
     if env_path and os.path.isfile(env_path):
-        return normalize_path(env_path)
+        return validate_vivado_launcher(env_path)
 
     # 3. 系统 PATH
     which = shutil.which("vivado") or shutil.which("vivado.bat")
     if which:
-        return normalize_path(which)
+        return validate_vivado_launcher(which)
 
     # 4. 默认安装目录。多版本并存时拒绝猜测；调用方应显式传 version/path。
     installations = discover_vivado_installations()
     if len(installations) == 1:
-        return installations[0].path
+        return validate_vivado_launcher(installations[0].path)
     if len(installations) > 1:
         choices = "\n".join(
             f"  - {item.version}: {item.path}" for item in installations

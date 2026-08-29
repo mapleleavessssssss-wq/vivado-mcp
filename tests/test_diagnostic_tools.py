@@ -1427,6 +1427,10 @@ class TestProgramDeviceValidation:
         session.execute.assert_awaited_once()
         tcl = session.execute.await_args.args[0]
         assert "get_hw_servers -quiet" in tcl
+        assert "get_property SID $server" in tcl
+        assert "__vmcp_select_hw_server" in tcl
+        assert "get_hw_targets -quiet -of_objects $__vmcp_server" in tcl
+        assert "get_hw_devices -quiet -of_objects $__vmcp_target" in tcl
         assert "__vmcp_select_exact $__vmcp_targets" in tcl
         assert "__vmcp_select_exact $__vmcp_devs" in tcl
         assert "[lindex [get_hw_targets] 0]" not in tcl

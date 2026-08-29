@@ -24,6 +24,7 @@ async def test_high_risk_and_read_only_tools_are_classified_conservatively():
         "reset_project_run",
         "generate_bitstream",
         "program_device",
+        "configure_hw_ila_basic_trigger",
         "capture_hw_ila_to_csv",
         "sync_project_files",
         "setup_debug_after_synth",
@@ -75,6 +76,27 @@ async def test_compile_flow_defaults_are_fast_and_explicitly_deepenable():
     assert impl["max_threads"]["default"] == 0
     assert bitstream["wait_for_completion"]["default"] is False
     assert timing["include_violating_paths"]["default"] is False
+
+
+@pytest.mark.asyncio
+async def test_ila_basic_trigger_schema_is_plan_only_and_identity_gated():
+    from vivado_mcp.server import mcp
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    schema = tools["configure_hw_ila_basic_trigger"].input_schema
+    properties = schema["properties"]
+
+    assert properties["apply"]["default"] is False
+    assert properties["clear_unlisted_probes"]["default"] is True
+    assert properties["expected_trigger_mode"]["default"] == "BASIC_ONLY"
+    assert properties["probe_triggers"]["type"] == "object"
+    assert {
+        "expected_program_file_path",
+        "expected_probes_file_path",
+        "probe_triggers",
+        "data_depth",
+        "trigger_position",
+    }.issubset(schema["required"])
 
 
 def test_server_instructions_include_hard_safety_gates():

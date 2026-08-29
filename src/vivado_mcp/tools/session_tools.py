@@ -121,7 +121,10 @@ def _check_win_curdir_policy() -> str:
 
 
 
-def _check_ascii_paths(vivado_path: str | None) -> str:
+def _check_ascii_paths(
+    vivado_path: str | None,
+    project_path: str | None = None,
+) -> str:
     """检测 Vivado 路径 / 当前工作目录是否含非 ASCII 字符。
 
     Vivado 2019.x 在中文路径下已知会触发 ``TclStackFree: incorrect freePtr``
@@ -137,6 +140,8 @@ def _check_ascii_paths(vivado_path: str | None) -> str:
     non_ascii_paths: list[str] = []
     if vivado_path and not vivado_path.isascii():
         non_ascii_paths.append(f"vivado_path: {vivado_path}")
+    if project_path and not project_path.isascii():
+        non_ascii_paths.append(f"project_path: {project_path}")
     try:
         cwd = os.getcwd()
         if not cwd.isascii():
@@ -173,6 +178,8 @@ async def start_session(
     vivado_version: str = "",
     vivado_path: str = "",
     timeout: int = 120,
+    project_path: str = "",
+    require_ip_integrator: bool = False,
     ctx: Context = None,
 ) -> str:
     """启动一个新的 Vivado 会话。
@@ -185,8 +192,9 @@ async def start_session(
     - ``"attach"`` — 连接到已由专用 launcher/bootstrap 开启 VMCP endpoint 的
       持久 Vivado GUI。MCP 退出只 detach，不关闭该 GUI。
 
-    每个 session_id 对应一个独立的会话句柄；同 session_id 再次调用会复用现有会话
-    (会话模式自动复用)。**多开独立 GUI 实例**见下方 ``port`` 说明。
+    每个 session_id 对应一个独立的会话句柄；同 session_id 只有在 mode、port、
+    Vivado launcher/version 和 startup project 约束一致时才复用。身份不一致会拒绝，
+    不会静默把命令发往另一工程。**多开独立 GUI 实例**见下方 ``port`` 说明。
 
     Args:
         session_id: 会话标识符，默认 "default"。
@@ -199,7 +207,14 @@ async def start_session(
             - ``attach`` 模式：必须提供要连接的现有 GUI 的显式非零端口。
         vivado_version: 明确版本，如 ``2018.3``、``2020.2`` 或 ``2024.2``。
             多版本并存时优先使用本字段，禁止按目录名猜测。
-        vivado_path: 可选，自定义 Vivado 可执行文件路径。留空则自动检测。
+        vivado_path: 可选，自定义 Vivado launcher 路径。Windows 必须使用官方
+            ``bin/vivado.bat``，Linux 使用 ``bin/vivado``；``bin/unwrapped``
+            内部 executable 会在进程创建前被拒绝，禁止绕过 vendor loader。
+        project_path: GUI/Tcl/attach 模式可选；准确 XPR 的绝对路径。GUI/Tcl 会先加载
+            工程再建立 READY；attach 不打开或修改工程，只用该路径核对现有 endpoint
+            身份。避免 endpoint 过早接管 Tcl 或误连另一工程。
+        require_ip_integrator: GUI/Tcl/attach + project_path 专用。为 True 时，握手必须
+            同时证明 ``open_bd_design`` 和 ``get_bd_pins`` 已注册，否则不进入 READY。
         timeout: 启动超时秒数，GUI 模式建议 120+。默认 120。
     """
     manager = _get_manager(ctx)
@@ -213,9 +228,14 @@ async def start_session(
             timeout=float(timeout),
             mode=mode,
             port=int(port),
+            project_path=project_path or None,
+            require_ip_integrator=require_ip_integrator,
         )
         status = session.status_dict()
-        ascii_warn = _check_ascii_paths(status.get("vivado_path") or vivado_path)
+        ascii_warn = _check_ascii_paths(
+            status.get("vivado_path") or vivado_path,
+            status.get("startup_project_path") or project_path,
+        )
         curdir_warn = _check_win_curdir_policy()
         return (
             f"会话 '{session_id}' 已就绪（mode={status['mode']}）。\n"
