@@ -10,6 +10,7 @@ import logging
 
 from mcp.server.mcpserver import Context
 
+from vivado_mcp.analysis.generated_reports import find_generated_report
 from vivado_mcp.analysis.io_parser import parse_report_io
 from vivado_mcp.analysis.ip_status_parser import format_ip_status_report, parse_ip_status
 from vivado_mcp.analysis.project_parser import format_project_info, parse_project_info
@@ -31,14 +32,131 @@ from vivado_mcp.tcl_scripts import (
     QUERY_DESIGN_STAGE,
     QUERY_PROJECT_INFO,
     QUERY_RUN_PROGRESS,
+    QUERY_RUN_REPORT_CONTEXT,
     REPORT_VIOLATING_PATHS,
 )
+from vivado_mcp.tools.annotations import READ_ONLY_SESSION
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
 logger = logging.getLogger(__name__)
 
+_REPORT_SOURCES = {"auto", "generated", "live"}
 
-@mcp.tool()
+
+def _parse_report_context(output: str) -> dict[str, str]:
+    line = next(
+        (line for line in output.splitlines() if line.startswith("VMCP_REPORT_CONTEXT|")),
+        "",
+    )
+    if not line:
+        return {}
+    fields: dict[str, str] = {}
+    for item in line.split("|")[1:]:
+        key, separator, value = item.partition("=")
+        if separator:
+            fields[key] = value
+    return fields
+
+
+async def _get_report_context(session, run_name: str) -> tuple[dict[str, str], str]:
+    try:
+        result = await session.execute(
+            QUERY_RUN_REPORT_CONTEXT.format(run_name=run_name),
+            timeout=15.0,
+        )
+    except Exception as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+    if result.is_error:
+        return {}, f"rc={result.return_code}: {result.output[:200]}"
+    fields = _parse_report_context(result.output)
+    if not fields:
+        return {}, "缺少 VMCP_REPORT_CONTEXT 标记"
+    if fields.get("found") != "1":
+        return fields, f"run 不存在或不唯一(count={fields.get('count', 'unknown')})"
+    return fields, ""
+
+
+def _generated_context_is_fresh(fields: dict[str, str]) -> tuple[bool, str]:
+    status = fields.get("status", "")
+    lowered = status.lower()
+    refresh = fields.get("needs_refresh", "").strip().lower()
+    if "complete" not in lowered:
+        return False, f"run 未完成(status={status or 'unknown'})"
+    if "out-of-date" in lowered or refresh in {"1", "true", "yes"}:
+        return False, f"run 已过期(status={status}, needs_refresh={refresh or 'unknown'})"
+    if refresh in {"0", "false", "no"}:
+        return True, "NEEDS_REFRESH=false"
+    return True, "Vivado 未暴露 NEEDS_REFRESH；按 Complete 且无 Out-of-Date 标记接受"
+
+
+def _stage_from_run_status(status: str) -> str:
+    lowered = status.lower()
+    if "route_design" in lowered or "write_bitstream" in lowered:
+        return "post-route"
+    if "place_design" in lowered:
+        return "post-place"
+    if "synth_design" in lowered:
+        return "post-synth"
+    return "unknown"
+
+
+async def _format_timing_text(
+    session,
+    timing_text: str,
+    *,
+    stage: str,
+    synth_status: str,
+    impl_status: str,
+    source_detail_override: str,
+    include_violating_paths: bool,
+) -> str:
+    timing_report = parse_timing_summary(timing_text)
+    source_detail, stage_warning = derive_stage_warning(
+        stage,
+        synth_status,
+        impl_status,
+    )
+    timing_report.source_stage = stage
+    timing_report.source_detail = source_detail_override or source_detail
+    timing_report.stage_warning = stage_warning
+
+    if (
+        include_violating_paths
+        and timing_report.summary.parse_status == "ok"
+        and not timing_report.summary.timing_met
+    ):
+        try:
+            paths_result = await session.execute(
+                REPORT_VIOLATING_PATHS,
+                timeout=60.0,
+            )
+            if paths_result.is_error:
+                error = f"rc={paths_result.return_code}: {paths_result.output[:200]}"
+                timing_report.violating_paths_error = error
+                logger.warning("违例路径查询返回错误: %s", error)
+            else:
+                timing_report.violating_paths = parse_violating_paths(
+                    paths_result.output
+                )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            timing_report.violating_paths_error = error
+            logger.warning("违例路径查询异常: %s", error)
+
+    formatted = format_timing_report(timing_report)
+    if (
+        not include_violating_paths
+        and timing_report.summary.parse_status == "ok"
+        and not timing_report.summary.timing_met
+    ):
+        formatted += (
+            "\n\n[FAST] 已跳过耗时的 Top10 违例路径展开；需要定位根因时调用 "
+            "get_timing_report(include_violating_paths=True)。"
+        )
+    return formatted
+
+
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def get_io_report(
     session_id: str = "default",
     ctx: Context = None,
@@ -76,25 +194,82 @@ async def get_io_report(
         return f"[ERROR] 获取 IO 报告失败: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def get_timing_report(
+    include_violating_paths: bool = False,
+    source: str = "auto",
+    run_name: str = "impl_1",
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
     """获取结构化时序报告。
 
-    执行 report_timing_summary 并解析为结构化摘要 + 关键路径详情。
+    默认 ``source="auto"``：优先解析已完成且未过期 run 中 Vivado 自动生成的
+    Timing Summary ``.rpt``；没有可信文件时才执行 live
+    ``report_timing_summary``。``source="generated"`` 禁止回退，``source="live"``
+    强制使用当前内存 design。默认不自动展开耗时的 Top10 违例路径；只有
+    ``include_violating_paths=True`` 才追加路径详情。
     返回人类可读的中文时序分析报告，包含 PASS/FAIL 状态判定。
 
     Args:
+        include_violating_paths: 时序违例时是否追加 setup/hold Top10 路径，默认 False。
+        source: ``auto`` / ``generated`` / ``live``。
+        run_name: generated report 来源 run，默认 ``impl_1``。
         session_id: 目标会话 ID。
     """
+    if source not in _REPORT_SOURCES:
+        return f"[ERROR] source={source!r} 非法；支持 auto / generated / live。"
+    try:
+        run_name = validate_identifier(run_name, "run_name")
+    except ValueError as exc:
+        return f"[ERROR] {exc}"
+
     session = _require_session(ctx, session_id)
     if not session:
         return _NO_SESSION.format(sid=session_id)
 
-    # 第一步:查询当前设计阶段,后面附加到 TimingReport 让用户知道数据来源
-    # Bug 2 修复:区分 post-synth 估算 vs post-route 最终,避免误判
+    generated_error = ""
+    if source in {"auto", "generated"}:
+        fields, context_error = await _get_report_context(session, run_name)
+        fresh, fresh_reason = _generated_context_is_fresh(fields)
+        if context_error:
+            generated_error = context_error
+        elif not fresh:
+            generated_error = fresh_reason
+        else:
+            generated = find_generated_report(
+                fields.get("directory", ""),
+                "timing",
+            )
+            if generated is not None:
+                status = fields.get("status", "")
+                stage = _stage_from_run_status(status)
+                source_detail = (
+                    f"generated run report: {generated.path} "
+                    f"({fresh_reason}, {generated.size} bytes)"
+                )
+                try:
+                    return await _format_timing_text(
+                        session,
+                        generated.text,
+                        stage=stage,
+                        synth_status=status if stage == "post-synth" else "",
+                        impl_status=status if stage != "post-synth" else "",
+                        source_detail_override=source_detail,
+                        include_violating_paths=include_violating_paths,
+                    )
+                except Exception as exc:
+                    generated_error = (
+                        f"generated report 解析失败: {type(exc).__name__}: {exc}"
+                    )
+            else:
+                generated_error = "未找到内容有效的 Timing Summary .rpt"
+
+        if source == "generated":
+            return f"[ERROR] generated timing report 不可用: {generated_error}"
+        logger.info("generated timing report 不可用，回退 live: %s", generated_error)
+
+    # live 路径：查询当前设计阶段，区分 post-synth 估算和 post-route signoff。
     stage, synth_status, impl_status = "unknown", "", ""
     try:
         stage_result = await session.execute(QUERY_DESIGN_STAGE, timeout=15.0)
@@ -105,7 +280,6 @@ async def get_timing_report(
         # 但把具体原因打出来,避免报告里 stage=unknown 让人困惑
         logger.warning("查询 design stage 失败,stage 降级为 unknown: %s", e)
 
-    # 第二步:跑时序报告
     try:
         result = await session.execute(
             "report_timing_summary -return_string", timeout=120.0
@@ -117,44 +291,23 @@ async def get_timing_report(
                 "提示: report_timing_summary 需要打开综合或实现后的设计。"
                 "请先运行 run_synthesis 或 run_implementation。"
             )
-        timing_report = parse_timing_summary(result.output)
-
-        # 注入阶段信息
-        source_detail, stage_warning = derive_stage_warning(stage, synth_status, impl_status)
-        timing_report.source_stage = stage
-        timing_report.source_detail = source_detail
-        timing_report.stage_warning = stage_warning
-
-        # 时序违例 → 二次查询违例路径详情 + 模式嗅探 + 修复建议
-        # 健康工程跳过不跑,省 10-30s。异常降级:不阻断主报告。
-        # parse_status 非 ok(NA/格式不识别)时摘要不可信,跳过这次昂贵查询
-        if timing_report.summary.parse_status == "ok" and not timing_report.summary.timing_met:
-            try:
-                paths_result = await session.execute(
-                    REPORT_VIOLATING_PATHS, timeout=60.0
-                )
-                if paths_result.is_error:
-                    err = (
-                        f"rc={paths_result.return_code}: "
-                        f"{paths_result.output[:200]}"
-                    )
-                    timing_report.violating_paths_error = err
-                    logger.warning("违例路径查询返回错误: %s", err)
-                else:
-                    timing_report.violating_paths = parse_violating_paths(
-                        paths_result.output
-                    )
-            except Exception as e:
-                err_msg = f"{type(e).__name__}: {e}"
-                timing_report.violating_paths_error = err_msg
-                logger.warning("违例路径查询异常: %s", err_msg)
-
-        return format_timing_report(timing_report)
+        source_detail = "live report_timing_summary"
+        if generated_error:
+            source_detail += f"; generated fallback reason: {generated_error}"
+        return await _format_timing_text(
+            session,
+            result.output,
+            stage=stage,
+            synth_status=synth_status,
+            impl_status=impl_status,
+            source_detail_override=source_detail,
+            include_violating_paths=include_violating_paths,
+        )
     except Exception as e:
         return f"[ERROR] 获取时序报告失败: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def check_bitstream_readiness(
     impl_run: str = "impl_1",
     session_id: str = "default",
@@ -308,15 +461,18 @@ async def check_bitstream_readiness(
     return "\n".join(out)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def get_utilization_report(
     detail: bool = False,
+    source: str = "auto",
+    run_name: str = "impl_1",
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
     """获取资源占用摘要(LUT/FF/BRAM/DSP/IO)。
 
-    执行 ``report_utilization -return_string`` 并从多个表格里抽取核心资源行,
+    默认优先解析完成且未过期 run 已生成的 utilization ``.rpt``；缺失时才执行
+    live ``report_utilization -return_string``。从多个表格里抽取核心资源行，
     高亮超过 90% 占用的 [CRITICAL] 项和 70-90% 的 [WARN] 项。
 
     典型用途:
@@ -327,11 +483,49 @@ async def get_utilization_report(
     Args:
         detail: True 时末尾附加 Block RAM 明细段(RAMB36/FIFO* / RAMB36E1 only /
             RAMB18 的 used/available)。默认 False,输出与原有格式一致。
+        source: ``auto`` / ``generated`` / ``live``。
+        run_name: generated report 来源 run，默认 ``impl_1``。
         session_id: 目标会话 ID。
     """
+    if source not in _REPORT_SOURCES:
+        return f"[ERROR] source={source!r} 非法；支持 auto / generated / live。"
+    try:
+        run_name = validate_identifier(run_name, "run_name")
+    except ValueError as exc:
+        return f"[ERROR] {exc}"
+
     session = _require_session(ctx, session_id)
     if not session:
         return _NO_SESSION.format(sid=session_id)
+
+    generated_error = ""
+    if source in {"auto", "generated"}:
+        fields, context_error = await _get_report_context(session, run_name)
+        fresh, fresh_reason = _generated_context_is_fresh(fields)
+        if context_error:
+            generated_error = context_error
+        elif not fresh:
+            generated_error = fresh_reason
+        else:
+            generated = find_generated_report(
+                fields.get("directory", ""),
+                "utilization",
+            )
+            if generated is not None:
+                report = parse_utilization(generated.text)
+                if not report.parse_error:
+                    return (
+                        f"报告来源: generated run report {generated.path} "
+                        f"({fresh_reason}, {generated.size} bytes)\n"
+                        + format_utilization_report(report, detail=detail)
+                    )
+                generated_error = "generated utilization report 格式无法解析"
+            else:
+                generated_error = "未找到内容有效的 utilization .rpt"
+
+        if source == "generated":
+            return f"[ERROR] generated utilization report 不可用: {generated_error}"
+        logger.info("generated utilization report 不可用，回退 live: %s", generated_error)
 
     try:
         result = await session.execute(
@@ -344,12 +538,15 @@ async def get_utilization_report(
                 "提示: report_utilization 需要打开综合或实现后的设计。"
             )
         report = parse_utilization(result.output)
-        return format_utilization_report(report, detail=detail)
+        prefix = "报告来源: live report_utilization"
+        if generated_error:
+            prefix += f"；generated fallback reason: {generated_error}"
+        return prefix + "\n" + format_utilization_report(report, detail=detail)
     except Exception as e:
         return f"[ERROR] 获取资源占用失败: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def get_project_info(
     session_id: str = "default",
     ctx: Context = None,
@@ -383,7 +580,7 @@ async def get_project_info(
         return f"[ERROR] 获取项目信息失败: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def get_run_progress(
     run_name: str = "impl_1",
     tail_lines: int = 30,
@@ -431,7 +628,7 @@ async def get_run_progress(
         return f"[ERROR] 查询 run 进度失败: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def get_next_suggestion(
     session_id: str = "default",
     ctx: Context = None,
@@ -446,7 +643,7 @@ async def get_next_suggestion(
     - 有 testbench 且没跑过行为仿真 → 先 launch_simulation
     - 可综合 → xdc_lint + run_synthesis
     - 综合完成 → run_implementation
-    - 布线完成 → check_bitstream_readiness + generate_bitstream
+    - 布线完成 → 一次 timing summary + generate_bitstream 内置 CW 门禁
     - 比特流就绪 → program_device
     - 任何阶段失败 → 引导到 get_critical_warnings
 
@@ -471,7 +668,7 @@ async def get_next_suggestion(
         return f"[ERROR] 生成下一步建议失败: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def get_ip_status(
     session_id: str = "default",
     ctx: Context = None,
@@ -508,7 +705,7 @@ async def get_ip_status(
         return f"[ERROR] 获取 IP 状态失败: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_SESSION)
 async def get_pre_commit_summary(
     impl_run: str = "impl_1",
     session_id: str = "default",

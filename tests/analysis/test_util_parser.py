@@ -135,6 +135,20 @@ def test_2020_prohibited_column_not_misaligned():
     assert lut.is_critical is False
 
 
+def test_less_than_percent_keeps_resource_row():
+    """真实小设计常见 ``<0.01``，不能因此丢掉整行资源。"""
+    report = parse_utilization(
+        "| Site Type | Used | Fixed | Prohibited | Available | Util% |\n"
+        "| Slice LUTs | 1 | 0 | 0 | 20800 | <0.01 |\n"
+        "| LUT as Logic | 1 | 0 | 0 | 20800 | <0.01 |\n"
+    )
+
+    lut = report.get("Slice LUTs")
+    assert lut is not None
+    assert lut.used == 1
+    assert lut.percent == pytest.approx(0.01)
+
+
 def test_2020_format_no_false_critical():
     """2020.1+ 格式不应误报资源超限。"""
     text = format_utilization_report(parse_utilization(SAMPLE_2020))

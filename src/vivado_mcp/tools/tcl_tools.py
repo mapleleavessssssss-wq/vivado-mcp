@@ -12,10 +12,11 @@
 from mcp.server.mcpserver import Context
 
 from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
+from vivado_mcp.tools.annotations import ARBITRARY_TCL
 from vivado_mcp.vivado.tcl_utils import tcl_quote
 
 
-@mcp.tool()
+@mcp.tool(annotations=ARBITRARY_TCL)
 async def run_tcl(
     command: str,
     session_id: str = "default",
@@ -38,6 +39,11 @@ async def run_tcl(
     支持多行脚本（用换行符分隔）。
 
     **路径含特殊字符时请用 safe_tcl 而非 run_tcl**，避免 Tcl 解析错误。
+
+    **版本能力门禁**：2018.3 / 2020.2 / 2024.2 的 Tcl surface 并不完全相同。
+    对版本敏感的 Vivado 命令先调用 ``get_vivado_capabilities``；返回
+    ``gate=FAIL`` 或 ``UNKNOWN`` 时不要执行。SDK/Vitis/XSCT/XSDB 命令不属于
+    本工具，即使 Tcl 可以 ``exec`` 外部程序也不要借此绕过独立会话和审批边界。
 
     **XSim 仿真常见坑摘要**（0.3.17 实战沉淀,下面即完整清单）:
 
@@ -154,7 +160,7 @@ async def run_tcl(
     return await _safe_execute(session, command, float(timeout), "命令执行失败")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ARBITRARY_TCL)
 async def safe_tcl(
     template: str,
     args: list[str] = None,

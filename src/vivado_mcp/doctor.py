@@ -385,7 +385,7 @@ def _collect_checks(
             )
         )
         init_tcl = _resolve_init_tcl(resolved_vivado)
-    except (FileNotFoundError, OSError) as exc:
+    except (FileNotFoundError, OSError, ValueError) as exc:
         checks.append(
             _check(
                 "vivado_executable",
@@ -416,8 +416,8 @@ def _collect_checks(
                 checks.append(
                     _check(
                         "vivado_init_tcl",
-                        "ok",
-                        "vivado-mcp init Tcl 注入完整且为当前配置。",
+                        "warn",
+                        "检测到可用的安装级 init 注入；它也会被 project run 子进程加载。",
                         path=str(init_tcl),
                         port=port,
                     )
@@ -426,10 +426,13 @@ def _collect_checks(
                 checks.append(
                     _check(
                         "vivado_init_tcl",
-                        "warn",
-                        "vivado-mcp init Tcl 注入缺失、不完整或端口/脚本已过期。",
-                        fixable=True,
-                        proposed_action=f"复用 vivado-mcp install --port {port} 更新注入",
+                        "ok",
+                        "未安装有效的 vivado-mcp init 注入；普通 GUI 使用一次性 "
+                        "bootstrap，属于推荐状态。",
+                        proposed_action=(
+                            "仅在必须先手工启动 GUI 再 attach 时，显式运行 "
+                            f"vivado-mcp install --port {port}"
+                        ),
                         path=str(init_tcl),
                         port=port,
                     )
@@ -527,6 +530,7 @@ def run_doctor(
     port: int = _DEFAULT_PORT,
     *,
     fix: bool = False,
+    install_init: bool = False,
     client: str = "all",
     home: Path | None = None,
 ) -> DoctorReport:
@@ -535,12 +539,14 @@ def run_doctor(
         raise ValueError("port 必须在 1..65535 范围内")
     if client not in {"all", "claude-code", "codex"}:
         raise ValueError("client 必须是 all、claude-code 或 codex")
+    if install_init and not fix:
+        raise ValueError("--install-init 必须与 --fix 一起使用")
     user_home = home if home is not None else Path.home()
     checks, resolved_vivado = _collect_checks(vivado_path, port, user_home)
     fixes: list[FixResult] = []
     if fix:
         by_id = {item.id: item for item in checks}
-        if by_id["vivado_init_tcl"].fixable and resolved_vivado:
+        if install_init and resolved_vivado:
             try:
                 # install 的人类输出不得污染 doctor --json。
                 with contextlib.redirect_stdout(io.StringIO()):

@@ -76,7 +76,7 @@ class TestGetUtilizationReportDetail:
             return_value=_make_tcl_result(_load_fixture("sample_report_utilization.txt"))
         )
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_utilization_report(ctx=_mock_context())
+            result = await get_utilization_report(source="live", ctx=_mock_context())
 
         assert "资源占用摘要" in result
         assert "Slice LUTs" in result
@@ -92,7 +92,9 @@ class TestGetUtilizationReportDetail:
             return_value=_make_tcl_result(_load_fixture("sample_report_utilization.txt"))
         )
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_utilization_report(detail=True, ctx=_mock_context())
+            result = await get_utilization_report(
+                detail=True, source="live", ctx=_mock_context()
+            )
 
         assert "Block RAM 明细" in result
         assert "RAMB36/FIFO*" in result
@@ -109,9 +111,37 @@ class TestGetUtilizationReportDetail:
             return_value=_make_tcl_result("ERROR: no open design", return_code=1)
         )
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_utilization_report(ctx=_mock_context())
+            result = await get_utilization_report(source="live", ctx=_mock_context())
 
         assert "[ERROR]" in result
+
+    @pytest.mark.asyncio
+    async def test_auto_prefers_completed_generated_report(self, tmp_path):
+        """完成且未过期的 run 直接读 .rpt，不执行 live report_utilization。"""
+        from vivado_mcp.tools.report_tools import get_utilization_report
+
+        run_dir = tmp_path / "impl_1"
+        run_dir.mkdir()
+        report_path = run_dir / "top_utilization_placed.rpt"
+        report_path.write_text(
+            _load_fixture("sample_report_utilization.txt"),
+            encoding="utf-8",
+        )
+        context = (
+            "VMCP_REPORT_CONTEXT|found=1|status=route_design Complete!|"
+            f"directory={run_dir.as_posix()}|needs_refresh=0"
+        )
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=_make_tcl_result(context))
+
+        with patch(
+            "vivado_mcp.tools.report_tools._require_session", return_value=session
+        ):
+            result = await get_utilization_report(ctx=_mock_context())
+
+        assert f"generated run report {report_path.resolve()}" in result
+        assert "资源占用摘要" in result
+        session.execute.assert_awaited_once()
 
 
 # ====================================================================== #
@@ -133,13 +163,67 @@ class TestGetTimingReportNa:
             ]
         )
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_timing_report(ctx=_mock_context())
+            result = await get_timing_report(source="live", ctx=_mock_context())
 
         assert "[ERROR]" not in result
         assert "PASS" not in result
         assert "无时序" in result
         # NA(timing_met=False 但 parse_status 非 ok)不应触发第三次违例路径查询
         assert session.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_auto_prefers_completed_generated_report(self, tmp_path):
+        """默认从 run .rpt 解析 PASS summary，不重新执行 live STA。"""
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        run_dir = tmp_path / "impl_1"
+        run_dir.mkdir()
+        report_path = run_dir / "top_timing_summary_routed.rpt"
+        report_path.write_text(
+            _load_fixture("sample_report_timing.txt"),
+            encoding="utf-8",
+        )
+        context = (
+            "VMCP_REPORT_CONTEXT|found=1|status=route_design Complete!|"
+            f"directory={run_dir.as_posix()}|needs_refresh=0"
+        )
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=_make_tcl_result(context))
+
+        with patch(
+            "vivado_mcp.tools.report_tools._require_session", return_value=session
+        ):
+            result = await get_timing_report(ctx=_mock_context())
+
+        assert "PASS" in result
+        assert f"generated run report: {report_path.resolve()}" in result
+        session.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_generated_source_rejects_out_of_date_run(self, tmp_path):
+        """显式 generated 模式对过期 run fail-closed，不回退 live。"""
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        run_dir = tmp_path / "impl_1"
+        run_dir.mkdir()
+        context = (
+            "VMCP_REPORT_CONTEXT|found=1|status=route_design Complete!|"
+            f"directory={run_dir.as_posix()}|needs_refresh=1"
+        )
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=_make_tcl_result(context))
+
+        with patch(
+            "vivado_mcp.tools.report_tools._require_session", return_value=session
+        ):
+            result = await get_timing_report(
+                source="generated",
+                ctx=_mock_context(),
+            )
+
+        assert result.startswith("[ERROR] generated timing report 不可用")
+        assert "过期" in result
+        session.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_unrecognized_format_marked_degraded(self):
@@ -154,7 +238,7 @@ class TestGetTimingReportNa:
             ]
         )
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
-            result = await get_timing_report(ctx=_mock_context())
+            result = await get_timing_report(source="live", ctx=_mock_context())
 
         assert "[DEGRADED]" in result
         assert "PASS" not in result

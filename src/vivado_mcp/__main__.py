@@ -34,7 +34,7 @@ def main() -> None:
     # install
     p_install = sub.add_parser(
         "install",
-        help="注入 Vivado_init.tcl，让 Vivado GUI 启动时自动开启 TCP server。",
+        help="高级兼容方式：注入安装级 Vivado_init.tcl，供手工 GUI attach。",
     )
     p_install.add_argument(
         "vivado_path",
@@ -77,7 +77,12 @@ def main() -> None:
     p_doctor.add_argument(
         "--fix",
         action="store_true",
-        help="仅修复安全项：复用 install，并备份后原子写入缺失的客户端配置。",
+        help="备份后原子写入缺失的客户端配置；默认不修改 Vivado_init.tcl。",
+    )
+    p_doctor.add_argument(
+        "--install-init",
+        action="store_true",
+        help="与 --fix 一起显式安装高级兼容 init 注入；普通 GUI 启动不需要。",
     )
     p_doctor.add_argument(
         "--client",
@@ -107,6 +112,7 @@ def main() -> None:
                 vivado_path=args.vivado_path,
                 port=args.port,
                 fix=args.fix,
+                install_init=args.install_init,
                 client=args.client,
             )
         except ValueError as e:
@@ -122,7 +128,7 @@ def main() -> None:
 
         try:
             install(vivado_path=args.vivado_path, port=args.port)
-        except (FileNotFoundError, PermissionError, OSError) as e:
+        except (FileNotFoundError, PermissionError, OSError, RuntimeError, ValueError) as e:
             print(f"[ERROR] {e}", file=sys.stderr)
             sys.exit(1)
         return
@@ -132,7 +138,7 @@ def main() -> None:
 
         try:
             uninstall(vivado_path=args.vivado_path)
-        except (FileNotFoundError, PermissionError, OSError) as e:
+        except (FileNotFoundError, PermissionError, OSError, RuntimeError, ValueError) as e:
             print(f"[ERROR] {e}", file=sys.stderr)
             sys.exit(1)
         return

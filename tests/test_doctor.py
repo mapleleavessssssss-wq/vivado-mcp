@@ -61,9 +61,8 @@ def _write_valid_clients(home: Path, vivado_path: Path) -> None:
 
 @pytest.mark.skipif(doctor.tomllib is None, reason="Python 环境没有结构化 TOML 解析器")
 def test_all_checks_success_and_stable_json(monkeypatch, tmp_path):
-    exe, init_tcl = _fake_vivado(tmp_path)
-    script = _patch_runtime(monkeypatch, tmp_path, probe=True)
-    init_tcl.write_text(_build_injection_block(script, 9999), encoding="utf-8")
+    exe, _ = _fake_vivado(tmp_path)
+    _patch_runtime(monkeypatch, tmp_path, probe=True)
     home = tmp_path / "home"
     _write_valid_clients(home, exe)
 
@@ -138,7 +137,7 @@ def test_third_party_injection_is_report_only(monkeypatch, tmp_path):
     content = init_tcl.read_text(encoding="utf-8")
     assert "SynthPilot injection" in content
     assert "puts keep_me" in content
-    assert _BEGIN_MARK in content
+    assert _BEGIN_MARK not in content
 
 
 @pytest.mark.skipif(doctor.tomllib is None, reason="Python 环境没有结构化 TOML 解析器")
@@ -154,7 +153,7 @@ def test_fix_uses_install_and_atomic_client_writes(monkeypatch, tmp_path):
     codex.parent.mkdir()
     codex.write_text('model = "example"\n', encoding="utf-8")
 
-    report = doctor.run_doctor(str(exe), fix=True, home=home)
+    report = doctor.run_doctor(str(exe), fix=True, install_init=True, home=home)
 
     assert {item.id for item in report.fixes if item.status == "applied"} == {
         "vivado_init_tcl",
@@ -234,6 +233,11 @@ def test_python310_without_toml_parser_degrades_codex_check(monkeypatch, tmp_pat
 def test_invalid_port_rejected(tmp_path):
     with pytest.raises(ValueError, match="1..65535"):
         doctor.run_doctor(port=0, home=tmp_path)
+
+
+def test_install_init_requires_explicit_fix(tmp_path):
+    with pytest.raises(ValueError, match="--install-init.*--fix"):
+        doctor.run_doctor(install_init=True, home=tmp_path)
 
 
 @pytest.mark.parametrize(

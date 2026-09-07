@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import threading
 from collections.abc import Callable
@@ -16,8 +17,22 @@ from collections.abc import Callable
 import pytest
 
 from vivado_mcp.vivado import session_manager as sm_module
-from vivado_mcp.vivado.gui_session import GuiSession, probe_vmcp_server
+from vivado_mcp.vivado.gui_session import (
+    GuiSession,
+    _make_probe_payload,
+    _new_startup_log_path,
+    probe_vmcp_endpoint,
+    probe_vmcp_server,
+)
 from vivado_mcp.vivado.session_manager import SessionManager
+
+
+def test_gui_startup_log_is_outside_repository(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIVADO_MCP_LOG_DIR", str(tmp_path / "logs"))
+    path = _new_startup_log_path("gui_2024_2")
+    assert path.parent == (tmp_path / "logs").resolve()
+    assert path.name.startswith("vivado_gui_2024_2_")
+    assert path.suffix == ".log"
 
 
 def _serve_length_prefix(
@@ -107,9 +122,16 @@ def _serve_length_prefix(
 
 
 def _vmcp_handler(req: bytes) -> bytes:
-    """模拟 vivado_mcp_server.tcl:回 {"rc":0,"output":<echo>}"""
+    """模拟 Tcl 执行后的握手：回 token 和可信 GUI 身份。"""
     text = req.decode("utf-8", errors="replace")
-    resp = json.dumps({"rc": 0, "output": text}, ensure_ascii=False).encode("utf-8")
+    token_match = re.search(r"VMCP_PROBE_[0-9a-f]+", text)
+    token = token_match.group(0) if token_match else text
+    output = (
+        f"{token}\n"
+        "VMCP_ID|protocol=2|kind=gui|pid=1234|vivado=2024.2|tcl=8.6.14|"
+        "project=fake_project|xpr=C:/fake/fake_project.xpr|ip_integrator=1\n"
+    )
+    resp = json.dumps({"rc": 0, "output": output}, ensure_ascii=False).encode("utf-8")
     return resp
 
 
@@ -128,6 +150,15 @@ def _find_unused_port() -> int:
 
 
 class TestProbeVmcpServer:
+    def test_probe_requests_project_and_ip_integrator_identity(self):
+        _, payload = _make_probe_payload()
+        text = payload.decode("utf-8")
+        assert "current_project" in text
+        assert 'set __vmcp_project ""' in text
+        assert "VMCP_ID" in text and "xpr=$__vmcp_xpr" in text
+        assert "open_bd_design" in text
+        assert "get_bd_pins" in text
+
     def test_returns_true_for_valid_server(self):
         port, stop, _ = _serve_length_prefix(_vmcp_handler)
         try:
@@ -348,7 +379,117 @@ class TestGuiSessionProbeThenAttach:
         assert f"set ::VMCP_PORT_PREF {explicit_port}" in captured["tcl"], (
             "必须注入确切显式端口,不能是池起点或别的值"
         )
+        assert "set ::VMCP_SESSION_KIND gui" in captured["tcl"]
+        assert "set ::VMCP_PROTOCOL_VERSION 2" in captured["tcl"]
+        assert " -notrace" in captured["tcl"]
         assert sess.pid == 4242, "spawn 时应记下 vivado pid"
+
+    async def test_project_argument_precedes_source_and_ipi_is_gated(
+        self, monkeypatch, tmp_path
+    ):
+        """真实故障回归:XPR 必须先加载，VMCP endpoint 才能接管 Tcl。"""
+        xpr = (tmp_path / "design with bd.xpr").resolve()
+        xpr.write_text("fixture", encoding="utf-8")
+        xpr_posix = xpr.as_posix()
+
+        def handler(req: bytes) -> bytes:
+            text = req.decode("utf-8", errors="replace")
+            if "VMCP_CURPROJ" in text:
+                return json.dumps(
+                    {"rc": 0, "output": "VMCP_CURPROJ:design_with_bd\n"}
+                ).encode("utf-8")
+            token_match = re.search(r"VMCP_PROBE_[0-9a-f]+", text)
+            token = token_match.group(0) if token_match else "missing"
+            output = (
+                f"{token}\n"
+                "VMCP_ID|protocol=2|kind=gui|pid=1234|vivado=2024.2|"
+                f"tcl=8.6.14|project=design_with_bd|xpr={xpr_posix}|"
+                "ip_integrator=1\n"
+            )
+            return json.dumps({"rc": 0, "output": output}).encode("utf-8")
+
+        port, stop, _ = _serve_length_prefix(handler)
+        captured: dict[str, tuple[object, ...]] = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["args"] = args
+
+            class _FakeProc:
+                pid = 5151
+                returncode = None
+
+                async def wait(self):
+                    return 0
+
+                def kill(self):
+                    pass
+
+            return _FakeProc()
+
+        monkeypatch.setenv("VIVADO_MCP_LOG_DIR", str(tmp_path / "logs"))
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(GuiSession, "_alloc_free_port", staticmethod(lambda: port))
+
+        sess = GuiSession(
+            vivado_path="/fake/vivado",
+            session_id="project-first",
+            port=0,
+            attach_only=False,
+            startup_project_path=xpr_posix,
+            require_ip_integrator=True,
+        )
+        try:
+            banner = await sess.start(timeout=5.0)
+            args = captured["args"]
+            assert args.index(xpr_posix) < args.index("-source")
+            assert "IP Integrator commands=READY" in banner
+            assert sess.status_dict()["startup_project_path"] == xpr_posix
+        finally:
+            await sess.detach()
+            stop.set()
+
+    def test_endpoint_probe_returns_evaluated_identity(self):
+        port, stop, _ = _serve_length_prefix(_vmcp_handler)
+        try:
+            ok, identity = probe_vmcp_endpoint("127.0.0.1", port)
+            assert ok is True
+            assert identity["vivado"] == "2024.2"
+            assert identity["project"] == "fake_project"
+            assert identity["xpr"] == "C:/fake/fake_project.xpr"
+            assert identity["ip_integrator"] == "1"
+        finally:
+            stop.set()
+
+    async def test_ipi_gate_rejects_endpoint_without_bd_commands(self, tmp_path):
+        xpr = (tmp_path / "missing_ipi.xpr").resolve()
+        xpr.write_text("fixture", encoding="utf-8")
+        xpr_posix = xpr.as_posix()
+
+        def handler(req: bytes) -> bytes:
+            text = req.decode("utf-8", errors="replace")
+            token_match = re.search(r"VMCP_PROBE_[0-9a-f]+", text)
+            token = token_match.group(0) if token_match else "missing"
+            output = (
+                f"{token}\n"
+                "VMCP_ID|protocol=2|kind=gui|pid=1234|vivado=2024.2|"
+                f"tcl=8.6.14|project=missing_ipi|xpr={xpr_posix}|"
+                "ip_integrator=0\n"
+            )
+            return json.dumps({"rc": 0, "output": output}).encode("utf-8")
+
+        port, stop, _ = _serve_length_prefix(handler)
+        try:
+            sess = GuiSession(
+                vivado_path="/fake/vivado",
+                port=port,
+                attach_only=False,
+                startup_project_path=xpr_posix,
+                require_ip_integrator=True,
+            )
+            assert await sess._try_attach_existing(port, timeout=1.0) is False
+            assert "open_bd_design/get_bd_pins" in sess._last_handshake_error
+        finally:
+            stop.set()
 
     async def test_spawn_auto_alloc_injects_allocated_port(self, monkeypatch):
         """port=0 路径:注入 tcl 的 VMCP_PORT_PREF 必须等于 auto-alloc 出的确切端口。"""
@@ -489,6 +630,10 @@ class TestListSessionsExternal:
             assert entry["mode"] == "external"
             assert entry["is_alive"] is True
             assert entry["session_id"] == f"<external@{port}>"
+            assert entry["vivado_version"] == "2024.2"
+            assert entry["project"] == "fake_project"
+            assert entry["xpr"] == "C:/fake/fake_project.xpr"
+            assert entry["identity"]["ip_integrator"] == "1"
             assert "未由 MCP 启动" in entry["note"]
         finally:
             stop.set()
@@ -592,6 +737,60 @@ class TestHandshakeTokenUnified:
         finally:
             stop.set()
 
+    async def test_gui_probe_rejects_batch_identity(self):
+        """mode=gui must not silently attach to a batch/OOC VMCP endpoint."""
+        def batch_handler(req: bytes) -> bytes:
+            text = req.decode("utf-8", errors="replace")
+            token = re.search(r"VMCP_PROBE_[0-9a-f]+", text).group(0)
+            return json.dumps({
+                "rc": 0,
+                "output": (
+                    f"{token}\nVMCP_ID|protocol=2|kind=batch|pid=9|"
+                    "vivado=2024.2|tcl=8.6.14\n"
+                ),
+            }).encode("utf-8")
+
+        port, stop, _ = _serve_length_prefix(batch_handler)
+        try:
+            sess = GuiSession(
+                vivado_path="C:/Xilinx/Vivado/2024.2/bin/vivado.bat",
+                port=port,
+                attach_only=False,
+            )
+            with pytest.raises(Exception):
+                await sess.start(timeout=0.5)
+            assert sess.attached_external is False
+            assert "kind='batch'" in sess._last_handshake_error
+        finally:
+            stop.set()
+
+    async def test_attach_accepts_official_ar_patch_suffix(self):
+        """2018.3 patched installations report 2018.3_ARxxxxx."""
+        def patched_handler(req: bytes) -> bytes:
+            text = req.decode("utf-8", errors="replace")
+            token = re.search(r"VMCP_PROBE_[0-9a-f]+", text).group(0)
+            return json.dumps({
+                "rc": 0,
+                "output": (
+                    f"{token}\nVMCP_ID|protocol=2|kind=gui|pid=9|"
+                    "vivado=2018.3_AR71898|tcl=8.5.17\n"
+                ),
+            }).encode("utf-8")
+
+        port, stop, _ = _serve_length_prefix(patched_handler)
+        try:
+            sess = GuiSession(
+                vivado_path="C:/Xilinx/Vivado/2018.3/bin/vivado.bat",
+                port=port,
+                attach_only=True,
+            )
+            banner = await sess.start(timeout=3.0)
+            assert "GUI 会话就绪" in banner
+            assert sess._identity["vivado"] == "2018.3_AR71898"
+            await sess.detach()
+        finally:
+            stop.set()
+
 
 # --------------------------------------------------------------------------- #
 #  start() 超时清理 spawn 的进程(孤儿修复)
@@ -661,6 +860,35 @@ class TestStartTimeoutCleansSpawnedProc:
         )
         # _proc is None → 直接返回,不抛不杀
         await sess._cleanup_failed_spawn()
+
+    async def test_lifespan_detach_never_kills_owned_gui(self, monkeypatch):
+        """MCP shutdown detaches transport; only explicit stop may kill an owned GUI."""
+        import subprocess as subprocess_mod
+
+        monkeypatch.setattr(
+            subprocess_mod,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("detach must not call taskkill")
+            ),
+        )
+
+        class _Proc:
+            pid = 24680
+            returncode = None
+
+        sess = GuiSession(
+            vivado_path="C:/Xilinx/Vivado/2024.2/bin/vivado.bat",
+            session_id="persistent-gui",
+            port=12345,
+            attach_only=False,
+        )
+        sess._proc = _Proc()
+        sess._pid = 24680
+        await sess.detach()
+        assert sess._proc is None
+        assert sess.pid is None
+        assert sess.state.value == "stopped"
 
 
 # --------------------------------------------------------------------------- #
@@ -1108,9 +1336,8 @@ def _make_curproj_handler(project_name: str) -> Callable[[bytes], bytes]:
         text = req.decode("utf-8", errors="replace")
         if "VMCP_CURPROJ" in text:
             out = f"VMCP_CURPROJ:{project_name}\n"
-        else:
-            out = text  # 反射:握手 token 校验需要
-        return json.dumps({"rc": 0, "output": out}, ensure_ascii=False).encode("utf-8")
+            return json.dumps({"rc": 0, "output": out}, ensure_ascii=False).encode("utf-8")
+        return _vmcp_handler(req)
 
     return handler
 

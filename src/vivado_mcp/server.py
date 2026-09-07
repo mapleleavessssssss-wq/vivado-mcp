@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from mcp.server import MCPServer
 
+from vivado_mcp import __version__
 from vivado_mcp import prompts as _prompts
 from vivado_mcp.config import find_vivado
 from vivado_mcp.vivado.session import VivadoSession
@@ -66,9 +67,12 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     try:
         vivado_path = find_vivado()
         logger.info("检测到 Vivado: %s", vivado_path)
-    except FileNotFoundError as e:
-        logger.warning("Vivado 路径检测失败: %s", e)
-        logger.warning("工具仍可使用，但需要在 start_session 时手动指定路径。")
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        logger.warning(
+            "Vivado auto-discovery is unavailable or ambiguous; "
+            "use start_session(vivado_version=...) or an absolute vivado_path."
+        )
+        logger.debug("Vivado discovery detail: %s", e)
         vivado_path = ""
 
     manager = SessionManager(vivado_path=vivado_path)
@@ -77,12 +81,27 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
         yield AppContext(session_manager=manager)
     finally:
         _manager_ref = None
-        await manager.close_all()
+        # Codex/MCP 生命周期结束不等于用户授权关闭可见 Vivado GUI。
+        # GuiSession.detach() 只断传输；无头 Tcl session 仍按基类 stop 清理。
+        await manager.detach_all()
 
 
 # 创建 MCPServer 实例
 mcp = MCPServer(
     "vivado-mcp",
+    version=__version__,
+    instructions=(
+        "控制 Vivado 工程、构建与 Hardware Manager；SDK/Vitis 软件任务使用 vitis-mcp。"
+        "写入前核对当前 session、version、project/part/top；项目模式用完整 .xpr，"
+        "非项目模式核对实际设计。多个实例须明确选定目标，不因实例数量本身停工。"
+        "沿用已有任务授权完成必要本地构建与已审阅 Tcl；reset_runs、覆盖 XDC、升级 IP、"
+        "Block Design、bitstream、硬件/网络操作须在已授权范围内。烧录/Flash 须有明确"
+        "设备与产物授权；bitstream 生成不授权烧录。目标不明、范围外或副作用未知时先消歧。"
+        "仅用 vendor bin/vivado.bat 或 bin/vivado 启动；禁止直接启动 bin/unwrapped。"
+        "版本敏感 Tcl 先核对 get_vivado_capabilities，同一版本/会话复用有效结果；"
+        "相关 gate=FAIL/UNKNOWN 时停止该动作。复用未失效报告，按需低频查进度；"
+        "失败、诊断或签收时展开深度检查。综合、实现/时序、bitstream 与上板证据分别报告。"
+    ),
     lifespan=app_lifespan,
 )
 
@@ -400,10 +419,13 @@ _prompts.register_prompts(mcp)
 #  导入工具模块，触发 @mcp.tool() 装饰器注册
 # --------------------------------------------------------------------------- #
 
+import vivado_mcp.tools.compile_tools  # noqa: E402, F401
 import vivado_mcp.tools.diagnostic_tools  # noqa: E402, F401
 import vivado_mcp.tools.flow_tools  # noqa: E402, F401
+import vivado_mcp.tools.ila_tools  # noqa: E402, F401
 import vivado_mcp.tools.introspect_tools  # noqa: E402, F401
 import vivado_mcp.tools.ip_tools  # noqa: E402, F401
+import vivado_mcp.tools.project_tools  # noqa: E402, F401
 import vivado_mcp.tools.report_tools  # noqa: E402, F401
 import vivado_mcp.tools.session_tools  # noqa: E402, F401
 import vivado_mcp.tools.tcl_tools  # noqa: E402, F401

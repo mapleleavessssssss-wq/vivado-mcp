@@ -9,11 +9,11 @@
   3. 没顶层 → set_property TOP
   4. 没 XDC → 添加约束
   4.5 有 testbench 且没跑过行为仿真 → 先 launch_simulation 验证逻辑
-  5. 没综合 → xdc_lint + run_synthesis(无 testbench 时附补仿真提醒)
+  5. 没综合 → run_synthesis(XDC 新改或首次签收时才单独 xdc_lint)
   6. 综合失败 / 有 ERROR → get_critical_warnings
   7. 综合完成但没实现 → run_implementation
   8. 实现失败(place/route ERROR) → get_critical_warnings
-  9. 布线完成但没 bitstream → check_bitstream_readiness + generate_bitstream
+  9. 布线完成但没 bitstream → 一次 timing summary + generate_bitstream 内置 CW 门禁
  10. bitstream 已生成 → program_device
 """
 
@@ -161,8 +161,8 @@ def suggest_next(info: ProjectInfo) -> Suggestion:
     # 规则 5: 没综合
     if "Complete" not in synth and "ERROR" not in synth.upper():
         actions = [
-            "xdc_lint()  # 先跑纯 Python 静态 XDC 检查(< 1s),捕捉低级错误",
             "run_synthesis()  # 正式综合(5-15 分钟,取决于设计规模)",
+            "仅当 XDC 本轮有改动或首次签收时运行 xdc_lint();不要每次重编译都重复。",
         ]
         if sim_n == 0:
             actions.append(
@@ -196,8 +196,8 @@ def suggest_next(info: ProjectInfo) -> Suggestion:
             summary="综合完成,可以开始实现(place + route)。",
             reasons=[f"synth_1: {synth}, impl_1: (无 run)"],
             actions=[
-                "get_utilization_report()  # 确认资源占用 < 90%(避免布线拥塞)",
                 "run_implementation()  # place_design + route_design(10-30 分钟)",
+                "仅在资源超限/拥塞是当前决策问题时调用 get_utilization_report()。",
             ],
         )
 
@@ -207,8 +207,8 @@ def suggest_next(info: ProjectInfo) -> Suggestion:
             summary="综合完成,impl_1 尚未启动。",
             reasons=[f"synth_1: {synth}, impl_1: {impl}"],
             actions=[
-                "get_utilization_report()",
                 "run_implementation()",
+                "仅在资源超限/拥塞是当前决策问题时调用 get_utilization_report()。",
             ],
         )
 
@@ -243,9 +243,9 @@ def suggest_next(info: ProjectInfo) -> Suggestion:
             summary="布线完成,可以生成比特流。",
             reasons=[f"impl_1: {impl}"],
             actions=[
-                "get_timing_report()          # 确认 WNS >= 0",
-                "check_bitstream_readiness()  # 综合判定 READY/WARN/BLOCK",
-                "generate_bitstream()         # 输出 .bit 文件",
+                "get_timing_report()  # 一次 summary 确认全部 clock/path group；默认不展开 Top10",
+                "时序满足后 generate_bitstream()  # 内置实现状态/CW 门禁并异步启动",
+                "不要再重复调用 check_bitstream_readiness；它是没有单独 timing 报告时的替代入口。",
             ],
         )
 

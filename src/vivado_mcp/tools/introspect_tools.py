@@ -20,9 +20,10 @@ from vivado_mcp.analysis.ltx_parser import parse_ltx as _parse_ltx
 from vivado_mcp.analysis.xpr_parser import format_xpr as _format_xpr
 from vivado_mcp.analysis.xpr_parser import parse_xpr as _parse_xpr
 from vivado_mcp.server import mcp
+from vivado_mcp.tools.annotations import READ_ONLY_LOCAL
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL)
 async def parse_xpr(file_path: str, ctx: Context = None) -> str:
     """离线解析 Vivado 工程文件(.xpr),无需启动 Vivado。
 
@@ -41,7 +42,7 @@ async def parse_xpr(file_path: str, ctx: Context = None) -> str:
     return _format_xpr(cfg)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL)
 async def parse_bit_header(file_path: str, ctx: Context = None) -> str:
     """离线解析 .bit 比特流文件头部,无需启动 Vivado。
 
@@ -61,7 +62,7 @@ async def parse_bit_header(file_path: str, ctx: Context = None) -> str:
     return _format_bit(header)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL)
 async def parse_ltx(file_path: str, ctx: Context = None) -> str:
     """离线解析 ILA 调试探针文件(.ltx),无需连板 / 启动 Vivado。
 

@@ -1,5 +1,104 @@
 # Changelog
 
+## [未发布]
+
+### 任务授权与文档入口
+
+- 公共说明、Prompt 和工程文件同步说明沿用已明确的授权，相关能力查询复用当前版本/会话证据。
+- 将自动 hook 明确为按需示例，避免重复确认与单文件启发式检查扩大为工程失败。
+- README hook 测试继承测试解释器的环境，修正虚拟环境安装包与全局 Python 不一致导致的失败。
+
+### 多版本、GUI 生命周期与安全门禁
+
+- `start_session` 新增 GUI/Tcl/attach `project_path` 与 `require_ip_integrator`：准确 XPR
+  作为 Vivado 位置参数在 VMCP `-source` 之前加载，握手核对实际 XPR，并可强制
+  `open_bd_design` / `get_bd_pins` 已注册后才进入 READY。修复 endpoint 在 GUI
+  启动过早阶段接管 Tcl、后续打开 Block Design 时命令面缺失的真实故障；attach
+  只核对现有 endpoint，不打开或改写工程。
+- 同一 `session_id` 的 start/stop/detach 现按会话串行化；并发双发不会 spawn 两个
+  Vivado 后覆盖 registry。复用现有会话时会拒绝 mode、port、launcher/version、
+  startup project 不一致。死亡会话清理同步移除 port map。
+- GUI 启动新增独立 launcher stdout/stderr 日志；vendor `.bat` / `loader.bat` 层错误
+  不再被 DEVNULL 吞掉，同时继续保留 AMD 支持的 vendor launcher 环境初始化链。
+- 修复 Windows batch 真正执行层：不再把 `subprocess.list2cmdline` 的 C-runtime
+  引号规则误用于 `cmd.exe`；AMD launcher 依赖原始 `%1/%2` 的 `-mode tcl/gui`
+  tokens 保持不带引号，仅对路径和特殊值按需引用。带空格路径和 `&|<>()^%`
+  参数已通过同时模拟 AMD 原始参数判断和 delayed expansion 的真实 fake-batch
+  roundtrip；`!` 因 vendor `%*` 转发会静默改值而明确拒绝。Tcl session 从进程
+  创建起即排空 stderr，code 1/timeout 会返回 launcher、returncode 与 stderr tail；
+  超时强制清理使用确切 PID 的 `taskkill /T`。
+- `project_path` / `require_ip_integrator` 扩展到 `mode="tcl"`；无头会话同样先打开
+  exact XPR，再完成 READY/project/IP Integrator 身份门禁。
+- `list_sessions` 不再把外部 9999–10003 endpoint 只列成匿名端口；只读 probe
+  直接保留 `project/xpr/vivado/ip_integrator` 身份，attach 前即可拒绝错误工程。
+- Tcl launcher 在 READY 前 EOF/timeout 时同时返回 bounded startup stdout/stderr tail
+  与实际启动参数；修复 vendor batch 把原因写 stdout 时只看到裸 `returncode=1` 的
+  诊断盲区。
+- 配置解析和最终进程创建增加双重 launcher 硬门：拒绝任何
+  `bin/unwrapped/.../vivado[.exe]`，不再允许智能体在 `vivado.bat` 失败后绕过 AMD
+  loader；避免 `xv_common.dll` 缺失 / Windows `0xC0000135` 弹窗。
+- 新增 `configure_hw_ila_basic_trigger`：以 bit/LTX 和 exact hardware object 为身份
+  门禁，将 `falling/rising/low/high` 等语义安全转换为 probe comparator；默认
+  PLAN_ONLY，所有对象、IDLE 状态、位宽、depth/window/position 和属性可写性在
+  首次写入前完成 preflight。`CONTROL.TRIGGER_MODE` 只比较当前值、不解析只读格式也
+  不写；未参与的 data-only probe 不误阻断，并完整支持 `AND/OR/NAND/NOR`。标准
+  basic trigger 不再依赖智能体手拼 `run_tcl`。ILA 配置/采集还会按 `HW_SERVER.SID`
+  锁定请求的 server，再逐级限定 target/device/ILA，已连接的其他 server 不会绕过
+  remote opt-in 或混入对象选择；`program_device` 同步使用相同的 exact-server 门禁。
+
+- 编译默认路径改为按决策取证：成功的综合/实现不再自动扫描完整 `runme.log`；
+  `post_check=on_failure/always` 可显式恢复。实现启动不再读取只影响综合的
+  generic/define。`get_timing_report` 默认只取 summary，Top10 违例路径改为
+  `include_violating_paths=True`；`generate_bitstream` 默认完成前置状态/CW 门禁后
+  启动即返回，`wait_for_completion=True` 才低频等待。建议引擎不再串行要求
+  timing + readiness + generate 三套重叠检查。
+- 新增只读 `get_compile_profile`，一次返回 run 的 STATUS/PROGRESS/NEEDS_REFRESH、
+  strategy/report strategy、`general.maxThreads`、timing stats 和已有 `.rpt`/`.dcp`；
+  `get_timing_report` / `get_utilization_report` 默认复用已完成且未过期 run 的生成报告，
+  避免重复执行 live report。真实 Vivado 报告中的 `<0.01` utilization 现可正确解析。
+- `run_synthesis` / `run_implementation` 新增 `max_threads=0..8`；`jobs` 明确只表示并行
+  run 槽位。显式线程值被写入本次 launch 后立即恢复父会话参数。2018.3、2020.2、
+  2024.2 隔离空工程均实测子 run 使用所请求的 4 线程。
+- 新增 `configure_incremental_compile`，默认 PLAN_ONLY；apply 路径必须核对完整工程
+  身份，只设置 automatic incremental checkpoint，不 reset 或 launch。Methodology、
+  QoR Suggestions 和深度 timing 路径分析改为阶段门禁，不再串成每轮固定检查。
+
+- 重点兼容 profile 增加 Vivado 2018.3 / 2020.2 / 2024.2；本机对应 Tcl runtime
+  为 8.5 / 8.5 / 8.6。多版本并存时 MCP server 仍可初始化，但启动会话必须显式
+  选择版本或绝对 launcher，路径/版本不匹配直接拒绝。
+- 接受旧版官方 Answer Record patch 的 `version -short` 后缀（实测
+  `2018.3_AR71898`），但仍拒绝其他 release；2018.3 / 2020.2 / 2024.2 空 GUI
+  bootstrap、localhost listener、detach 保活均完成真机验证。
+- GUI endpoint 握手增加 `protocol/kind/pid/vivado/tcl` 身份；禁止把 batch/OOC
+  endpoint 当 GUI。GUI 使用 Windows vendor `.bat` 时通过单一 `cmd /d /s /c`
+  command line 启动，路径空格保持正确。
+- MCP 生命周期结束改为 detach 可见 GUI，不再把 client 退出等价为用户批准关闭
+  Vivado；只有显式 `stop_session` 可以终止受管 GUI。GUI 启动保留独立临时日志，
+  秒退/超时返回日志路径和尾部证据。
+- `run_synthesis` / `run_implementation` 不再隐式 `reset_run` 或 `open_run`，默认
+  启动后立即返回；新增显式破坏性 `reset_project_run`。Bitstream 前置检查改为
+  fail-closed，检查异常不会继续 launch。
+- 当前 39 个工具均有显式 MCP annotations；任意 Tcl、工程/run 写入、Bitstream、
+  Hardware Manager、program 和 ILA 操作保持保守副作用标记。
+- 新增只读 `get_vivado_capabilities`：通过 Tcl `info commands` 检查当前会话的
+  精确命令能力，不执行目标命令；版本敏感命令在 `FAIL/UNKNOWN` 时停止。明确
+  Vivado MCP 不承载 SDK/Vitis/XSCT/XSDB，软件侧通过 XSA/Bitstream/ELF 与独立
+  Vitis MCP 交接。
+- `setup_debug_after_synth(apply=False)` 改为真正 PLAN_ONLY，不再打开/关闭 design；
+  ILA 采集默认只接受 loopback hw_server，远程地址需要显式 opt-in。
+- `vivado-mcp install` 标为高级兼容方式并提示其安装级影响；普通 GUI session 使用
+  一次性 `-source` bootstrap，不要求修改 `Vivado_init.tcl`。
+- 本机三版本隔离验证确认安装级 `Vivado_init.tcl` 会被 project run 子进程加载；
+  2024.2 的旧 9999 注入已按官方 uninstall 移除并恢复到安装前“文件不存在”状态，
+  避免每个子 run 重复尝试启动 TCP server。手工启动 GUI 的 attach 因此需要显式
+  bootstrap/配置，不再依赖安装级注入。
+
+### MCP v2 合并与安全默认
+
+- 合并 MCP SDK 2.0 / v0.3.25 的 doctor、Prompts、Resources 和 single-inflight 修复；39 个工具及新增测试统一使用 v2 公开 API。
+- 综合/实现公开 API 默认异步返回；保留 v0.3.25 `wait` 参数作为兼容别名。原子 launch 只允许 `Not started`，任何其他状态均不隐式 `reset_run`。
+- `doctor --fix` 默认只备份并修复客户端配置，不再自动安装 `Vivado_init.tcl`。只有显式 `--install-init` 才启用手工 GUI attach 的高级兼容注入。
+
 ## [0.3.25] — 2026-08-09
 
 > 本版基于同类 Vivado MCP 的协议、工作流和安装体验调研，吸收有效模式，
@@ -55,6 +154,18 @@
 > 导致 vivado-mcp 新安装环境启动即报 `ModuleNotFoundError`。本版完成 SDK v2
 > 迁移，并一并发布自 0.3.23 以来已在 main 验证的诊断、Vivado 2018.x 兼容、
 > CI 与展示页改进。测试基线 754 → 766。
+
+### Live GUI 工程文件同步
+
+- 新增 `sync_project_files`：在同一 Tcl 事务中核对完整 `.xpr` 路径、工程名、
+  part、top、Vivado 版本和目标 session，再将明确列出的新增文件加入
+  `sources_1`/`sim_1`/`constrs_1`。默认 dry-run；`apply=True` 才执行
+  `add_files`，并为设计/仿真 fileset 更新 compile order，避免外部编辑 `.xpr`
+  被已打开 GUI 的旧状态覆盖。
+- 新增 `setup_debug_after_synth`：复刻 GUI 的“综合后 Set Up Debug”流程，要求
+  唯一匹配 ILA/Debug Hub 时钟，按 probe pattern 检查综合网表中的
+  `MARK_DEBUG` 信号，通过 `save_constraints` 保存目标 Debug XDC；拒绝覆盖未知
+  Debug Core，避免预先手写 RTL net 名在综合折叠后导致 `Chipscope 16-213`。
 
 > GitHub issue #2(Vivado 2022.2 / Win10 GUI 模式 `launch_simulation` 报
 > `[Common 17-180] Spawn failed: Broken pipe`)触发的诊断链补强。定性:该报错是

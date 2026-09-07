@@ -20,12 +20,19 @@ import json
 import logging
 import os
 import socket
+import tempfile
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
+from vivado_mcp.config import get_vivado_version, vivado_versions_match
 from vivado_mcp.tcl_scripts import QUERY_CURRENT_PROJECT
 from vivado_mcp.vivado.base_session import BaseSession, SessionState
+from vivado_mcp.vivado.session import (
+    create_vivado_subprocess,
+    decode_vivado_output,
+)
 from vivado_mcp.vivado.tcl_utils import TclResult, clean_output
 
 logger = logging.getLogger(__name__)
@@ -53,6 +60,42 @@ _PENDING_SPAWN_PORTS: set[int] = set()
 _CURPROJ_TIMEOUT = 5.0
 
 
+def _new_startup_log_path(session_id: str) -> Path:
+    """Allocate a diagnostic GUI log outside projects and the source tree."""
+    root = Path(
+        os.environ.get(
+            "VIVADO_MCP_LOG_DIR",
+            str(Path(tempfile.gettempdir()) / "vivado-mcp" / "logs"),
+        )
+    ).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return root / f"vivado_{session_id}_{stamp}_{uuid.uuid4().hex[:8]}.log"
+
+
+def _tail_text_file(path: Path | None, max_chars: int = 4000) -> str:
+    """Read a bounded diagnostic tail without turning a log failure fatal."""
+    if path is None or not path.is_file():
+        return ""
+    try:
+        text = decode_vivado_output(path.read_bytes())
+    except OSError:
+        return ""
+    return text[-max_chars:].strip()
+
+
+def _describe_text_file(path: Path | None) -> str:
+    """Report path/existence/size so an absent Vivado log is explicit evidence."""
+    if path is None:
+        return "<未分配>"
+    try:
+        if not path.is_file():
+            return f"{path} (NOT_CREATED)"
+        return f"{path} (exists, {path.stat().st_size} bytes)"
+    except OSError as exc:
+        return f"{path} (stat failed: {exc})"
+
+
 def _make_probe_payload() -> tuple[str, bytes]:
     """生成一次性握手探测 payload:(magic token, 未加 length 头的 payload 字节)。
 
@@ -62,7 +105,46 @@ def _make_probe_payload() -> tuple[str, bytes]:
     正是 B16「逻辑 fork 改一处漏一处」的重演。
     """
     token = "VMCP_PROBE_" + uuid.uuid4().hex[:16]
-    return token, f"puts {token}".encode("utf-8")
+    command = f"""
+puts {token}
+set __vmcp_kind unknown
+if {{[info exists ::VMCP_SESSION_KIND]}} {{ set __vmcp_kind $::VMCP_SESSION_KIND }}
+set __vmcp_project ""
+set __vmcp_xpr ""
+if {{[catch {{current_project}} __vmcp_project]}} {{ set __vmcp_project "" }}
+if {{$__vmcp_project ne ""}} {{
+    if {{![catch {{get_property DIRECTORY $__vmcp_project}} __vmcp_dir]
+            && ![catch {{get_property NAME $__vmcp_project}} __vmcp_name]}} {{
+        set __vmcp_xpr [file normalize [file join $__vmcp_dir "${{__vmcp_name}}.xpr"]]
+    }}
+}}
+set __vmcp_ipi [expr {{
+    [llength [info commands open_bd_design]] > 0
+    && [llength [info commands get_bd_pins]] > 0
+}}]
+set __vmcp_identity "VMCP_ID|protocol=2|kind=$__vmcp_kind|pid=[pid]"
+append __vmcp_identity "|vivado=[version -short]|tcl=[info patchlevel]"
+append __vmcp_identity "|project=$__vmcp_project|xpr=$__vmcp_xpr"
+append __vmcp_identity "|ip_integrator=$__vmcp_ipi"
+puts $__vmcp_identity
+""".strip()
+    return token, command.encode("utf-8")
+
+
+def _parse_probe_identity(obj: object) -> dict[str, str]:
+    """Parse the evaluated VMCP_ID line; legacy servers return an empty dict."""
+    if not isinstance(obj, dict):
+        return {}
+    for line in str(obj.get("output", "")).splitlines():
+        if not line.startswith("VMCP_ID|"):
+            continue
+        fields: dict[str, str] = {}
+        for item in line.split("|")[1:]:
+            key, sep, value = item.partition("=")
+            if sep and key:
+                fields[key] = value
+        return fields
+    return {}
 
 
 def _verify_probe_resp(obj: object, token: str) -> bool:
@@ -74,6 +156,15 @@ def _verify_probe_resp(obj: object, token: str) -> bool:
     if not (isinstance(obj, dict) and "rc" in obj and "output" in obj):
         return False
     return token in str(obj.get("output", ""))
+
+
+def _paths_match(expected: str, actual: str) -> bool:
+    """Compare resolved local paths using the host platform's case rules."""
+    if not expected or not actual:
+        return False
+    expected_key = os.path.normcase(os.path.normpath(str(Path(expected).resolve())))
+    actual_key = os.path.normcase(os.path.normpath(str(Path(actual).resolve())))
+    return expected_key == actual_key
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
@@ -88,6 +179,35 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
             return None
         buf.extend(chunk)
     return bytes(buf)
+
+
+def probe_vmcp_endpoint(
+    host: str,
+    port: int,
+    timeout: float = 0.5,
+) -> tuple[bool, dict[str, str]]:
+    """Probe one endpoint and return protocol status plus evaluated identity."""
+    token, payload = _make_probe_payload()
+    header = len(payload).to_bytes(4, "big")
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(header + payload)
+            hdr = _recv_exact(s, 4)
+            if hdr is None:
+                return False, {}
+            resp_len = int.from_bytes(hdr, "big")
+            if resp_len <= 0 or resp_len > _HANDSHAKE_MAX_RESP:
+                return False, {}
+            body = _recv_exact(s, resp_len)
+            if body is None:
+                return False, {}
+            obj = json.loads(body.decode("utf-8"))
+            if not _verify_probe_resp(obj, token):
+                return False, {}
+            return True, _parse_probe_identity(obj)
+    except (OSError, socket.timeout, json.JSONDecodeError, UnicodeDecodeError):
+        return False, {}
 
 
 def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -106,26 +226,8 @@ def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
         True 表示成功握手且响应 output 含 magic token(对面是同协议 server);
         False 表示连不上 / 协议不匹配 / 响应 output 缺 magic。
     """
-    token, payload = _make_probe_payload()
-    header = len(payload).to_bytes(4, "big")
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as s:
-            s.settimeout(timeout)
-            s.sendall(header + payload)
-            hdr = _recv_exact(s, 4)
-            if hdr is None:
-                return False
-            resp_len = int.from_bytes(hdr, "big")
-            if resp_len <= 0 or resp_len > _HANDSHAKE_MAX_RESP:
-                return False
-            body = _recv_exact(s, resp_len)
-            if body is None:
-                return False
-            obj = json.loads(body.decode("utf-8"))
-            # magic token 反射校验:挡掉 echo-type / 非 vmcp 服务的假阳性
-            return _verify_probe_resp(obj, token)
-    except (OSError, socket.timeout, json.JSONDecodeError, UnicodeDecodeError):
-        return False
+    ok, _ = probe_vmcp_endpoint(host, port, timeout)
+    return ok
 
 
 def _query_current_project(
@@ -245,6 +347,8 @@ class GuiSession(BaseSession):
         session_id: str = "default",
         port: int = 0,
         attach_only: bool = False,
+        startup_project_path: str | None = None,
+        require_ip_integrator: bool = False,
     ):
         super().__init__(vivado_path=vivado_path, session_id=session_id)
         # 端口意图哨兵(B 方案):
@@ -254,6 +358,8 @@ class GuiSession(BaseSession):
         # attach 模式下 port 始终是要连的显式端口(attach 本就需知道连哪)。
         self._port_preference = port
         self._attach_only = attach_only
+        self._startup_project_path = startup_project_path
+        self._require_ip_integrator = require_ip_integrator
         # probe-then-attach 命中外部 GUI(用户手动启动 + init.tcl 已注入)时为 True
         # 与 _attach_only 区别:_attach_only 是用户显式请求,_attached_external
         # 是 mode="gui" 时的隐式 attach。两者对 mode/stop 行为意义相同。
@@ -277,6 +383,12 @@ class GuiSession(BaseSession):
         # list_sessions 探活守卫据此跳过 fresh probe:Vivado 单线程 event loop
         # 正在跑已超时的长命令时,新连接得不到服务,1s 探活必然落空 ≠ 挂死。
         self._pending_response: bool = False
+        # protocol/kind/pid/vivado/tcl returned by the evaluated handshake.
+        # Empty means a legacy server that only reflected the probe token.
+        self._identity: dict[str, str] = {}
+        self._last_handshake_error: str = ""
+        self._startup_log_path: Path | None = None
+        self._launcher_log_path: Path | None = None
 
     @property
     def mode(self) -> str:
@@ -301,11 +413,25 @@ class GuiSession(BaseSession):
         """本 session spawn 的 vivado 进程 pid(attach / 外部命中路径为 None)。"""
         return self._pid
 
+    @property
+    def startup_project_path(self) -> str | None:
+        """Exact XPR requested on the Vivado GUI command line, if any."""
+        return self._startup_project_path
+
     def status_dict(self) -> dict:
         """在基类字段上补 pid,便于 list_sessions / 诊断区分自己 spawn 的实例。"""
         d = super().status_dict()
         if self._pid is not None:
             d["pid"] = self._pid
+        if self._identity:
+            d["identity"] = dict(self._identity)
+        if self._startup_log_path is not None:
+            d["startup_log"] = str(self._startup_log_path)
+        if self._launcher_log_path is not None:
+            d["launcher_log"] = str(self._launcher_log_path)
+        if self._startup_project_path is not None:
+            d["startup_project_path"] = self._startup_project_path
+        d["require_ip_integrator"] = self._require_ip_integrator
         return d
 
     @staticmethod
@@ -356,7 +482,7 @@ class GuiSession(BaseSession):
         except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
             return False
 
-        ok = await self._handshake(reader, writer)
+        ok = await self._handshake(reader, writer, require_gui=True)
         if not ok:
             writer.close()
             try:
@@ -432,26 +558,41 @@ class GuiSession(BaseSession):
                 # 关键：-source 临时注入 tcl server（即使用户没跑 install 也能工作）
                 # 注入 VMCP_PORT_PREF = 确切端口,tcl server 绑这个端口否则退出
                 # (不再池滑动 → 杜绝新 vivado 监听在没人连的端口=孤儿)
-                import tempfile
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".tcl", delete=False, encoding="utf-8"
                 ) as tmp:
                     tmp.write(f"set ::VMCP_PORT_PREF {target_port}\n")
-                    tmp.write(f'source "{script_path.as_posix()}"\n')
+                    tmp.write("set ::VMCP_SESSION_KIND gui\n")
+                    tmp.write("set ::VMCP_PROTOCOL_VERSION 2\n")
+                    tmp.write(f'source "{script_path.as_posix()}" -notrace\n')
                     tmp_script = tmp.name
                 self._tmp_script = tmp_script
                 # atexit 兜底:MCP 进程被强杀时仍会清理
                 _TMP_SCRIPTS.add(tmp_script)
 
-                self._proc = await asyncio.create_subprocess_exec(
-                    self.vivado_path,
-                    "-mode", "gui",
-                    "-source", tmp_script,
-                    "-nojournal", "-nolog",
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+                # Vivado processes a positional design/project before the startup
+                # script.  This ordering is essential for IP Integrator projects:
+                # source VMCP only after the exact XPR has loaded and registered
+                # open_bd_design/get_bd_pins in the main Tcl interpreter.
+                gui_args = (self.vivado_path, "-mode", "gui")
+                if self._startup_project_path is not None:
+                    gui_args += (self._startup_project_path,)
+                gui_args += ("-source", tmp_script, "-nojournal")
+                self._startup_log_path = _new_startup_log_path(self.session_id)
+                self._launcher_log_path = self._startup_log_path.with_suffix(
+                    ".launcher.log"
                 )
+                gui_args += ("-log", str(self._startup_log_path))
+                # Preserve vendor .bat / loader stdout+stderr.  Vivado's own -log
+                # starts only after the executable is alive, so launcher failures
+                # otherwise disappear behind DEVNULL and look like project errors.
+                with self._launcher_log_path.open("ab", buffering=0) as launcher_log:
+                    self._proc = await create_vivado_subprocess(
+                        *gui_args,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=launcher_log,
+                        stderr=asyncio.subprocess.STDOUT,
+                    )
                 # 记下 pid:stop() 在 self._proc 引用因故丢失时仍能按 pid 精杀
                 self._pid = self._proc.pid
                 logger.info(
@@ -493,7 +634,11 @@ class GuiSession(BaseSession):
                 else:
                     # 连上后必须握手验证：确认对面说的是我们的 length-prefix 协议
                     # （避免连到 SynthPilot 等其他产品的 server 上）
-                    handshake_ok = await self._handshake(reader, writer)
+                    handshake_ok = await self._handshake(
+                        reader,
+                        writer,
+                        require_gui=spawned,
+                    )
                     if handshake_ok:
                         self._reader = reader
                         self._writer = writer
@@ -504,6 +649,10 @@ class GuiSession(BaseSession):
                             f"GUI 会话就绪：attach={self._attach_only}，"
                             f"端口 {target_port}"
                         )
+                        if self._startup_project_path is not None:
+                            msg += f"，project={self._startup_project_path}"
+                        if self._require_ip_integrator:
+                            msg += "，IP Integrator commands=READY"
                         logger.info(msg)
                         return msg + await self._current_project_hint()
                     logger.debug(
@@ -519,9 +668,19 @@ class GuiSession(BaseSession):
                 # 进程还活吗
                 if self._proc is not None and self._proc.returncode is not None:
                     self._state = SessionState.ERROR
+                    log_tail = _tail_text_file(self._startup_log_path)
+                    launcher_tail = _tail_text_file(self._launcher_log_path)
                     raise RuntimeError(
-                        f"Vivado GUI 进程提前退出 "
-                        f"(returncode={self._proc.returncode})"
+                        f"Vivado launcher/GUI 进程提前退出 "
+                        f"(returncode={self._proc.returncode})。"
+                        f"启动日志: {_describe_text_file(self._startup_log_path)}"
+                        f"\nLauncher 日志: "
+                        f"{_describe_text_file(self._launcher_log_path)}"
+                        + (f"\n日志尾部:\n{log_tail}" if log_tail else "")
+                        + (
+                            f"\nLauncher 日志尾部:\n{launcher_tail}"
+                            if launcher_tail else ""
+                        )
                     )
                 await asyncio.sleep(2.0)
 
@@ -529,9 +688,19 @@ class GuiSession(BaseSession):
             # 进 SessionManager._sessions,stop_session 无从清理,不杀就是真孤儿
             await self._cleanup_failed_spawn()
             self._state = SessionState.ERROR
+            log_tail = _tail_text_file(self._startup_log_path)
+            launcher_tail = _tail_text_file(self._launcher_log_path)
             raise RuntimeError(
                 f"连接 Vivado GUI 超时（{timeout}s，确切端口 {target_port}）。"
-                f"该端口可能被其他进程抢占,请重试。最后一次错误: {connect_err}"
+                "该端口可能被其他进程抢占，或对端身份不是 GUI。"
+                f"最后连接错误: {connect_err}; 握手: {self._last_handshake_error or '<无>'}; "
+                f"启动日志: {_describe_text_file(self._startup_log_path)}"
+                f"\nLauncher 日志: {_describe_text_file(self._launcher_log_path)}"
+                + (f"\n日志尾部:\n{log_tail}" if log_tail else "")
+                + (
+                    f"\nLauncher 日志尾部:\n{launcher_tail}"
+                    if launcher_tail else ""
+                )
             )
         finally:
             if spawned:
@@ -608,6 +777,7 @@ class GuiSession(BaseSession):
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         timeout: float = 3.0,
+        require_gui: bool = False,
     ) -> bool:
         """发送探测命令验证对端说的是我们的 length-prefix 协议。
 
@@ -640,8 +810,64 @@ class GuiSession(BaseSession):
                 reader.readexactly(resp_len), timeout=timeout
             )
             obj = json.loads(body.decode("utf-8"))
-            return _verify_probe_resp(obj, token)
-        except Exception:
+            if not _verify_probe_resp(obj, token):
+                self._last_handshake_error = "probe token 未回显"
+                return False
+
+            identity = _parse_probe_identity(obj)
+            if require_gui and not identity:
+                self._last_handshake_error = "对端未返回 VMCP_ID，无法证明是 GUI"
+                return False
+
+            expected_version = get_vivado_version(self.vivado_path)
+            actual_version = identity.get("vivado", "")
+            if (
+                expected_version != "unknown"
+                and actual_version
+                and not vivado_versions_match(expected_version, actual_version)
+            ):
+                self._last_handshake_error = (
+                    "Vivado 版本不匹配: "
+                    f"expected={expected_version}, actual={actual_version}"
+                )
+                return False
+
+            actual_kind = identity.get("kind", "unknown")
+            if require_gui and actual_kind != "gui":
+                self._last_handshake_error = (
+                    f"请求 GUI，但端口对端 kind={actual_kind!r}；拒绝 attach"
+                )
+                return False
+
+            if self._startup_project_path is not None:
+                actual_xpr = identity.get("xpr", "")
+                if not actual_xpr:
+                    self._last_handshake_error = (
+                        "已请求 startup project，但握手时 current_project/XPR 尚未就绪"
+                    )
+                    return False
+                if not _paths_match(self._startup_project_path, actual_xpr):
+                    self._last_handshake_error = (
+                        "Vivado project 不匹配: "
+                        f"expected={self._startup_project_path}, actual={actual_xpr}"
+                    )
+                    return False
+
+            if (
+                self._require_ip_integrator
+                and identity.get("ip_integrator") != "1"
+            ):
+                self._last_handshake_error = (
+                    "IP Integrator commands 未就绪: "
+                    "open_bd_design/get_bd_pins 尚未注册"
+                )
+                return False
+
+            self._identity = identity
+            self._last_handshake_error = ""
+            return True
+        except Exception as exc:
+            self._last_handshake_error = f"握手异常: {type(exc).__name__}: {exc}"
             return False
 
     async def execute(
@@ -755,6 +981,35 @@ class GuiSession(BaseSession):
             return_code=rc,
             is_error=(rc != 0),
         )
+
+    async def detach(self) -> None:
+        """Close only the MCP transport and preserve the visible Vivado GUI.
+
+        This is the MCP-lifespan cleanup path.  A Codex task ending must not be
+        interpreted as authorization to send Tcl ``exit`` or ``taskkill`` a
+        user-visible vendor process.  Explicit ``stop_session`` still calls
+        :meth:`stop` and retains its existing owned-process semantics.
+        """
+        logger.info("正在 detach GUI 会话 '%s'（保留 Vivado 进程）...", self.session_id)
+        if self._writer is not None:
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception as exc:
+                logger.debug("detach 关闭 writer 异常: %s", exc)
+        self._writer = None
+        self._reader = None
+        self._proc = None
+        self._pid = None
+        self._pending_response = False
+        if self._tmp_script:
+            try:
+                os.unlink(self._tmp_script)
+            except OSError:
+                pass
+            _TMP_SCRIPTS.discard(self._tmp_script)
+            self._tmp_script = None
+        self._state = SessionState.STOPPED
 
     async def stop(self, timeout: float = 10.0) -> None:
         """关闭 TCP 连接 + 终止 spawn 的 GUI 进程（attach 模式不终止外部进程）。

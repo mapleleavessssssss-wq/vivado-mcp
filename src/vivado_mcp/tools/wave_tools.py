@@ -23,6 +23,7 @@ from mcp.server.mcpserver import Context
 from vivado_mcp.analysis import wcfg_editor
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 from vivado_mcp.tcl_scripts import RELOAD_WCFG, RESOLVE_WCFG_PATH, SET_ANALOG_PROPS
+from vivado_mcp.tools.annotations import PROJECT_WRITE, SESSION_CHANGE
 from vivado_mcp.vivado.tcl_utils import to_tcl_path
 
 # AnalogInterpolation 白名单。0.3.2x 用户实测仅验证 LINEAR；HOLD 是 Vivado 另一
@@ -139,7 +140,7 @@ def _parse_analog_result(raw: str, signals: list[str]) -> tuple[list[str], list[
 # ====================================================================== #
 
 
-@mcp.tool()
+@mcp.tool(annotations=PROJECT_WRITE)
 async def set_wave_zoom(
     start_ns: float,
     end_ns: float,
@@ -211,7 +212,7 @@ async def set_wave_zoom(
     return f"[OK] 已设缩放窗 {start_ns}~{end_ns} ns 并重载: {tcl_path}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=SESSION_CHANGE)
 async def set_wave_analog(
     signals: list[str],
     min: float = None,

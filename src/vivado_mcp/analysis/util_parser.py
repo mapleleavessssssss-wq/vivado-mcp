@@ -95,6 +95,14 @@ def _split_cells(line: str) -> list[str] | None:
     return [c.strip() for c in s[1:-1].split("|")]
 
 
+def _parse_percent(value: str) -> float:
+    """Parse Vivado utilization percentages, including values such as ``<0.01``."""
+    normalized = value.strip()
+    if normalized.startswith("<"):
+        normalized = normalized[1:].strip()
+    return float(normalized)
+
+
 def parse_utilization(raw_text: str) -> UtilizationReport:
     """从 report_utilization 输出解析出核心资源占用。
 
@@ -146,7 +154,7 @@ def parse_utilization(raw_text: str) -> UtilizationReport:
             try:
                 used = int(cells[used_i])
                 avail = int(cells[avail_i])
-                pct = float(cells[pct_i])
+                pct = _parse_percent(cells[pct_i])
             except ValueError:
                 continue
             seen.add(name)
@@ -159,7 +167,7 @@ def parse_utilization(raw_text: str) -> UtilizationReport:
                 continue
             try:
                 avail = int(cells[avail_i]) if cells[avail_i] else 0
-                pct = float(cells[pct_i]) if cells[pct_i] else 0.0
+                pct = _parse_percent(cells[pct_i]) if cells[pct_i] else 0.0
             except ValueError:
                 avail, pct = 0, 0.0
             seen_detail.add(name)

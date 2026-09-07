@@ -12,8 +12,13 @@ subprocess 实现（两种会话模式之一）。负责：
 import asyncio
 import collections
 import logging
+import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 
+from vivado_mcp.config import validate_vivado_launcher
 from vivado_mcp.vivado.base_session import BaseSession, SessionState
 from vivado_mcp.vivado.tcl_utils import (
     TclResult,
@@ -26,8 +31,95 @@ from vivado_mcp.vivado.tcl_utils import (
 
 logger = logging.getLogger(__name__)
 
+
+_CMD_META_CHARS = frozenset("^&|<>()%")
+_CMD_QUOTE_TRIGGER_CHARS = frozenset(" \t^&|<>()%")
+
+
+def _quote_windows_batch_arg(value: str) -> str:
+    """Render one trusted launcher argument for cmd.exe batch re-parsing.
+
+    ``subprocess.list2cmdline`` implements the Microsoft C runtime argv rules,
+    not cmd.exe grammar.  In particular, its embedded quotes are surfaced as
+    literal ``\"`` by ``cmd /c`` and metacharacters such as ``&`` split the
+    command.  AMD's launcher also compares raw ``%1``/``%2`` values, so safe
+    option tokens must remain unquoted.  Paths and metacharacter-bearing values
+    are quoted only when required.  Double quotes/control characters and ``!``
+    are rejected rather than guessed: AMD ``loader.bat`` enables delayed
+    expansion before forwarding ``%*``, which silently removes or expands a
+    literal exclamation mark even when the outer cmd.exe roundtrip succeeds.
+    """
+    if any(char in value for char in ('"', "!", "\x00", "\r", "\n")):
+        raise ValueError(
+            "Windows batch launcher 参数含不支持的引号、感叹号或控制字符: "
+            f"{value!r}"
+        )
+    escaped = "".join(
+        f"^{char}" if char in _CMD_META_CHARS else char
+        for char in value
+    )
+    if value and not any(char in _CMD_QUOTE_TRIGGER_CHARS for char in value):
+        return escaped
+    return f'"{escaped}"'
+
+
+def windows_batch_command(vivado_path: str, *args: str) -> str:
+    """Build one cmd-safe command while preserving raw vendor option tokens."""
+    return " ".join(
+        _quote_windows_batch_arg(value) for value in (vivado_path, *args)
+    )
+
+
+async def create_vivado_subprocess(
+    vivado_path: str,
+    *args: str,
+    **kwargs,
+) -> asyncio.subprocess.Process:
+    """Start a Vivado launcher without bypassing the vendor environment.
+
+    Real executables use exact argv boundaries.  Windows ``.bat``/``.cmd``
+    launchers use cmd's shell entry with explicit cmd escaping; attempting to
+    pass the same nested command through ``create_subprocess_exec`` is not
+    round-trip safe on Windows.
+    """
+    vivado_path = validate_vivado_launcher(vivado_path)
+    if sys.platform == "win32" and vivado_path.lower().endswith((".bat", ".cmd")):
+        return await asyncio.create_subprocess_shell(
+            windows_batch_command(vivado_path, *args),
+            executable=os.environ.get("COMSPEC", "cmd.exe"),
+            **kwargs,
+        )
+    return await asyncio.create_subprocess_exec(vivado_path, *args, **kwargs)
+
+
+def _paths_match(expected: str, actual: str) -> bool:
+    """Compare resolved local paths using the host platform's case rules."""
+    if not expected or not actual:
+        return False
+    expected_key = os.path.normcase(os.path.normpath(str(Path(expected).resolve())))
+    actual_key = os.path.normcase(os.path.normpath(str(Path(actual).resolve())))
+    return expected_key == actual_key
+
 # stderr 缓冲区保留的最近行数（避免内存无限增长）
 _STDERR_RING_SIZE = 200
+
+_TCL_STARTUP_PROBE = """
+puts "VMCP_READY"
+set __vmcp_project ""
+set __vmcp_xpr ""
+if {[catch {current_project} __vmcp_project]} { set __vmcp_project "" }
+if {$__vmcp_project ne ""} {
+    if {![catch {get_property DIRECTORY $__vmcp_project} __vmcp_dir]
+            && ![catch {get_property NAME $__vmcp_project} __vmcp_name]} {
+        set __vmcp_xpr [file normalize [file join $__vmcp_dir "${__vmcp_name}.xpr"]]
+    }
+}
+set __vmcp_ipi [expr {
+    [llength [info commands open_bd_design]] > 0
+    && [llength [info commands get_bd_pins]] > 0
+}]
+puts "VMCP_TCL_ID|project=$__vmcp_project|xpr=$__vmcp_xpr|ip_integrator=$__vmcp_ipi"
+""".strip()
 
 
 class SubprocessSession(BaseSession):
@@ -37,8 +129,18 @@ class SubprocessSession(BaseSession):
     使用 catch + UUID sentinel 协议实现可靠的命令执行与输出采集。
     """
 
-    def __init__(self, vivado_path: str, session_id: str = "default"):
+    def __init__(
+        self,
+        vivado_path: str,
+        session_id: str = "default",
+        startup_project_path: str | None = None,
+        require_ip_integrator: bool = False,
+    ):
         super().__init__(vivado_path=vivado_path, session_id=session_id)
+        self._startup_project_path = startup_project_path
+        self._require_ip_integrator = require_ip_integrator
+        self._identity: dict[str, str] = {}
+        self._launch_args: tuple[str, ...] = ()
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._closing = False
@@ -62,6 +164,21 @@ class SubprocessSession(BaseSession):
             and self._process.returncode is None
         )
 
+    @property
+    def startup_project_path(self) -> str | None:
+        """Exact XPR requested on the Vivado Tcl command line, if any."""
+        return self._startup_project_path
+
+    def status_dict(self) -> dict:
+        """Add project-first startup and Tcl identity evidence."""
+        status = super().status_dict()
+        if self._startup_project_path is not None:
+            status["startup_project_path"] = self._startup_project_path
+        if self._identity:
+            status["identity"] = dict(self._identity)
+        status["require_ip_integrator"] = self._require_ip_integrator
+        return status
+
     async def start(self, timeout: float = 60.0) -> str:
         """启动 Vivado TCL 子进程。
 
@@ -82,10 +199,14 @@ class SubprocessSession(BaseSession):
         logger.info("启动 Vivado 会话 '%s': %s", self.session_id, self.vivado_path)
 
         try:
-            self._process = await asyncio.create_subprocess_exec(
+            launch_args = ["-mode", "tcl"]
+            if self._startup_project_path is not None:
+                launch_args.append(self._startup_project_path)
+            launch_args.extend(("-nojournal", "-nolog"))
+            self._launch_args = tuple(launch_args)
+            self._process = await create_vivado_subprocess(
                 self.vivado_path,
-                "-mode", "tcl",
-                "-nojournal", "-nolog",
+                *launch_args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -94,13 +215,14 @@ class SubprocessSession(BaseSession):
             self._state = SessionState.ERROR
             raise RuntimeError(f"无法启动 Vivado: {e}") from e
 
+        # Drain stderr immediately.  Waiting until READY can deadlock startup if
+        # the vendor launcher or Vivado fills the stderr pipe first.
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
         # 等待 Vivado 启动完成（读取初始横幅）
         banner = await self._read_startup_banner(timeout)
         self._state = SessionState.READY
         self._start_time = time.time()
-
-        # B5 修复：启动 stderr 持续读取任务
-        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
         logger.info("Vivado 会话 '%s' 启动成功", self.session_id)
         return banner
@@ -139,7 +261,7 @@ class SubprocessSession(BaseSession):
         pattern = make_sentinel_pattern(sentinel)
 
         # 发送探测命令
-        probe = wrap_command('puts "VMCP_READY"', sentinel)
+        probe = wrap_command(_TCL_STARTUP_PROBE, sentinel)
         assert self._process and self._process.stdin and self._process.stdout
         self._process.stdin.write(probe.encode("utf-8"))
         await self._process.stdin.drain()
@@ -158,18 +280,29 @@ class SubprocessSession(BaseSession):
                 )
                 if not raw:
                     # EOF — 进程意外退出
-                    stderr_out = ""
-                    if self._process.stderr:
+                    if self._process.returncode is None:
                         try:
-                            stderr_out = decode_vivado_output(
-                                await asyncio.wait_for(
-                                    self._process.stderr.read(), timeout=2.0
-                                )
+                            await asyncio.wait_for(self._process.wait(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            pass
+                    if self._stderr_task and not self._stderr_task.done():
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(self._stderr_task), timeout=2.0
                             )
                         except asyncio.TimeoutError:
                             pass
+                    stderr_out = self._recent_stderr(max_lines=80)
+                    stdout_out = clean_output("\n".join(lines[-80:]))
                     raise RuntimeError(
-                        f"Vivado 进程意外退出。stderr: {stderr_out}"
+                        "Vivado Tcl launcher/process 在 READY 前退出。"
+                        f"returncode={self._process.returncode}; "
+                        f"launcher={self.vivado_path}; args={self._launch_args!r}"
+                        + (
+                            f"\n--- startup stdout tail ---\n{stdout_out}"
+                            if stdout_out else ""
+                        )
+                        + (f"\n--- stderr tail ---\n{stderr_out}" if stderr_out else "")
                     )
 
                 line = decode_vivado_output(raw).rstrip("\r\n")
@@ -181,12 +314,50 @@ class SubprocessSession(BaseSession):
 
         except asyncio.TimeoutError:
             self._state = SessionState.ERROR
+            stderr_out = self._recent_stderr(max_lines=80)
+            stdout_out = clean_output("\n".join(lines[-80:]))
             raise RuntimeError(
                 f"Vivado 启动超时（{timeout}s）。"
-                "请检查 Vivado 路径是否正确，或尝试增大超时值。"
+                f"returncode={self._process.returncode}; "
+                f"launcher={self.vivado_path}; args={self._launch_args!r}。"
+                + (
+                    f"\n--- startup stdout tail ---\n{stdout_out}"
+                    if stdout_out else ""
+                )
+                + (f"\n--- stderr tail ---\n{stderr_out}" if stderr_out else "")
             )
 
-        return clean_output("\n".join(lines))
+        identity: dict[str, str] = {}
+        banner_lines: list[str] = []
+        for line in lines:
+            if line.startswith("VMCP_TCL_ID|"):
+                for item in line.split("|")[1:]:
+                    key, sep, value = item.partition("=")
+                    if sep and key:
+                        identity[key] = value
+                continue
+            banner_lines.append(line)
+
+        if self._startup_project_path is not None:
+            actual_xpr = identity.get("xpr", "")
+            if not actual_xpr or not _paths_match(
+                self._startup_project_path, actual_xpr
+            ):
+                raise RuntimeError(
+                    "Vivado Tcl startup project 身份不匹配: "
+                    f"expected={self._startup_project_path}, "
+                    f"actual={actual_xpr or '<无>'}"
+                )
+        if (
+            self._require_ip_integrator
+            and identity.get("ip_integrator") != "1"
+        ):
+            raise RuntimeError(
+                "Vivado Tcl session 的 IP Integrator commands 未就绪: "
+                "open_bd_design/get_bd_pins 尚未注册"
+            )
+        self._identity = identity
+        return clean_output("\n".join(banner_lines))
 
     async def execute(
         self,
@@ -341,15 +512,6 @@ class SubprocessSession(BaseSession):
         self._state = SessionState.STOPPING
         logger.info("正在关闭 Vivado 会话 '%s'...", self.session_id)
 
-        # 取消 stderr drain 任务
-        if self._stderr_task and not self._stderr_task.done():
-            self._stderr_task.cancel()
-            try:
-                await self._stderr_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._stderr_task = None
-
         inflight = self._inflight_task
         if inflight is None or inflight.done():
             # 无在途 reader 时与 execute 共用同一把锁，完整保护 exit 的发送。
@@ -372,8 +534,42 @@ class SubprocessSession(BaseSession):
                     "Vivado 会话 '%s' 未在 %ss 内退出，强制终止。",
                     self.session_id, timeout,
                 )
-                self._process.kill()
-                await self._process.wait()
+                if sys.platform == "win32":
+                    kill_result = await asyncio.to_thread(
+                        subprocess.run,
+                        ["taskkill", "/F", "/T", "/PID", str(self._process.pid)],
+                        capture_output=True,
+                        timeout=10.0,
+                    )
+                    if kill_result.returncode != 0:
+                        try:
+                            await asyncio.wait_for(self._process.wait(), timeout=0.5)
+                        except asyncio.TimeoutError as exc:
+                            detail = decode_vivado_output(
+                                kill_result.stderr or kill_result.stdout
+                            )[-1000:].strip()
+                            raise RuntimeError(
+                                "taskkill 未能终止 Vivado 进程树: "
+                                f"pid={self._process.pid}, "
+                                f"returncode={kill_result.returncode}"
+                                + (f", detail={detail}" if detail else "")
+                            ) from exc
+                else:
+                    self._process.kill()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=10.0)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        f"强制终止后进程仍未退出: pid={self._process.pid}"
+                    ) from exc
+
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._stderr_task = None
 
         self._state = SessionState.STOPPED
         self._process = None

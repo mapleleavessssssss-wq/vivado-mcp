@@ -2,7 +2,7 @@
 
 run_synthesis / run_implementation / generate_bitstream / program_device。
 封装 Vivado 长时间运行的操作，提供超时管理和进度反馈。
-综合/实现完成后自动执行警告诊断，bitstream 生成前自动安全检查。
+综合/实现后的日志诊断按需执行，bitstream 生成前保留自动安全检查。
 
 **D5 架构**：长任务使用 Python 侧轮询 STATUS/PROGRESS，不再依赖 Tcl `wait_on_run`
 阻塞事件循环。这样 subprocess 和 GuiSession 两种实现共用同一套轮询代码，
@@ -23,25 +23,118 @@ from vivado_mcp.tcl_scripts import (
     LAUNCH_RUN_IF_IDLE,
     POLL_RUN_STATUS,
     QUERY_FILESET_OVERRIDES,
+    QUERY_RUN_LAUNCH_STATE,
 )
-from vivado_mcp.vivado.tcl_utils import to_tcl_path, validate_identifier
+from vivado_mcp.tools._hardware_safety import (
+    is_loopback_hw_server,
+    is_valid_hw_server_url,
+    parse_hw_server_url,
+    select_exact_tcl_proc,
+    select_hw_server_tcl_proc,
+)
+from vivado_mcp.tools.annotations import HARDWARE_CHANGE, PROJECT_WRITE
+from vivado_mcp.vivado.tcl_utils import tcl_quote, to_tcl_path, validate_identifier
 
 logger = logging.getLogger(__name__)
 
-# 轮询间隔（秒）。综合/实现任务通常以分钟计，2 秒足够快响应完成事件
-_POLL_INTERVAL_SEC = 2.0
+# 轮询间隔（秒）。vendor run 通常以分钟计；5 秒足够反馈进度，同时避免把 GUI
+# Tcl event loop 当作高频状态接口。需要更细进度时使用显式 get_run_progress。
+_POLL_INTERVAL_SEC = 5.0
 
 # --------------------------------------------------------------------------- #
 #  内部辅助：综合 / 实现 / bitstream 共享的轮询逻辑(单一来源,勿复制)
 # --------------------------------------------------------------------------- #
+
+
+def _parse_launch_state(output: str) -> dict[str, str]:
+    """Parse the single ``VMCP_LAUNCH_STATE`` protocol line."""
+    line = next(
+        (line for line in output.splitlines() if line.startswith("VMCP_LAUNCH_STATE|")),
+        "",
+    )
+    if not line:
+        return {}
+    fields: dict[str, str] = {}
+    for item in line.split("|")[1:]:
+        key, separator, value = item.partition("=")
+        if separator:
+            fields[key] = value
+    return fields
+
+
+async def _get_run_launch_decision(session, run_name: str) -> str | None:
+    """Return a no-launch result, or ``None`` when the run can be started."""
+    try:
+        result = await session.execute(
+            QUERY_RUN_LAUNCH_STATE.format(run_name=run_name),
+            timeout=15.0,
+        )
+    except Exception as exc:
+        return f"[ERROR] 查询 run 启动状态失败: {type(exc).__name__}: {exc}"
+    if result.is_error:
+        return (
+            f"[ERROR] 查询 run 启动状态失败(rc={result.return_code}):\n"
+            f"{result.output}"
+        )
+
+    fields = _parse_launch_state(result.output)
+    if not fields:
+        return "[ERROR] run 启动状态缺少 VMCP_LAUNCH_STATE 标记，未执行 launch。"
+    if fields.get("found") != "1":
+        return (
+            f"[ERROR] Run '{run_name}' 不存在或不唯一"
+            f"(count={fields.get('count', 'unknown')})，未执行 launch。"
+        )
+
+    status = fields.get("status", "")
+    progress = fields.get("progress", "")
+    needs_refresh_raw = fields.get("needs_refresh", "").strip().lower()
+    needs_refresh = (
+        True
+        if needs_refresh_raw in {"1", "true", "yes"}
+        else False
+        if needs_refresh_raw in {"0", "false", "no"}
+        else None
+    )
+    lowered = status.lower()
+
+    if "running" in lowered or "queued" in lowered:
+        return (
+            f"[ALREADY_RUNNING] {run_name}: status={status}, "
+            f"progress={progress or 'unknown'}。没有重复 launch；"
+            "请按需低频调用 get_run_progress。"
+        )
+    if "error" in lowered:
+        return (
+            f"[BLOCKED] {run_name} 当前为 ERROR: {status}。未自动 reset；"
+            "请先诊断，确需删除旧结果时单独批准 reset_project_run。"
+        )
+    if "out-of-date" in lowered or needs_refresh is True:
+        return (
+            f"[OUT_OF_DATE] {run_name}: status={status}, "
+            f"needs_refresh={needs_refresh_raw or 'unknown'}。"
+            "未强制标记 up-to-date，也未自动 reset；请先确认变更范围。"
+        )
+    if "complete" in lowered:
+        if needs_refresh is False:
+            return (
+                f"[UP_TO_DATE] {run_name}: {status}。未重复 launch；"
+                "可直接复用该 run 的状态、指标和已生成报告。"
+            )
+        return (
+            f"[COMPLETE] {run_name}: {status}，但当前 Vivado 未提供可判定的"
+            " NEEDS_REFRESH。为避免无意义 reset/relaunch，本次未启动。"
+        )
+    return None
 
 async def _poll_run_until_done(
     session,
     run_name: str,
     timeout_sec: float,
     ctx: Context,
+    expected_complete_step: str | None = None,
 ) -> tuple[str, str, str, str]:
-    """每 2s 轮询 run STATUS/PROGRESS 直到终态(Complete/ERROR)或超时。
+    """每 5s 轮询 run STATUS/PROGRESS 直到终态(Complete/ERROR)或超时。
 
     Tcl 片段在 tcl_scripts.POLL_RUN_STATUS(单一定义);本 helper 是
     _launch_and_wait 和 generate_bitstream 的共用轮询循环。
@@ -86,8 +179,12 @@ async def _poll_run_until_done(
             await ctx.report_progress(progress=progress_int, total=100)
             last_progress_int = progress_int
 
-        # 终态判断：Complete! 表示成功；ERROR 表示失败；其余继续轮询
-        if "Complete" in final_status:
+        # 终态判断。bitstream 启动后 STATUS 可能短暂保留旧的
+        # ``route_design Complete!``；只有目标 step 完成才允许返回。
+        completed = "Complete" in final_status
+        if expected_complete_step is not None:
+            completed = completed and expected_complete_step in final_status
+        if completed:
             break
         if "ERROR" in final_status.upper():
             break
@@ -159,25 +256,69 @@ async def _launch_and_wait(
     timeout_minutes: int,
     label: str,
     ctx: Context,
-    wait: bool = True,
+    wait_for_completion: bool = True,
+    post_check: str = "none",
+    inspect_fileset_overrides: bool = True,
+    max_threads: int = 0,
 ) -> str:
-    """原子启动 run；按 wait 选择立即返回或轮询、open_run、诊断。
+    """原子启动 run；按需由 Python 轮询，且从不隐式 reset/open design。
 
     不再调用 Tcl 的 `wait_on_run`（它会阻塞 Vivado event loop，
-    GUI 模式下会冻住界面）。wait=True 时改用 Python 每 2 秒查一次
-    STATUS/PROGRESS；wait=False 时返回 job_id，由 get_run_progress 查询。
+    GUI 模式下会冻住界面）。改用 Python 每 5 秒查一次 STATUS/PROGRESS。
     """
+    if post_check not in {"none", "on_failure", "always"}:
+        return (
+            f"[ERROR] post_check={post_check!r} 非法；"
+            "支持 none / on_failure / always。"
+        )
+    if not 0 <= max_threads <= 8:
+        return "[ERROR] max_threads 必须为 0..8；0 表示继承当前 Vivado 设置。"
+
     timeout_sec = timeout_minutes * 60.0
 
     # ------------------- 0. PRD B4:读取实际生效的参数覆盖 -------------------
-    # 在 reset_run 之前查 generic / verilog_define,结果里明示,
+    # 在 launch_runs 之前查 generic / verilog_define,结果里明示,
     # 防止"以为 set_property generic 生效了实际没设上"的隐性坑。
-    override_lines = await _query_fileset_overrides(session)
+    override_lines = (
+        await _query_fileset_overrides(session)
+        if inspect_fileset_overrides
+        else []
+    )
 
     # ------------------- 1. 启动 -------------------
+    launch_tcl = LAUNCH_RUN_IF_IDLE.format(run_name=run_name, jobs=jobs)
+    thread_lines: list[str] = []
+    if max_threads > 0:
+        # Project runs snapshot general.maxThreads into the child run Tcl at launch.
+        # Restore the parent interpreter immediately so one call does not silently
+        # change later work in the same GUI session.  This sequence is compatible
+        # with Tcl 8.5 used by Vivado 2018.3/2020.2.
+        indented_launch_tcl = "\n".join(
+            f"    {line}" for line in launch_tcl.splitlines()
+        )
+        launch_tcl = (
+            "set __vmcp_prev_threads [get_param general.maxThreads]\n"
+            "set __vmcp_launch_rc [catch {\n"
+            f"    set_param general.maxThreads {max_threads}\n"
+            f"{indented_launch_tcl}\n"
+            "} __vmcp_launch_result]\n"
+            "set __vmcp_restore_rc [catch {\n"
+            "    set_param general.maxThreads $__vmcp_prev_threads\n"
+            "} __vmcp_restore_result]\n"
+            "puts \"VMCP_THREAD_CONTROL|requested="
+            f"{max_threads}|previous=$__vmcp_prev_threads|"
+            "launch_rc=$__vmcp_launch_rc|restore_rc=$__vmcp_restore_rc\"\n"
+            "if {$__vmcp_launch_rc != 0} {error $__vmcp_launch_result}\n"
+            "if {$__vmcp_restore_rc != 0} {error $__vmcp_restore_result}"
+        )
+        thread_lines.append(
+            f"单 run CPU 线程请求: {max_threads}；launch 后已请求恢复父会话设置。"
+        )
+
     try:
         launch_result = await session.execute(
-            LAUNCH_RUN_IF_IDLE.format(run_name=run_name, jobs=jobs), timeout=60.0
+            launch_tcl,
+            timeout=60.0,
         )
         if launch_result.is_error:
             return f"[ERROR] 启动 {label} 失败:\n{launch_result.output}"
@@ -206,19 +347,27 @@ async def _launch_and_wait(
         )
     if launch_state == "missing":
         return f"[ERROR] 启动 {label} 失败: 找不到 run '{run_name}'"
+    if launch_state == "not_ready":
+        return (
+            f"[BLOCKED] {label} run '{run_name}' 当前状态不允许直接 launch: "
+            f"{launch_status or '<unknown>'}。未执行 reset_run。"
+        )
     if launch_state != "started":
         return f"[ERROR] 启动 {label} 失败: 未知启动状态 {launch_state!r}"
 
-    if not wait:
+    if not wait_for_completion:
         result_parts = [
-            f"{label}已异步启动。",
+            f"[STARTED] {label}已异步启动: {run_name}",
             f"job_id: {session.session_id}:{run_name}",
             f"状态: {launch_status or '已提交'}",
+            "未重置 run，未打开 design，也未等待完成。",
             (
                 f"查询: get_run_progress(run_name='{run_name}', "
                 f"session_id='{session.session_id}')"
             ),
+            "完成后只请求能改变下一步决策的报告。",
         ]
+        result_parts.extend(thread_lines)
         result_parts.extend(override_lines)
         return "\n".join(result_parts)
 
@@ -232,36 +381,7 @@ async def _launch_and_wait(
     if outcome == "timeout":
         return f"[ERROR] {label}超时（{timeout_minutes} 分钟），最后状态: {final_status}"
 
-    # ------------------- 3. B4 修复：自动 open_run -------------------
-    # 综合/实现完成后自动打开设计，让紧随其后的 report_* / report_io 能工作。
-    # catch 保护：run 可能已经打开（无害），或有其他运行时错误
-    # 注意:catch 吞异常后外层 return_code=0,所以不能只看 is_error。
-    # 必须把 $__open_err 的内容 puts 出来,Python 侧检测 VMCP_OPEN_ERR: 前缀。
-    open_note = ""
-    if "Complete" in final_status and "ERROR" not in final_status.upper():
-        try:
-            open_result = await session.execute(
-                f"if {{[catch {{ open_run {run_name} }} __open_err]}} "
-                f'{{ puts "VMCP_OPEN_ERR:$__open_err" }}',
-                timeout=120.0,
-            )
-            # 外层 is_error (Tcl 语法错等) 和内层 VMCP_OPEN_ERR 都要看
-            err_line = next(
-                (ln for ln in open_result.output.splitlines()
-                 if ln.startswith("VMCP_OPEN_ERR:")),
-                None,
-            )
-            if open_result.is_error:
-                open_note = f"(open_run 自动打开失败: {open_result.output[:200]})"
-            elif err_line:
-                inner = err_line[len("VMCP_OPEN_ERR:"):].strip()
-                # "already open" 这类无害信息不告警
-                if "already" not in inner.lower():
-                    open_note = f"(open_run 返回错误: {inner[:200]})"
-        except Exception as e:
-            open_note = f"(open_run 自动打开异常: {e})"
-
-    # ------------------- 4. 诊断概览 -------------------
+    # ------------------- 3. 诊断概览 -------------------
     result_parts: list[str] = [
         f"--- {label}结果 ---",
         f"状态: {final_status}",
@@ -269,46 +389,56 @@ async def _launch_and_wait(
         f"耗时: {final_elapsed}",
     ]
     result_parts.extend(override_lines)
-    if open_note:
-        result_parts.append(open_note)
+    result_parts.extend(thread_lines)
+    result_parts.append("未自动 open_run；需要设计报告时请单独明确打开目标 run。")
 
-    try:
-        diag_result = await session.execute(
-            COUNT_WARNINGS.format(run_name=run_name), timeout=30.0
+    run_failed = "ERROR" in final_status.upper()
+    should_check = post_check == "always" or (
+        post_check == "on_failure" and run_failed
+    )
+    if not should_check:
+        result_parts.append(
+            f"后置日志扫描: NOT_RUN (post_check={post_check})；"
+            "需要 warning/error 统计时显式调用 get_critical_warnings。"
         )
-        if diag_result.is_error:
-            # 计数命令本身失败:不能把 -1 哨兵打成数字误导 AI,显式降级
-            result_parts.append(
-                f"\n[DEGRADED] 诊断计数不可用(rc={diag_result.return_code}): "
-                f"{diag_result.output[:200]}"
+    else:
+        try:
+            diag_result = await session.execute(
+                COUNT_WARNINGS.format(run_name=run_name), timeout=30.0
             )
-        else:
-            errors, cw, w = parse_diag_counts(diag_result.output)
-            if errors < 0 or cw < 0:
-                # -1 哨兵 = runme.log 缺失或输出无 VMCP_DIAG 标记
+            if diag_result.is_error:
+                # 计数命令本身失败:不能把 -1 哨兵打成数字误导 AI,显式降级
                 result_parts.append(
-                    "\n[DEGRADED] 诊断计数不可用: "
-                    "runme.log 缺失或未匹配到 VMCP_DIAG 标记"
+                    f"\n[DEGRADED] 诊断计数不可用(rc={diag_result.return_code}): "
+                    f"{diag_result.output[:200]}"
                 )
             else:
-                if cw > 0:
-                    result_parts.insert(
-                        0,
-                        f"!! 发现 {cw} 条 CRITICAL WARNING !! "
-                        "建议立即运行 get_critical_warnings 查看分类详情和修复建议。",
+                errors, cw, w = parse_diag_counts(diag_result.output)
+                if errors < 0 or cw < 0:
+                    # -1 哨兵 = runme.log 缺失或输出无 VMCP_DIAG 标记
+                    result_parts.append(
+                        "\n[DEGRADED] 诊断计数不可用: "
+                        "runme.log 缺失或未匹配到 VMCP_DIAG 标记"
                     )
-                if errors > 0:
-                    result_parts.insert(
-                        0,
-                        f"!! 发现 {errors} 条 ERROR !! 请检查 runme.log 详情。",
+                else:
+                    if cw > 0:
+                        result_parts.insert(
+                            0,
+                            f"!! 发现 {cw} 条 CRITICAL WARNING !! "
+                            "建议立即运行 get_critical_warnings 查看分类详情和修复建议。",
+                        )
+                    if errors > 0:
+                        result_parts.insert(
+                            0,
+                            f"!! 发现 {errors} 条 ERROR !! 请检查 runme.log 详情。",
+                        )
+                    result_parts.append(
+                        f"\n诊断概览: errors={errors},"
+                        f" critical_warnings={cw}, warnings={w}"
                     )
-                result_parts.append(
-                    f"\n诊断概览: errors={errors},"
-                    f" critical_warnings={cw}, warnings={w}"
-                )
-    except Exception as e:
-        # 诊断失败不阻塞主流程，但要告诉用户原因（1.4 错误处理铁律）
-        result_parts.append(f"\n（诊断统计失败: {e}）")
+        except Exception as e:
+            # 诊断失败不阻塞主流程，但要告诉用户原因（1.4 错误处理铁律）
+            result_parts.append(f"\n（诊断统计失败: {e}）")
 
     return "\n".join(result_parts)
 
@@ -317,27 +447,36 @@ async def _launch_and_wait(
 #  工具定义
 # --------------------------------------------------------------------------- #
 
-@mcp.tool()
+@mcp.tool(annotations=PROJECT_WRITE)
 async def run_synthesis(
     run_name: str = "synth_1",
     jobs: int = 4,
+    max_threads: int = 0,
     timeout_minutes: int = 30,
+    wait_for_completion: bool = False,
+    post_check: str = "none",
     session_id: str = "default",
     ctx: Context = None,
-    wait: bool = True,
+    wait: bool | None = None,
 ) -> str:
-    """启动综合；默认等待完成，也可异步提交后查询状态。
+    """启动综合；不隐式 reset run，也不隐式打开综合设计。
 
     不调用 Tcl wait_on_run(会阻塞 Vivado event loop,GUI 模式冻住界面);
-    wait=True 时 Python 每 2 秒查一次状态并上报进度；wait=False 时立即
-    返回 job_id，随后用 get_run_progress 查询。
+    默认 ``wait_for_completion=False``，启动后立即返回，让用户在长编译期间
+    保持可见、可控；使用 ``get_run_progress`` 查询所有 run 状态。只有明确传入
+    ``wait_for_completion=True`` 才在本次 MCP 调用中轮询至终态。
 
     Args:
         run_name: 综合 run 名称，默认 "synth_1"。
-        jobs: 并行任务数，默认 4。
+        jobs: 同时调度的并行 run 槽位，默认 4；不是单个 run 的 CPU 线程数。
+        max_threads: 单个 run 请求使用的 CPU 线程上限，1..8；默认 0 继承当前
+            Vivado 设置。显式设置只影响本次 launch，随后恢复父 GUI 会话参数。
         timeout_minutes: 超时分钟数，默认 30。
+        wait_for_completion: 是否在本次调用中等待完成，默认 False。
+        post_check: 等待完成后的日志扫描策略：``none``(默认)、
+            ``on_failure`` 或 ``always``。启动即返回时不执行后置扫描。
         session_id: 目标会话 ID。
-        wait: True 等待完成并诊断；False 启动后立即返回 job_id。
+        wait: v0.3.25 兼容别名；显式传入时覆盖 wait_for_completion。
     """
     try:
         run_name = validate_identifier(run_name, "run_name")
@@ -348,32 +487,50 @@ async def run_synthesis(
     if not session:
         return _NO_SESSION.format(sid=session_id)
 
+    if wait is not None:
+        wait_for_completion = wait
+
+    decision = await _get_run_launch_decision(session, run_name)
+    if decision is not None:
+        return decision
+
     return await _launch_and_wait(
-        session, run_name, jobs, timeout_minutes, "综合", ctx, wait=wait
+        session, run_name, jobs, timeout_minutes, "综合", ctx,
+        wait_for_completion,
+        post_check,
+        True,
+        max_threads,
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=PROJECT_WRITE)
 async def run_implementation(
     run_name: str = "impl_1",
     jobs: int = 4,
+    max_threads: int = 0,
     timeout_minutes: int = 60,
+    wait_for_completion: bool = False,
+    post_check: str = "none",
     session_id: str = "default",
     ctx: Context = None,
-    wait: bool = True,
+    wait: bool | None = None,
 ) -> str:
-    """启动实现（布局布线）；默认等待完成，也可异步提交。
+    """启动实现（布局布线）；不隐式 reset run，也不隐式打开设计。
 
     不调用 Tcl wait_on_run(会阻塞 Vivado event loop,GUI 模式冻住界面);
-    wait=True 时 Python 每 2 秒查一次 STATUS/PROGRESS；wait=False 时立即
-    返回 job_id，随后用 get_run_progress 查询。
+    默认只启动后返回；只有 ``wait_for_completion=True`` 才在本次调用中轮询。
 
     Args:
         run_name: 实现 run 名称，默认 "impl_1"。
-        jobs: 并行任务数，默认 4。
+        jobs: 同时调度的并行 run 槽位，默认 4；不是单个 run 的 CPU 线程数。
+        max_threads: 单个 run 请求使用的 CPU 线程上限，1..8；默认 0 继承当前
+            Vivado 设置。显式设置只影响本次 launch，随后恢复父 GUI 会话参数。
         timeout_minutes: 超时分钟数，默认 60。
+        wait_for_completion: 是否在本次调用中等待完成，默认 False。
+        post_check: 等待完成后的日志扫描策略：``none``(默认)、
+            ``on_failure`` 或 ``always``。
         session_id: 目标会话 ID。
-        wait: True 等待完成并诊断；False 启动后立即返回 job_id。
+        wait: v0.3.25 兼容别名；显式传入时覆盖 wait_for_completion。
     """
     try:
         run_name = validate_identifier(run_name, "run_name")
@@ -384,30 +541,71 @@ async def run_implementation(
     if not session:
         return _NO_SESSION.format(sid=session_id)
 
+    if wait is not None:
+        wait_for_completion = wait
+
+    decision = await _get_run_launch_decision(session, run_name)
+    if decision is not None:
+        return decision
+
     return await _launch_and_wait(
-        session, run_name, jobs, timeout_minutes, "实现", ctx, wait=wait
+        session, run_name, jobs, timeout_minutes, "实现", ctx,
+        wait_for_completion,
+        post_check,
+        False,
+        max_threads,
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=PROJECT_WRITE)
+async def reset_project_run(
+    run_name: str,
+    session_id: str = "default",
+    ctx: Context = None,
+) -> str:
+    """显式重置一个 Vivado project run。
+
+    这是会删除该 run 既有综合/实现结果的破坏性操作，绝不由
+    ``run_synthesis``、``run_implementation`` 或 ``generate_bitstream`` 隐式调用。
+    """
+    try:
+        run_name = validate_identifier(run_name, "run_name")
+    except ValueError as exc:
+        return f"[ERROR] {exc}"
+
+    session = _require_session(ctx, session_id)
+    if not session:
+        return _NO_SESSION.format(sid=session_id)
+    return await _safe_execute(
+        session,
+        f"reset_runs {run_name}",
+        60.0,
+        "重置 project run 失败",
+    )
+
+
+@mcp.tool(annotations=PROJECT_WRITE)
 async def generate_bitstream(
     impl_run: str = "impl_1",
     jobs: int = 4,
     timeout_minutes: int = 30,
     force: bool = False,
+    wait_for_completion: bool = False,
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
     """生成比特流文件。在实现完成后执行。
 
     默认启用前置安全检查：检测 CRITICAL WARNING 后阻止生成，
-    需确认无风险后使用 force=True 跳过检查。
+    需确认无风险后使用 force=True 跳过检查。默认只启动后返回；显式
+    ``wait_for_completion=True`` 才在本次调用内低频轮询到完成。
 
     Args:
         impl_run: 实现 run 名称，默认 "impl_1"。
-        jobs: 并行任务数，默认 4。
+        jobs: 同时调度的并行 run 槽位，默认 4；不是单个 run 的 CPU 线程数。
         timeout_minutes: 超时分钟数，默认 30。
         force: 跳过 CRITICAL WARNING 安全检查，默认 False。
+        wait_for_completion: 是否等待 Bitstream 完成，默认 False。
         session_id: 目标会话 ID。
     """
     try:
@@ -420,9 +618,7 @@ async def generate_bitstream(
         return _NO_SESSION.format(sid=session_id)
 
     # 前置安全检查：force=False 时检测 CRITICAL WARNING。
-    # 检查本身失败时不拦截,但必须降级为显式 [DEGRADED](追加进最终返回),
-    # 不允许静默放行 —— 否则"未布线/日志不可读"这类信号会被吞掉。
-    precheck_warn = ""
+    # 安全门禁 fail-closed：无法证明 run 状态和 CW 数量时，不允许启动 bitstream。
     if not force:
         try:
             pre_result = await session.execute(
@@ -437,10 +633,9 @@ async def generate_bitstream(
                     if pre_result.is_error
                     else "输出未匹配到 VMCP_PRE_BIT 标记(run 不存在或日志不可读)"
                 )
-                logger.warning("bitstream 前置安全检查未能执行: %s", reason)
-                precheck_warn = (
-                    f"[DEGRADED] 前置 CW 安全检查未能执行: {reason}。"
-                    "本次生成未经 CRITICAL WARNING 门禁。"
+                return (
+                    f"[BLOCKED] 前置 CW 安全检查未能执行: {reason}。"
+                    "未启动 bitstream；请修复检查条件，或在人工核对后显式 force=True。"
                 )
             elif cw_count > 0:
                 lines = [
@@ -460,15 +655,13 @@ async def generate_bitstream(
                 )
                 return "\n".join(lines)
         except Exception as e:
-            # 安全检查本身失败不应阻塞——降级为跳过检查。但一定要告诉用户:
-            # 否则"未布线"这种致命信号会被静默吞,用户以为一切正常继续跑。
             logger.warning(
-                "bitstream 前置安全检查失败,降级跳过: %s: %s",
+                "bitstream 前置安全检查失败并阻止启动: %s: %s",
                 type(e).__name__, e,
             )
-            precheck_warn = (
-                f"[DEGRADED] 前置 CW 安全检查失败: {type(e).__name__}: {e}。"
-                "本次生成未经 CRITICAL WARNING 门禁。"
+            return (
+                f"[BLOCKED] 前置 CW 安全检查失败: {type(e).__name__}: {e}。"
+                "未启动 bitstream；请修复检查条件，或在人工核对后显式 force=True。"
             )
 
     # D5 架构同步到 bitstream:不再用 Tcl wait_on_run(阻塞 Vivado event loop,
@@ -487,10 +680,29 @@ async def generate_bitstream(
     except Exception as e:
         return f"[ERROR] 启动比特流生成失败: {e}"
 
+    if not wait_for_completion:
+        precheck = (
+            "前置 CW 安全检查: 已按 force=True 显式跳过。"
+            if force
+            else "前置 CW 安全检查: PASS。"
+        )
+        return (
+            f"[STARTED] 已启动 Bitstream: {impl_run} -> write_bitstream。\n"
+            f"{precheck}\n"
+            "未等待完成；请稍后用 get_run_progress(run_name='"
+            f"{impl_run}') 按需查询，不要高频轮询。"
+        )
+
     # 轮询(与 _launch_and_wait 共用 _poll_run_until_done,单一来源)
     try:
         outcome, final_status, final_progress, final_elapsed = (
-            await _poll_run_until_done(session, impl_run, timeout_sec, ctx)
+            await _poll_run_until_done(
+                session,
+                impl_run,
+                timeout_sec,
+                ctx,
+                expected_complete_step="write_bitstream",
+            )
         )
     except Exception as e:
         return f"[ERROR] 轮询比特流状态失败: {e}"
@@ -530,17 +742,16 @@ async def generate_bitstream(
         f"耗时: {final_elapsed}\n"
         f"比特流目录: {bit_dir}"
     )
-    if precheck_warn:
-        # 安全门检查失败时的显式降级标记:不拦截,但必须让 AI/用户看见
-        result_text += f"\n{precheck_warn}"
     return result_text
 
 
-@mcp.tool()
+@mcp.tool(annotations=HARDWARE_CHANGE)
 async def program_device(
     bitstream_path: str,
     target: str = "*",
+    hw_target_name: str = "",
     hw_server_url: str = "localhost:3121",
+    allow_remote_hw_server: bool = False,
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
@@ -563,8 +774,10 @@ async def program_device(
 
     Args:
         bitstream_path: 比特流文件路径（.bit 文件）。
-        target: 目标设备过滤器，默认 "*"（第一个可用设备）。
+        target: 精确设备对象名/NAME；默认 "*" 表示设备必须恰好只有一个。
+        hw_target_name: 可选的精确 hw_target 对象名/NAME；留空时必须恰好一个。
         hw_server_url: 硬件服务器地址，默认 "localhost:3121"。
+        allow_remote_hw_server: 是否明确允许远程 hw_server，默认 False。
         session_id: 目标会话 ID。
     """
     # 路径预检:避免半路 program_hw_devices 才报 "file not found",
@@ -593,10 +806,15 @@ async def program_device(
             "不允许空白/;/$/[]/{}/引号/反斜杠"
             "(如 '*' 或 'localhost:3121/xilinx_tcf/...')"
         )
-    if not hw_server_url or any(c in _TCL_UNSAFE or c == "*" for c in hw_server_url):
+    if not is_valid_hw_server_url(hw_server_url):
         return (
-            f"[ERROR] hw_server_url 为空或含非法字符: {hw_server_url!r}。"
-            "应形如 'localhost:3121' 或 '<主机名/IP>:<端口>'"
+            f"[ERROR] hw_server_url 格式非法: {hw_server_url!r}。"
+            "应形如 'localhost:3121'、'[::1]:3121' 或 '<主机名/IP>:<端口>'"
+        )
+    if not is_loopback_hw_server(hw_server_url) and not allow_remote_hw_server:
+        return (
+            f"[BLOCKED] 默认禁止远程 hw_server: {hw_server_url!r}。"
+            "请确认目标电脑、板卡和网络边界后显式设置 allow_remote_hw_server=True。"
         )
 
     session = _require_session(ctx, session_id)
@@ -604,13 +822,40 @@ async def program_device(
         return _NO_SESSION.format(sid=session_id)
 
     bit_tcl = to_tcl_path(bitstream_path)
+    server_tcl = tcl_quote(hw_server_url)
+    server_host, server_port = parse_hw_server_url(hw_server_url)
+    server_host_tcl = tcl_quote(server_host)
+    hw_target_tcl = tcl_quote(hw_target_name)
+    # Backward-compatible '*' no longer means "silently take index 0".  It
+    # means no selector was supplied, so the exact-selection helper requires
+    # the current hardware session to contain exactly one device.
+    device_tcl = tcl_quote("" if target == "*" else target)
 
     tcl = (
+        f'{select_exact_tcl_proc()}\n'
+        f'{select_hw_server_tcl_proc()}\n'
+        f'set __vmcp_server_url {server_tcl}\n'
+        f'set __vmcp_server_host {server_host_tcl}\n'
+        f'set __vmcp_server_port {server_port}\n'
+        f'set __vmcp_target_name {hw_target_tcl}\n'
+        f'set __vmcp_device_name {device_tcl}\n'
         f'open_hw_manager\n'
-        f'connect_hw_server -url {hw_server_url}\n'
-        f'open_hw_target [lindex [get_hw_targets {target}] 0]\n'
-        f'set dev [lindex [get_hw_devices] 0]\n'
+        f'set __vmcp_server [__vmcp_select_hw_server '
+        f'$__vmcp_server_url $__vmcp_server_host $__vmcp_server_port]\n'
+        f'set __vmcp_targets [get_hw_targets -quiet '
+        f'-of_objects $__vmcp_server]\n'
+        f'set __vmcp_target [__vmcp_select_exact $__vmcp_targets '
+        f'$__vmcp_target_name hw_target]\n'
+        f'if {{![get_property IS_OPENED $__vmcp_target]}} {{ '
+        f'open_hw_target $__vmcp_target }}\n'
+        f'set __vmcp_devs [get_hw_devices -quiet '
+        f'-of_objects $__vmcp_target]\n'
+        f'set dev [__vmcp_select_exact $__vmcp_devs '
+        f'$__vmcp_device_name hw_device]\n'
         f'current_hw_device $dev\n'
+        f'set probes [get_property PROBES.FILE $dev]\n'
+        f'if {{$probes ne "" && ![file isfile $probes]}} {{ '
+        f'set_property PROBES.FILE {{}} $dev; set_property FULL_PROBES.FILE {{}} $dev }}\n'
         f'set_property PROGRAM.FILE {bit_tcl} $dev\n'
         f'program_hw_devices $dev\n'
         f'puts "编程完成: $dev"'
