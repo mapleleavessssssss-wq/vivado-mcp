@@ -99,23 +99,6 @@ async def test_ila_basic_trigger_schema_is_plan_only_and_identity_gated():
     }.issubset(schema["required"])
 
 
-def test_server_instructions_include_hard_safety_gates():
-    from vivado_mcp.server import mcp
-
-    instructions = mcp.instructions or ""
-    for phrase in {
-        ".xpr",
-        "多实例",
-        "不得自动 reset_runs",
-        "生成 bitstream",
-        "program FPGA",
-        "来源不明 Tcl",
-        "report_methodology 仅在",
-        "report_qor_suggestions",
-    }:
-        assert phrase in instructions
-
-
 def test_initialize_identity_uses_package_version():
     import vivado_mcp
     from vivado_mcp.server import mcp

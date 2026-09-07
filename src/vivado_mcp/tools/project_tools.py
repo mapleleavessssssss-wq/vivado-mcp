@@ -87,8 +87,8 @@ async def sync_project_files(
     ``apply=True`` 才执行 ``add_files``，并对 ``sources_1``/``sim_1`` 调用
     ``update_compile_order``，当前 GUI 的 Sources/Hierarchy 会立即更新。
 
-    这是工程状态写操作。调用 ``apply=True`` 前必须向用户报告并确认目标工程
-    身份，且获得明确批准。
+    这是工程状态写操作。调用 ``apply=True`` 前核对目标工程身份与已有写入授权；
+    同一具名工程和文件范围已经获准时不重复确认，范围变化时再取得相应授权。
 
     Args:
         file_paths: 本次明确要同步的文件绝对路径；不递归扫描目录。

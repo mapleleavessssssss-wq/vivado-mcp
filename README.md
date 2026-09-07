@@ -407,12 +407,15 @@ get_run_progress(run_name="synth_1", session_id="default")
 ## 可选:Claude Code Hook 配置示例
 
 > **注意**:`.claude/` 目录不随仓库 / PyPI 包分发,下面是一份**可选**的 hook 配置示例,
-> 复制到你自己项目的 `.claude/settings.json` 即可启用。hook 里 import 的
-> `vivado_mcp.analysis` 模块随 `pip install vivado-mcp` 一起装好,无需额外脚本。
+> 只有明确需要事件级自动检查时，才选择所需项放到项目的 `.claude/settings.json`。
+> 当前 Codex 工作流默认不安装这些 hook。执行 hook 的 `python` 必须来自已安装
+> `vivado_mcp` 的环境；不同解释器不共享包，必要时用该虚拟环境的完整 Python 路径。
 > 所有 hook 命令均为**单行** `python -c`(分号串联)——Windows cmd 与 bash 下都能直接执行,
 > 多行 `python -c` 在 cmd 下会 SyntaxError 静默失效,自行改写时请保持单行。
 
-配好后 AI 不只会"被动应答",还能**主动守门**:
+这些示例会增加自动检查或确认次数。已有任务授权和 MCP 内部时序门禁足够时，不叠加
+`bitstream-guard`。单文件 XDC/RTL 提示可能缺少其它约束文件或依赖，不能直接当作整个工程
+FAIL，也不能据此扩大成完整签收或无关重构。按实际工作流选择：
 
 | Hook | 触发事件 | 作用 |
 |---|---|---|

@@ -16,8 +16,10 @@
 """
 
 import json
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -54,6 +56,10 @@ def _run_hook(command: str, stdin_payload: dict, cwd: Path | None = None):
         input=json.dumps(stdin_payload).encode("utf-8"),
         capture_output=True,
         cwd=cwd,
+        env={
+            **os.environ,
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+        },
         timeout=60,
     )
 

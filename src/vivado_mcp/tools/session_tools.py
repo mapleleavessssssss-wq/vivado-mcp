@@ -291,7 +291,9 @@ async def get_vivado_capabilities(
     ``info commands``，不会执行被检查的命令，也不会打开或修改工程。
 
     ``gate`` 含义：全部存在为 ``PASS``；任一不存在为 ``FAIL``；探测输出不完整
-    为 ``UNKNOWN``。调用版本敏感的 Vivado Tcl 前，应先让本工具通过。
+    为 ``UNKNOWN``。为具体动作预检时，``commands`` 只传该动作需要的命令；
+    默认完整矩阵用于环境盘点，其中无关功能缺失不阻塞当前任务。
+    同一版本/会话的有效结果可复用；仅当前所需命令不可用或未知时停止该动作。
     """
     manager = _get_manager(ctx)
     session = manager.get(session_id)

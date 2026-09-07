@@ -94,7 +94,7 @@ def fpga_workflow() -> str:
         steps=(
             "Baseline：再次调用 `get_project_info` 与 `get_compile_profile`，一次记录 run freshness、策略、线程、已有报告/checkpoint 和 timing stats。先解决缺源文件、错误 top、失效 IP 和约束语法问题，不把所有报告串成固定检查。",
             "Synthesis：只有 run 为 `Not started` 才调用 `run_synthesis`；默认异步返回 job id，以 `get_run_progress` 低频确认完成。完成后优先复用生成的 utilization/timing 报告，仅作早期指标。过期或失败 run 不自动 reset。",
-            "Implementation：综合门禁通过后调用 `run_implementation`，同样默认异步并低频查询。增量模式先用 `configure_incremental_compile(apply=False)` 评估，只有工程身份和复用条件明确时才单独审批 apply。",
+            "Implementation：综合门禁通过后调用 `run_implementation`，同样默认异步并低频查询。增量模式先用 `configure_incremental_compile(apply=False)` 评估，核对工程身份、复用条件与已有授权后执行 apply；同一范围不重复确认。",
             "Signoff：在 post-route run 上读取已有 `get_timing_report`、`get_critical_warnings` 和 DRC。`report_methodology` 只在首次综合或重要模块/XDC/clock 变化后运行；QoR Suggestions 仅在 fully routed 且 baseline strategy 适用时使用。post-synth WNS 不能替代 post-route 结论。",
             "Bitstream：先调用 `check_bitstream_readiness`；只有 readiness 与 signoff 证据一致时才调用 `generate_bitstream`。用 `parse_bit_header` 可核对产物头；只有用户明确要求且目标设备已确认时才 `program_device`。",
             "Reproducibility：需要入库时，用 `run_tcl` 执行 `write_project_tcl -force -no_copy_sources -paths_relative_to ...`；报告哪些 XCI、BD wrapper 和外部文件仍需纳入重建验证。",
@@ -268,7 +268,7 @@ def ila_hardware_debug() -> str:
             "Probe plan：选择能区分假设的最小信号集，记录宽度、时钟域、触发表达式、depth 和采样时钟。跨域信号应在各自时钟域观察，不让 ILA 采样掩盖 CDC。",
             "Build impact：通过 `run_tcl` 检查/创建 debug core 和连接，仅按已批准计划修改；重新综合/实现后调用 `get_utilization_report` 与 `get_timing_report`，确认 ILA 未造成新的拥塞或违例。",
             "Artifact gate：调用 `check_bitstream_readiness` 后才 `generate_bitstream`。分别用 `parse_bit_header` 和 `parse_ltx` 核对器件、时间/来源及 probe，固定记录 bit/ltx/commit 三元组；任何一项不匹配即 BLOCKED。",
-            "Program gate：列出目标 hardware server/device 与 DNA/part 等可核对信息；用户明确确认后才调用 `program_device`。不得仅按列表第一个 target 编程。",
+            "Program gate：核对目标 hardware server/device、DNA/part 与明确的设备/产物编程授权；已授权序列不逐步重问，目标或范围不清时补充确认。不得仅按列表第一个 target 编程。",
             "Capture：标准 basic trigger 先调用 `configure_hw_ila_basic_trigger(apply=False)` 完成 bit/LTX、device/ILA/probe、位宽和属性门禁，再经批准以 `apply=True` 配置；随后调用 `capture_hw_ila_to_csv(trigger_now=False)` arm/wait/upload。只有专用工具无法表达的 advanced trigger 才使用 `run_tcl`，并先读取运行时 property。每次采集记录触发配置、采样时钟、depth、bit/ltx 标识与环境条件。",
             "Re-measure：根据一次采集只更新一个假设或探针计划。若两轮采集均不能区分假设，停止并说明缺少的可观测性，而不是不断扩大 probe 集。",
         ),

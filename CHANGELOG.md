@@ -2,6 +2,12 @@
 
 ## [未发布]
 
+### 任务授权与文档入口
+
+- 公共说明、Prompt 和工程文件同步说明沿用已明确的授权，相关能力查询复用当前版本/会话证据。
+- 将自动 hook 明确为按需示例，避免重复确认与单文件启发式检查扩大为工程失败。
+- README hook 测试继承测试解释器的环境，修正虚拟环境安装包与全局 Python 不一致导致的失败。
+
 ### 多版本、GUI 生命周期与安全门禁
 
 - `start_session` 新增 GUI/Tcl/attach `project_path` 与 `require_ip_integrator`：准确 XPR

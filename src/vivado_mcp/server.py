@@ -91,21 +91,16 @@ mcp = MCPServer(
     "vivado-mcp",
     version=__version__,
     instructions=(
-        "仅用于 FPGA、RTL、Vivado 与 AMD/Xilinx 任务。任何写入或状态变化前，"
-        "必须报告并核对完整 .xpr、project、part、top、Vivado version、session。"
-        "多实例或身份不一致时停止。不得自动 reset_runs、覆盖 XDC、升级 IP、"
-        "修改 Block Design、生成 bitstream、program FPGA、写 Flash 或执行来源不明 Tcl。"
-        "综合成功不代表实现/时序通过，bitstream 成功不授权烧录。硬件、网络、"
-        "run_tcl/safe_tcl 及副作用不明操作始终需要用户确认。本 server 只控制 "
-        "Vivado，不把 Vitis/SDK/XSCT/XSDB 命令交给 Vivado run_tcl。调用版本敏感的 "
-        "Vivado 前必须使用 vendor bin/vivado.bat 或 bin/vivado，禁止直接启动 "
-        "bin/unwrapped 下的内部 executable。"
-        "Vivado Tcl 前先用 get_vivado_capabilities；gate=FAIL/UNKNOWN 时停止。"
-        "默认采用快速证据路径：同一 run/设计状态不重复报告；综合、实现和 Bitstream "
-        "启动后按需低频查进度；成功路径不自动扫描完整日志。只有失败、明确诊断或 "
-        "signoff 才展开 warning、Top10 path、methodology/DRC 等深度检查。"
-        "report_methodology 仅在首次综合或重要模块/XDC/clock 变化后重跑；"
-        "report_qor_suggestions 还必须核对 fully routed、器件族和 baseline strategy。"
+        "控制 Vivado 工程、构建与 Hardware Manager；SDK/Vitis 软件任务使用 vitis-mcp。"
+        "写入前核对当前 session、version、project/part/top；项目模式用完整 .xpr，"
+        "非项目模式核对实际设计。多个实例须明确选定目标，不因实例数量本身停工。"
+        "沿用已有任务授权完成必要本地构建与已审阅 Tcl；reset_runs、覆盖 XDC、升级 IP、"
+        "Block Design、bitstream、硬件/网络操作须在已授权范围内。烧录/Flash 须有明确"
+        "设备与产物授权；bitstream 生成不授权烧录。目标不明、范围外或副作用未知时先消歧。"
+        "仅用 vendor bin/vivado.bat 或 bin/vivado 启动；禁止直接启动 bin/unwrapped。"
+        "版本敏感 Tcl 先核对 get_vivado_capabilities，同一版本/会话复用有效结果；"
+        "相关 gate=FAIL/UNKNOWN 时停止该动作。复用未失效报告，按需低频查进度；"
+        "失败、诊断或签收时展开深度检查。综合、实现/时序、bitstream 与上板证据分别报告。"
     ),
     lifespan=app_lifespan,
 )
