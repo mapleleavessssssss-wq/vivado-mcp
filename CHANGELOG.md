@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### GUI 启动诊断
+
+- 从 [PR #5](https://github.com/mapleleavessssssss-wq/vivado-mcp/pull/5)
+  （[@lingshuncangqiong](https://github.com/lingshuncangqiong)）独立采用 GUI
+  启动日志增强：分别保存 Vivado 日志与启动器 stdout/stderr，启动失败、提前退出
+  或连接超时时返回日志路径、文件状态及有界尾部，方便定位 [Issue #6](https://github.com/mapleleavessssssss-wq/vivado-mcp/issues/6)。
+- 日志默认保存在系统临时目录的 `vivado-mcp/logs` 下，可用
+  `VIVADO_MCP_LOG_DIR` 指定目录；成功启动后可从会话状态查看路径。
+  日志读取失败保留原始启动错误，attach 到已有 GUI 时不创建启动日志。
+- 本次仅增强诊断，保留现有启动器、端口、握手与进程管理行为；尚未确认
+  Vivado 2018.3 / Python 3.13 / Windows 11 报告环境中的启动失败根因。
+
 ## [0.3.25] — 2026-08-09
 
 > 本版基于同类 Vivado MCP 的协议、工作流和安装体验调研，吸收有效模式，
