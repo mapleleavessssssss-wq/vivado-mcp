@@ -118,6 +118,18 @@ VIVADO_PATH = "D:/Xilinx/Vivado/2019.1/bin/vivado.bat"
 
 AI 应依次调用 `start_session(mode="gui")` 和 `run_tcl("version -short")`。成功时 Vivado GUI 会启动（已有注入服务则直接 attach），并返回版本号。失败时直接运行 `vivado-mcp doctor`，无需逐项猜配置。
 
+若 MCP 启动 GUI 时出现“进程提前退出”或连接超时，先查看错误中列出的
+**Vivado 启动日志**和 **Launcher 日志**。启动器的错误可能发生在 Vivado
+日志创建之前，因此两份都需要检查。日志默认位于系统临时目录的
+`vivado-mcp/logs`，可用 `VIVADO_MCP_LOG_DIR` 指定目录；成功后也可从
+`list_sessions` 的 `startup_log` / `launcher_log` 字段找到路径。
+这些文件会继续记录该 GUI 进程的输出，关闭会话后保留，便于后续诊断。
+
+如果手动打开同一 Vivado 能正常工作，可先完成上述 `install` 注入，再手动启动
+GUI，使用 `start_session(mode="attach", port=9999)` 连接；安装时使用自定义
+端口的，填写该端口。attach 不会新建 GUI 或本次启动日志。提交问题时请附上
+版本、手动启动对照结果和相关错误片段，单独一个退出码不足以确定原因。
+
 <details>
 <summary>从源码安装（开发/贡献）</summary>
 

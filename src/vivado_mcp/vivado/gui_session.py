@@ -15,18 +15,22 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import codecs
 import importlib.resources
 import json
 import logging
 import os
+import re
 import socket
+import tempfile
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from vivado_mcp.tcl_scripts import QUERY_CURRENT_PROJECT
 from vivado_mcp.vivado.base_session import BaseSession, SessionState
-from vivado_mcp.vivado.tcl_utils import TclResult, clean_output
+from vivado_mcp.vivado.tcl_utils import TclResult, clean_output, decode_vivado_output
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +55,67 @@ _PENDING_SPAWN_PORTS: set[int] = set()
 
 # current_project 一次性查询(PRD A2)的独立短连接超时。模块级常量便于测试覆盖。
 _CURPROJ_TIMEOUT = 5.0
+
+
+def _new_startup_log_path(session_id: str) -> Path:
+    """生成独立诊断目录中的唯一日志路径；目录由启动方创建。"""
+    root = Path(
+        os.environ.get(
+            "VIVADO_MCP_LOG_DIR",
+            str(Path(tempfile.gettempdir()) / "vivado-mcp" / "logs"),
+        )
+    ).expanduser().resolve()
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)[:64] or "session"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return root / f"vivado_{safe_id}_{stamp}_{uuid.uuid4().hex}.log"
+
+
+def _tail_text_file(path: Path | None, max_chars: int = 4000) -> str:
+    """只读取有界日志尾部；读取失败不覆盖原始启动错误。"""
+    if path is None or max_chars <= 0:
+        return ""
+    max_bytes = max_chars * 4
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            offset = max(0, size - max_bytes)
+            handle.seek(offset)
+            raw = handle.read(min(size, max_bytes))
+    except FileNotFoundError:
+        # Vivado 尚未进入日志初始化阶段时，这是正常诊断信息。
+        return ""
+    except OSError as exc:
+        logger.warning("读取启动日志 %s 失败，保留原始启动错误: %s", path, exc)
+        return ""
+
+    # 尾部窗口可能从半个多字节字符开始，文件末尾也可能仍在写入。
+    # 先对齐编码边界，避免有效 UTF-8 因截断而整段误走系统 ANSI 回退。
+    encodings = ("utf-8", "mbcs") if os.name == "nt" else ("utf-8",)
+    for encoding in encodings:
+        for skip in range(min(4, len(raw)) if offset else 1):
+            decoder = codecs.getincrementaldecoder(encoding)()
+            try:
+                decoder.decode(raw[skip:], final=False)
+            except UnicodeDecodeError:
+                continue
+            pending, _ = decoder.getstate()
+            aligned = raw[skip:len(raw) - len(pending)]
+            return decode_vivado_output(aligned)[-max_chars:].strip()
+    return decode_vivado_output(raw)[-max_chars:].strip()
+
+
+def _describe_text_file(path: Path | None) -> str:
+    """同时报告日志路径和状态，明确区分未创建与无法读取。"""
+    if path is None:
+        return "<未分配>"
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return f"{path} (NOT_CREATED，尚未创建)"
+    except OSError as exc:
+        logger.warning("检查启动日志 %s 失败: %s", path, exc)
+        return f"{path} (状态读取失败: {exc})"
+    return f"{path} (已存在，{size} 字节)"
 
 
 def _make_probe_payload() -> tuple[str, bytes]:
@@ -277,6 +342,8 @@ class GuiSession(BaseSession):
         # list_sessions 探活守卫据此跳过 fresh probe:Vivado 单线程 event loop
         # 正在跑已超时的长命令时,新连接得不到服务,1s 探活必然落空 ≠ 挂死。
         self._pending_response: bool = False
+        self._startup_log_path: Path | None = None
+        self._launcher_log_path: Path | None = None
 
     @property
     def mode(self) -> str:
@@ -306,7 +373,25 @@ class GuiSession(BaseSession):
         d = super().status_dict()
         if self._pid is not None:
             d["pid"] = self._pid
+        if self._startup_log_path is not None:
+            d["startup_log"] = str(self._startup_log_path)
+        if self._launcher_log_path is not None:
+            d["launcher_log"] = str(self._launcher_log_path)
         return d
+
+    def _startup_diagnostics(self) -> str:
+        """失败消息共用双日志诊断，不向正常状态列表填入日志正文。"""
+        details = (
+            f"\n启动日志: {_describe_text_file(self._startup_log_path)}"
+            f"\n启动器日志: {_describe_text_file(self._launcher_log_path)}"
+        )
+        log_tail = _tail_text_file(self._startup_log_path)
+        launcher_tail = _tail_text_file(self._launcher_log_path)
+        if log_tail:
+            details += f"\n启动日志尾部:\n{log_tail}"
+        if launcher_tail:
+            details += f"\n启动器日志尾部:\n{launcher_tail}"
+        return details
 
     @staticmethod
     def _alloc_free_port() -> int:
@@ -376,6 +461,9 @@ class GuiSession(BaseSession):
         if self.is_alive:
             return f"会话 '{self.session_id}' 已在运行中。"
 
+        # 同一对象停用后可重新启动；转为 attach 时不应沿用上次 spawn 的日志。
+        self._startup_log_path = None
+        self._launcher_log_path = None
         self._closing = False
         self._state = SessionState.STARTING
         logger.info(
@@ -429,10 +517,14 @@ class GuiSession(BaseSession):
                 raise RuntimeError(str(e)) from e
 
             try:
+                self._startup_log_path = _new_startup_log_path(self.session_id)
+                self._launcher_log_path = self._startup_log_path.with_suffix(
+                    ".launcher.log"
+                )
+                self._startup_log_path.parent.mkdir(parents=True, exist_ok=True)
                 # 关键：-source 临时注入 tcl server（即使用户没跑 install 也能工作）
                 # 注入 VMCP_PORT_PREF = 确切端口,tcl server 绑这个端口否则退出
                 # (不再池滑动 → 杜绝新 vivado 监听在没人连的端口=孤儿)
-                import tempfile
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".tcl", delete=False, encoding="utf-8"
                 ) as tmp:
@@ -443,15 +535,19 @@ class GuiSession(BaseSession):
                 # atexit 兜底:MCP 进程被强杀时仍会清理
                 _TMP_SCRIPTS.add(tmp_script)
 
-                self._proc = await asyncio.create_subprocess_exec(
-                    self.vivado_path,
-                    "-mode", "gui",
-                    "-source", tmp_script,
-                    "-nojournal", "-nolog",
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
+                # Vivado 自身的 -log 仅在可执行程序启动后生效；另存启动器
+                # stdout/stderr，保留 .bat / loader 提前失败时的错误。
+                # 父进程句柄在启动成功、异常或取消时均关闭，子进程持有自己的副本。
+                with self._launcher_log_path.open("xb", buffering=0) as launcher_log:
+                    self._proc = await asyncio.create_subprocess_exec(
+                        self.vivado_path,
+                        "-mode", "gui",
+                        "-source", tmp_script,
+                        "-nojournal", "-log", str(self._startup_log_path),
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=launcher_log,
+                        stderr=asyncio.subprocess.STDOUT,
+                    )
                 # 记下 pid:stop() 在 self._proc 引用因故丢失时仍能按 pid 精杀
                 self._pid = self._proc.pid
                 logger.info(
@@ -460,7 +556,9 @@ class GuiSession(BaseSession):
                 )
             except (OSError, FileNotFoundError) as e:
                 self._state = SessionState.ERROR
-                raise RuntimeError(f"启动 Vivado GUI 失败: {e}") from e
+                raise RuntimeError(
+                    f"启动 Vivado GUI 失败: {e}" + self._startup_diagnostics()
+                ) from e
 
         # ---- 2. 只连那一个确切端口,轮询直到新 vivado 起完 ----
         # 不再扫端口池:连别人的端口正是 0.3.19 串台的根因。
@@ -522,6 +620,7 @@ class GuiSession(BaseSession):
                     raise RuntimeError(
                         f"Vivado GUI 进程提前退出 "
                         f"(returncode={self._proc.returncode})"
+                        + self._startup_diagnostics()
                     )
                 await asyncio.sleep(2.0)
 
@@ -532,6 +631,7 @@ class GuiSession(BaseSession):
             raise RuntimeError(
                 f"连接 Vivado GUI 超时（{timeout}s，确切端口 {target_port}）。"
                 f"该端口可能被其他进程抢占,请重试。最后一次错误: {connect_err}"
+                + self._startup_diagnostics()
             )
         finally:
             if spawned:
