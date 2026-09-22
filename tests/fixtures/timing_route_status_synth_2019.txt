@@ -1,0 +1,9 @@
+Design Route Status
+                                               :      # nets :
+   ------------------------------------------- : ----------- :
+   # of logical nets.......................... :          37 :
+       # of nets with no placed pins.......... :          37 :
+       # of nets not needing routing.......... :           0 :
+       # of routable nets..................... :           0 :
+       # of nets with routing errors.......... :           0 :
+   ------------------------------------------- : ----------- :

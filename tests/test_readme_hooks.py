@@ -16,8 +16,10 @@
 """
 
 import json
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -48,12 +50,17 @@ def _all_hook_commands(snippet: dict) -> dict[str, str]:
 def _run_hook(command: str, stdin_payload: dict, cwd: Path | None = None):
     """用 shell=True 模拟 hook 实际执行环境(Windows 下即 cmd /c <command>,
     正是审计 P2 多行 python -c 失效的那个语境)。"""
+    # hook 示例的 python 必须来自安装了本项目的测试环境。Windows 下其它
+    # 测试恢复 os.environ 后可能改变原生 PATH，不能误跑系统 Python。
+    env = os.environ.copy()
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     return subprocess.run(
         command,
         shell=True,
         input=json.dumps(stdin_payload).encode("utf-8"),
         capture_output=True,
         cwd=cwd,
+        env=env,
         timeout=60,
     )
 

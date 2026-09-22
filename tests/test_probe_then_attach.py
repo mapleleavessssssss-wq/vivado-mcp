@@ -986,9 +986,9 @@ class TestListSessionsLivenessProbe:
     ):
         """上一条命令超时但仍在跑(_pending_response=True)→ 跳过探活。
 
-        run_tcl 超时后 _HINT_TIMEOUT 已告诉 AI「等它完成」;此窗口 Vivado
-        event loop 被占,1s 探测必然落空,若再标 unresponsive 就和 hint
-        自相矛盾、诱导 AI 杀健康长任务(审计 P1)。
+        run_tcl 等待响应超时不代表命令已停止;此窗口 Vivado
+        event loop 被占,1s 探测必然落空,此时标记 unresponsive 会将
+        正常长任务误判为无响应(审计 P1)。
         """
         port, listener = _serve_silent_listener()
         try:

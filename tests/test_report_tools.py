@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -58,6 +59,134 @@ _PROJ_INFO = (
     "VMCP_PROJ:synth_status=synth_design Complete!\n"
     "VMCP_PROJ:impl_status=route_design Complete!\n"
 )
+
+_FULL_TIMING = """Design : top
+Device : xc7a35tcpg236-1
+Design State : Fully Routed
+| Design Timing Summary
+WNS(ns) TNS(ns) TNS Failing Endpoints TNS Total Endpoints WHS(ns) THS(ns) THS Failing Endpoints THS Total Endpoints WPWS(ns) TPWS(ns) TPWS Failing Endpoints TPWS Total Endpoints
+-------
+0.1 0 0 150 0.1 0 0 150 0.2 0 0 2
+"""  # noqa: E501
+
+
+class TestTimingEvidenceTools:
+    @pytest.mark.asyncio
+    async def test_offline_and_saved_baseline_need_no_session_or_writes(self, tmp_path):
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        path = tmp_path / "report.rpt"
+        path.write_text(_FULL_TIMING, encoding="utf-8")
+        with patch("vivado_mcp.tools.report_tools._require_session") as require:
+            first = await get_timing_report(output_format="json", report_file=str(path))
+            baseline = tmp_path / "before.json"
+            baseline.write_text(first, encoding="utf-8")
+            before_files = set(tmp_path.iterdir())
+            second = json.loads(await get_timing_report(
+                output_format="json", report_file=str(path), baseline_file=str(baseline),
+            ))
+        require.assert_not_called()
+        assert set(tmp_path.iterdir()) == before_files
+        assert second["comparison"]["status"] == "observational"
+        assert second["comparison"]["authoritative"] is False
+        assert second["provenance"]["source"] == "report_file"
+
+    @pytest.mark.asyncio
+    async def test_missing_baseline_does_not_overwrite_main_verdict(self, tmp_path):
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        path = tmp_path / "report.rpt"
+        path.write_text(_FULL_TIMING, encoding="utf-8")
+        data = json.loads(await get_timing_report(
+            output_format="json", report_file=str(path), baseline_file=str(tmp_path / "absent"),
+        ))
+        assert data["verdict"]["status"] == "met_observed_checks"
+        assert data["comparison"]["status"] == "error"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["bad\x00path.rpt", "missing.rpt"])
+    async def test_bad_file_paths_are_json_errors(self, path):
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        data = json.loads(await get_timing_report(output_format="json", report_file=path))
+        assert data["parse_status"] == "error"
+        assert data["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_session_is_json_and_positional_context_remains_compatible(self):
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        ctx = _mock_context()
+        with patch("vivado_mcp.tools.report_tools._require_session", return_value=None) as require:
+            data = json.loads(await get_timing_report("named", ctx, output_format="json"))
+        require.assert_called_once_with(ctx, "named")
+        assert data["parse_status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_live_command_failure_is_json(self):
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        session = AsyncMock()
+        session.execute.side_effect = [
+            _make_tcl_result(_STAGE_POST_ROUTE), _make_tcl_result("failed", 1),
+        ]
+        with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
+            data = json.loads(await get_timing_report(ctx=_mock_context(), output_format="json"))
+        assert data["parse_status"] == "error"
+        assert "rc=1" in data["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("row", [
+        "0.1 1 0 150 0.1 0 0 150 0.2 0 0 2",
+        "0.1 0 0 150 0.1 0 0 150 -0.2 NA 1 2",
+    ])
+    async def test_text_cannot_say_pass_when_evidence_does_not(self, tmp_path, row):
+        from vivado_mcp.tools.report_tools import get_timing_report
+
+        path = tmp_path / "report.rpt"
+        path.write_text(_FULL_TIMING.replace("0.1 0 0 150 0.1 0 0 150 0.2 0 0 2", row))
+        text = await get_timing_report(report_file=str(path))
+        assert "PASS" not in text
+
+
+class TestReadinessEvidence:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pre,report,ready", [
+        ("route_design Complete!,critical_warnings=0\nVMCP_PRE_BIT_TOP:top", _FULL_TIMING, True),
+        ("route_design Complete!,critical_warnings=-1\nVMCP_PRE_BIT_TOP:top", _FULL_TIMING, False),
+        ("UNKNOWN,critical_warnings=0", _FULL_TIMING, False),
+        ("write_bitstream Running,critical_warnings=0", _FULL_TIMING, False),
+        ("write_bitstream ERROR,critical_warnings=0", _FULL_TIMING, False),
+        ("route_design Complete!,critical_warnings=0\nVMCP_PRE_BIT_TOP:other", _FULL_TIMING, False),
+        ("route_design Complete!,critical_warnings=0\nVMCP_PRE_BIT_TOP:top",
+         _FULL_TIMING.replace("Fully Routed", "Synthesized"), False),
+        ("route_design Complete!,critical_warnings=0\nVMCP_PRE_BIT_TOP:top",
+         _FULL_TIMING.replace("0.1 0 0 150 0.1 0 0 150 0.2 0 0 2", "0 0 0 0 0 0 0 0"), False),
+    ])
+    async def test_only_complete_matched_evidence_can_be_ready(self, pre, report, ready):
+        from vivado_mcp.tools.report_tools import check_bitstream_readiness
+
+        session = AsyncMock()
+        session.execute.side_effect = [
+            _make_tcl_result("VMCP_PRE_BIT:status=" + pre), _make_tcl_result(report),
+        ]
+        with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
+            result = await check_bitstream_readiness(ctx=_mock_context())
+        assert ("READY" in result) is ready
+
+    @pytest.mark.asyncio
+    async def test_preflight_command_error_cannot_use_success_looking_payload(self):
+        from vivado_mcp.tools.report_tools import check_bitstream_readiness
+
+        session = AsyncMock()
+        session.execute.return_value = _make_tcl_result(
+            "VMCP_PRE_BIT:status=route_design Complete!,critical_warnings=0", 1,
+        )
+        with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
+            result = await check_bitstream_readiness(ctx=_mock_context())
+        assert "READY" not in result
+        assert "rc=1" in result
+        assert session.execute.await_count == 1
 
 
 # ====================================================================== #
@@ -246,8 +375,8 @@ class TestCheckBitstreamReadinessNa:
         assert "rc=1" in result  # 具体原因可见
 
     @pytest.mark.asyncio
-    async def test_ok_timing_stays_ready(self):
-        """positive 对照:正常 PASS 时序 + route 完成 + 0 CW → READY。"""
+    async def test_run_complete_without_report_stage_is_not_ready(self):
+        """run 完成不能替代报告阶段与 pulse-width 证据。"""
         from vivado_mcp.tools.report_tools import check_bitstream_readiness
 
         session = AsyncMock()
@@ -260,7 +389,9 @@ class TestCheckBitstreamReadinessNa:
         with patch("vivado_mcp.tools.report_tools._require_session", return_value=session):
             result = await check_bitstream_readiness(ctx=_mock_context())
 
-        assert "READY" in result
+        assert "READY" not in result
+        assert "unknown" in result
+        assert "[DEGRADED]" in result
 
 
 # ====================================================================== #

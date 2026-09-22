@@ -2,12 +2,14 @@
 # ruff: noqa: E501
 """面向 AI 客户端的紧凑 FPGA 工作流 Prompt。
 
-公共规则由 :func:`_workflow_prompt` 统一生成，领域 Prompt 只描述各自的证据、
-分类、动作和通过条件。这样既保持每个 Prompt 可独立使用，又避免复制安全规则。
+五个可分发工作流直接读取 Skill 正文，避免两份内容漂移。
+其余领域 Prompt 通过 :func:`_workflow_prompt` 共享证据闭环与适用规则。
 """
 
 from collections.abc import Callable, Sequence
 from typing import Protocol
+
+from vivado_mcp.workflows import read_workflow
 
 
 class _PromptDecorator(Protocol):
@@ -22,11 +24,11 @@ class _PromptRegistrar(Protocol):
     def prompt(self) -> _PromptDecorator: ...
 
 _COMMON_SAFETY = """## 闭环与安全栏
-1. **Fresh evidence**：只使用本轮从当前 session/工程取得的报告作为基线；旧日志、截图和经验只能作为线索，不能代替测量。
-2. **最小改动**：按证据分类，一次只改一类问题，记录改动及理由，再用与基线相同的命令复测。未经用户确认，不做 RTL 架构、板级引脚或硬件连接的实质变更。
-3. **禁止假绿**：不得通过删除或降级约束、`set_false_path`、multicycle、waiver、关闭 DRC、删除 assertion，或缩短测试到未覆盖目标场景来制造通过。只有功能意图和独立证据证明例外成立时，才提出约束例外并交由用户决定。
+1. **Fresh evidence**：现场结论使用当前 session/工程的新报告；离线分析记录输入文件来源、阶段和覆盖范围，不能把历史数据当作当前实现。截图和经验不能代替测量。
+2. **最小改动**：按证据分类，一次只改一类问题，记录改动及理由，再以同条件复测。已授权范围内的常规修复继续完成；改变接口、目标频率、板级接线或编程硬件需相应明确授权。
+3. **禁止假绿**：不得通过删除或降级约束、`set_false_path`、multicycle、waiver、关闭 DRC、删除 assertion，或缩短测试到未覆盖目标场景来制造通过。约束例外须有功能意图与独立证据；沿用已有授权，新增功能假设或扩大影响范围时才请求用户决定。
 4. **证据门禁**：命令返回成功不等于任务通过；必须满足本 Prompt 的通过条件。报告过期、阶段错误、对象为空或结果无法归属当前工程时，结论一律为未验证。
-5. **停止条件**：达到通过条件即停止；缺前置输入、需要高风险决定、发现相邻领域根因，或连续两轮改动没有净改善时也停止，不继续盲试。停止时保留当前 session，不擅自操作其他 session/job/process。
+5. **停止条件**：达到通过条件即停止；缺输入或需要范围外决定时仅暂停依赖步骤，继续独立分析。发现相邻领域根因时转入对应调查；连续两轮改动没有净改善时停止盲试并重新归因。保留当前 session，不擅自操作其他 session/job/process。
 
 ## 固定输出
 按以下字段交付，不省略失败项：`范围与前置条件`、`新鲜基线`、`问题分类与证据`、`已做变更`、`同指标复测`、`最终状态(PASS/FAIL/BLOCKED)`、`未决风险`、`建议下一步`。每项附所用工具或 Tcl、设计阶段和关键数值；没有证据时明确写“未验证”，不得推测为 PASS。"""
@@ -58,7 +60,7 @@ def _workflow_prompt(
 
 ## 前置条件
 {_bullets(prerequisites)}
-任何前置条件缺失都返回 BLOCKED；先列明缺失项，不在半配置状态上继续。
+缺少必要输入时仅暂停依赖它的步骤，列明缺失项并继续已有证据支持的分析；不能据此判 PASS。
 
 ## 证据闭环
 {_bullets(steps)}
@@ -81,20 +83,21 @@ def fpga_workflow() -> str:
         not_for="单独的时序、CDC、仿真、GT/IP/PCIe 或 ILA 深度诊断；进入对应 Prompt。",
         tools=(
             "start_session", "list_sessions", "get_project_info", "safe_tcl", "run_tcl",
-            "run_synthesis", "run_implementation", "get_run_progress", "get_timing_report",
+            "verilog_compile_check", "xdc_lint", "get_cdc_report", "run_synthesis", "run_implementation", "get_run_progress", "get_timing_report",
             "get_utilization_report", "get_critical_warnings", "check_bitstream_readiness",
             "generate_bitstream", "program_device",
         ),
         prerequisites=(
             "用 `list_sessions` 确认目标 session；没有会话才调用 `start_session`，并明确 GUI、Tcl 或 attach 模式。全流程始终携带同一 session_id。",
             "用 `get_project_info` 读取当前工程、器件、顶层、sources/XDC/simulation sources 和 run 状态。工程不存在时，用 `safe_tcl` 执行带参数的 `create_project`、`add_files`，再用 `run_tcl` 设置 top；不得猜器件、板卡或路径。",
-            "确认用户给出的目标频率、器件/板卡、顶层、产物目录和是否允许编程硬件；缺任一关键输入先停止询问。",
+            "确认目标频率、器件/板卡、顶层和产物目录；缺必要输入时仅暂停依赖步骤，继续可做检查。未请求下载时不编程硬件，继续已授权构建；请求下载时再核对精确设备及授权。",
         ),
         steps=(
-            "Baseline：再次调用 `get_project_info`，并用 `run_tcl(\"report_drc -return_string\")`、`get_critical_warnings` 保存新鲜基线。先解决缺源文件、错误 top、失效 IP 和约束语法问题。",
+            "Baseline：调用 `get_project_info`、`get_critical_warnings` 保存工程基线；已打开合适设计时再用 `run_tcl(\"report_drc -return_string\")`。新工程尚无设计时标记 DRC 未验证并继续预检。先解决缺源文件、错误 top、失效 IP 和约束语法问题。",
+            "Preflight：用 `verilog_compile_check`、`xdc_lint` 检查源码与约束。有 testbench 且请求含功能验证时，经 simulation_bringup 完成有限自检仿真；记录 assertion/scoreboard 与完成标志。没有 testbench 时明确功能未验证，按已有授权继续构建；真实仿真失败不得被构建成功掩盖。",
             "Synthesis：调用 `run_synthesis`，以 `get_run_progress` 确认完成；失败则按首个根因分类，不把进程退出或日志存在当作成功。完成后记录 `get_utilization_report` 和综合阶段时序，仅作早期指标。",
             "Implementation：综合门禁通过后调用 `run_implementation`，同样用 `get_run_progress` 取得最终状态。每次变更后只重跑受影响阶段，禁止并发撞同一 Vivado session。",
-            "Signoff：在 post-route 设计上重新获取 `get_timing_report`、`get_critical_warnings`、`run_tcl(\"report_drc -return_string\")` 和 `run_tcl(\"report_methodology -return_string\")`。post-synth WNS 不能替代 post-route 结论。",
+            "Signoff：在 post-route 设计上重新获取 `get_timing_report`、`get_critical_warnings`、`run_tcl(\"report_drc -return_string\")` 和 `run_tcl(\"report_methodology -return_string\")`；跨域补 `get_cdc_report`、时钟关系及适用 bus-skew 证据。post-synth WNS 不能替代 post-route 结论。逐阶段记录 PASS/FAIL/未验证与报告来源，功能验证和构建分开交付。",
             "Bitstream：先调用 `check_bitstream_readiness`；只有 readiness 与 signoff 证据一致时才调用 `generate_bitstream`。用 `parse_bit_header` 可核对产物头；只有用户明确要求且目标设备已确认时才 `program_device`。",
             "Reproducibility：需要入库时，用 `run_tcl` 执行 `write_project_tcl -force -no_copy_sources -paths_relative_to ...`；报告哪些 XCI、BD wrapper 和外部文件仍需纳入重建验证。",
         ),
@@ -104,27 +107,8 @@ def fpga_workflow() -> str:
 
 
 def debug_timing() -> str:
-    """时序违例调试：从新鲜摘要到受控的根因修复。"""
-    return _workflow_prompt(
-        title="时序收敛调试",
-        applies="已完成综合或实现，存在 setup/hold 违例、WNS/TNS 退化或时钟关系异常。",
-        not_for="RTL 功能失败、未建立时钟的 CDC 审计或尚未完成对应 run 的工程。",
-        tools=("get_project_info", "get_timing_report", "get_utilization_report", "get_critical_warnings", "run_tcl"),
-        prerequisites=(
-            "用 `get_project_info` 确认工程、器件和当前 synth/impl 状态；明确分析 post-synth 还是 post-route，并优先使用 post-route signoff 证据。",
-            "确认目标时钟、预期频率和约束来源。没有时钟定义或 generated clock 关系不清时，先停止并补功能意图。",
-            "保证所分析 run 与当前源码/XDC 同步；run 过期或未完成时先重跑相应阶段。",
-        ),
-        steps=(
-            "Baseline：调用 `get_timing_report` 保存 WNS/TNS、WHS/THS、违例数量、Top 路径和设计阶段；调用 `get_utilization_report` 与 `get_critical_warnings` 获取资源和约束旁证。",
-            "Classify：按路径证据区分逻辑深度/长组合链、高扇出、拥塞、跨时钟、时钟定义错误、IO 约束或 hold。用 `run_tcl(\"report_clock_interaction -return_string\")` 和 `run_tcl(\"report_cdc -details -return_string\")` 验证 CDC 嫌疑。",
-            "Escalate：必要时用 `run_tcl(\"report_methodology -return_string\")`、`run_tcl(\"report_high_fanout_nets -fanout_greater_than 200 -return_string\")` 和 `run_tcl(\"report_design_analysis -congestion -return_string\")` 补证据；命令不兼容当前 Vivado 时记录降级，不伪造结果。",
-            "Fix：优先修复缺失/错误时钟与功能明确的 RTL 根因，再考虑流水线、复制驱动、布局或策略。每次只改一种原因，记录目标路径组和预期改善量。",
-            "Re-measure：重跑受影响的 synth/impl，在同一设计阶段再次调用 `get_timing_report`；对比 WNS/TNS、违例数量及原 Top 路径是否真实消失，同时检查是否新增 hold 或 methodology 问题。",
-        ),
-        pass_condition="目标 signoff 阶段 setup 与 hold 均满足要求，约束覆盖完整，原违例未被隐藏，且 DRC/methodology 没有新的阻断项。只改善 WNS 但仍为负数属于 FAIL。",
-        domain_safety="`set_false_path` 和 multicycle 不是性能优化手段。只有接口协议、时钟关系和端到端周期预算共同证明路径无需默认分析时，才能作为待用户审批的约束变更提出。",
-    )
+    """时序收敛：与分发 Skill 共用完整正文。"""
+    return read_workflow("vivado-timing-closure")
 
 
 def debug_gt_mapping() -> str:
@@ -207,48 +191,28 @@ def simulation_bringup() -> str:
         title="仿真 Bring-up",
         applies="建立或修复 Vivado/XSim behavioral simulation，定位 compile、elaborate、runtime 或 testbench 失败。",
         not_for="用仿真结果替代 post-route timing/CDC signoff，或没有 testbench 预期行为的开放式跑波形。",
-        tools=("get_project_info", "verilog_compile_check", "run_tcl", "set_wave_zoom", "set_wave_analog"),
+        tools=("get_project_info", "verilog_compile_check", "query_waveform", "safe_tcl", "run_tcl", "set_wave_zoom", "set_wave_analog"),
         prerequisites=(
-            "用 `get_project_info` 确认 simulation sources、sim top、fileset、语言/define/include 与目标 simulator；没有 testbench 或预期结束条件即 BLOCKED。",
+            "已有 VCD 时直接离线 `query_waveform(file_path=...)` 列出信号，不要求会话；需要重跑时用 `get_project_info` 核对 sim top/fileset、语言/define/include 和目标 simulator。",
             "明确测试目标、时钟/复位、输入激励、最大仿真时间、PASS/FAIL assertion 或 scoreboard，以及允许的 warning。",
-            "确认当前 session 没有正在使用的同名仿真 job；所有启动、运行和停止命令只作用于选定 session。",
+            "需要运行仿真时确认没有正在使用的同名 job；所有启动、运行和停止命令只作用于选定 session。离线 VCD 查询不要求会话。",
         ),
         steps=(
             "Static baseline：先用 `verilog_compile_check` 做快速语法/编译检查，但把结果标为预检；外部编译器通过不等于 Vivado 文件集、elaboration 或 simulation 通过。",
             "Vivado compile/elaborate：用 `run_tcl` 检查 sim fileset/top 和 compile order，再执行 `launch_simulation -simset sim_1 -mode behavioral`。按首个真实错误分类为 source/order/define、elaboration、模型/库或 testbench，不预设为 RTL bug。",
-            "Finite run：成功展开后用 `run_tcl(\"run <有限时长>\")` 执行用户定义窗口；优先让 testbench 自报 assertion/scoreboard 和完成标志。禁止无界 `run all`，除非 testbench 有可信终止机制且用户同意。",
-            "Classify runtime：区分 assertion、timeout/deadlock、X/Z 传播、复位未释放、时钟未振荡、DUT 功能和 testbench/模型错误。需要波形时先添加最小信号集，再用 `set_wave_zoom` 和 `set_wave_analog` 辅助查看，不用目测替代断言。",
+            "Finite run：成功展开后在目标 XSim 中依次 `open_vcd`、`log_vcd` 选择已核对信号、有限 `run`、`close_vcd`；路径和 scope 经 `safe_tcl` 参数传入。缺失过去的事件需要同激励重跑，不能从当前值补造历史；保留 assertion/scoreboard 和完成标志。",
+            "Classify runtime：用 `query_waveform` 选择精确信号、start_time/end_time 和 max_events；时间为 VCD ticks，按 timescale 换算。通过 condition 的 equals/change/unknown/all_equals 查复位、X/Z 或握手；先读 initial_values，再读 events/matches。WDB/FST 不支持，截断或空 matches 均不能证明测试通过。",
             "Stop/recover：卡住时只对当前 session 调用 `run_tcl(\"close_sim -force\")`，保留日志并记录最后仿真时间；不得结束机器上的全部 XSim 进程或影响其他工程。",
             "Re-measure：一次只修一类根因，重新 compile/elaborate 并运行同一 stimulus、seed 与时长；比较 assertion 数、完成标志、关键状态和仿真时间。",
         ),
-        pass_condition="Vivado compile 与 elaboration 成功；仿真到达预定完成条件；必须通过的 assertion/scoreboard 为零失败；无 timeout、fatal 或未解释 X/Z。只有 compile success 属于 FAIL/未完成。",
+        pass_condition="Vivado compile/elaboration 成功；仿真到达预定完成条件；必要 assertion/scoreboard 零失败，无 timeout、fatal 或未解释 X/Z。查询的 simulation_verdict=not_evaluated 不提供测试判定；只有 compile success 属于 FAIL/未完成。",
         domain_safety="不得删除 assertion、改变 seed/输入或缩短运行窗口来躲避失败。`close_sim -force` 仅针对当前 Vivado session；若无法证明停止范围，先请求用户处理。",
     )
 
 
 def cdc_audit() -> str:
-    """跨时钟域结构、约束和 waiver 的证据化审计。"""
-    return _workflow_prompt(
-        title="CDC 审计",
-        applies="审查异步或相关时钟域之间的 crossing、同步结构、时钟约束和 CDC waiver。",
-        not_for="把普通单时钟时序违例统一标成 CDC，或在缺少协议意图时自动添加 false path。",
-        tools=("get_project_info", "get_timing_report", "get_critical_warnings", "run_tcl"),
-        prerequisites=(
-            "用 `get_project_info` 确认当前工程和已完成的 synth/impl run；获取时钟列表、generated clocks、时钟关系及 crossing 的功能协议。",
-            "明确每个 crossing 类型：单 bit level/pulse、multi-bit bus、counter/pointer、reset 或 handshake；不知道源/目的域和数据稳定性要求时停止。",
-            "保证 CDC 报告来自当前源码/XDC；约束变更后旧 run 的报告全部作废。",
-        ),
-        steps=(
-            "Baseline：调用 `get_timing_report` 和 `get_critical_warnings`，再用 `run_tcl(\"report_clock_interaction -return_string\")`、`run_tcl(\"report_cdc -details -return_string\")` 获取新鲜 crossing 清单和严重级别。",
-            "Inventory：按 source clock、destination clock、信号/总线、宽度、同步级数和报告 ID 建表；对象为空时检查时钟是否正确定义，不能把空报告判为无 CDC。",
-            "Classify：单 bit level 检查多级同步器及 ASYNC_REG；pulse 检查脉冲宽度/握手；multi-bit 检查稳定握手、FIFO 或 Gray 编码；reset 检查异步断言同步释放。不要把每一位独立双触发器当作总线一致性方案。",
-            "Constraints：用 `run_tcl(\"report_exceptions -return_string\")` 和 methodology 报告核对 clock groups、false path、max delay 与 waiver 的覆盖对象。每个例外必须映射到功能协议和结构证据。",
-            "Fix：优先修同步结构和缺失/错误时钟定义；需要 waiver 或例外时，提交 crossing、理由、审阅者和失效条件，不自动写入 XDC。",
-            "Re-measure：重跑对应阶段及同一组 CDC/clock interaction/timing 报告；比较严重 crossing 数、对象集合和新警告，确认问题是修复而非被约束隐藏。",
-        ),
-        pass_condition="所有 crossing 均有已知协议和适配结构；CDC 报告无未解释严重项；时钟关系完整；每个例外/waiver 有可审计证据且未遮蔽真实同步问题。空报告只有在时钟与对象覆盖已验证后才可 PASS。",
-        domain_safety="CDC waiver、asynchronous clock group 和 false path 都可能隐藏亚稳态或数据一致性风险。没有结构与协议证据时只提出调查项，不生成约束。",
-    )
+    """CDC 结构与约束审查：与分发 Skill 共用完整正文。"""
+    return read_workflow("vivado-cdc-audit")
 
 
 def ila_hardware_debug() -> str:
@@ -276,7 +240,22 @@ def ila_hardware_debug() -> str:
     )
 
 
-# 顺序是 MCP 对外兼容契约：旧 5 项保持原顺序，新工作流仅追加。
+def project_bringup() -> str:
+    """接管或建立工程，按请求范围推进构建与产物检查。"""
+    return read_workflow("vivado-project-bringup")
+
+
+def waveform_debug() -> str:
+    """离线 VCD 查询与需要时的有限 XSim 导出。"""
+    return read_workflow("vivado-waveform-debug")
+
+
+def constraints_authoring() -> str:
+    """依据板级和接口参数建立 XDC，并验证约束覆盖。"""
+    return read_workflow("vivado-constraints-authoring")
+
+
+# 顺序是 MCP 对外兼容契约：旧八项保持原顺序，新工作流仅追加。
 PROMPT_FUNCTIONS = (
     fpga_workflow,
     debug_timing,
@@ -286,6 +265,9 @@ PROMPT_FUNCTIONS = (
     simulation_bringup,
     cdc_audit,
     ila_hardware_debug,
+    project_bringup,
+    waveform_debug,
+    constraints_authoring,
 )
 
 

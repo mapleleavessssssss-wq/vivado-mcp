@@ -16,7 +16,18 @@ EXPECTED_NAMES = [
     "simulation_bringup",
     "cdc_audit",
     "ila_hardware_debug",
+    "project_bringup",
+    "waveform_debug",
+    "constraints_authoring",
 ]
+
+SHARED_SKILLS = {
+    "project_bringup": "vivado-project-bringup",
+    "debug_timing": "vivado-timing-closure",
+    "waveform_debug": "vivado-waveform-debug",
+    "cdc_audit": "vivado-cdc-audit",
+    "constraints_authoring": "vivado-constraints-authoring",
+}
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -63,8 +74,8 @@ def _declared_tool_names(prompt_body: str) -> set[str]:
     return set(re.findall(r"`([a-z][a-z0-9_]*)`", line))
 
 
-def test_registers_eight_prompts_in_compatible_order():
-    """原 5 项顺序不变，3 个新工作流追加，装饰器收到原函数。"""
+def test_registers_prompts_in_compatible_order():
+    """保留原八项顺序，三项窄范围工作流追加。"""
     fake_mcp = _FakeMcp()
 
     register_prompts(fake_mcp)
@@ -99,9 +110,24 @@ def test_prompts_are_compact_and_include_common_safety_contract():
 
     for function in PROMPT_FUNCTIONS:
         body = function()
-        assert 1500 <= len(body) <= 3000, (function.__name__, len(body))
+        if function.__name__ in SHARED_SKILLS:
+            continue
+        assert 1500 <= len(body) <= 3600, (function.__name__, len(body))
         for marker in required:
             assert marker in body, (function.__name__, marker)
+
+
+def test_shared_prompts_equal_distributed_skill_bodies():
+    """直接从分发文件提取正文，MCP 不能出现另一个漂移版本。"""
+    functions = {function.__name__: function for function in PROMPT_FUNCTIONS}
+    for prompt_name, skill_name in SHARED_SKILLS.items():
+        raw = (PROJECT_ROOT / "skills" / skill_name / "SKILL.md").read_bytes()
+        text = raw.decode("utf-8-sig")
+        lines = text.splitlines(keepends=True)
+        closing = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+        body = "".join(lines[closing + 1:])
+        assert functions[prompt_name]() == body
+        assert 800 <= len(body) <= 3600
 
 
 def test_prompt_tool_references_are_registered_tools():
@@ -126,3 +152,10 @@ def test_high_risk_prompts_have_domain_specific_gates():
     assert "compile success 属于 FAIL" in bodies["simulation_bringup"]
     assert "空报告" in bodies["cdc_audit"]
     assert "bitstream、LTX、器件和 commit" in bodies["ila_hardware_debug"]
+    assert "check_timing -verbose" in bodies["constraints_authoring"]
+    assert "-min" in bodies["constraints_authoring"]
+    assert "-max" in bodies["constraints_authoring"]
+    assert "功能未验证" in bodies["project_bringup"]
+    assert "simulation_verdict" in bodies["waveform_debug"]
+    for name in ("cdc_audit", "debug_timing", "constraints_authoring"):
+        assert "report_bus_skew" in bodies[name]

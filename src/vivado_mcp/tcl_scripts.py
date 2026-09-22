@@ -88,9 +88,7 @@ if {{$__r eq ""}} {{
 # --------------------------------------------------------------------------- #
 #  查询 sources_1 fileset 上的参数覆盖(generic / verilog_define)
 #  用途(PRD B4):_launch_and_wait 启动综合/实现前读取,把 fileset 上设置的参数
-#  明示进结果,防止"以为 set_property generic 生效了实际没设上"的隐性坑。
-#  注意:fileset 上有值 ≠ 综合实际生效(quirks §3 类型不匹配可走错分支),
-#  所以结果行附带核对 runme.log 'bound to:' 的提醒,措辞两边保持一致。
+#  明示进结果。这些是 fileset 配置值，不代表综合后的参数验证结论。
 #  无 Python 占位符,直接用单花括号。
 # --------------------------------------------------------------------------- #
 
@@ -258,22 +256,17 @@ if {[llength [get_runs -quiet synth_1]] > 0} {
 if {[llength [get_runs -quiet impl_1]] > 0} {
     set __impl_status [get_property STATUS [get_runs impl_1]]
 }
-# 判断 current_design 处于哪个阶段
-# Vivado STATUS 典型值:
-#   "Not started"
-#   "synth_design Complete!"
-#   "place_design Complete!" / "place_design ERROR"
-#   "route_design Complete!" / "route_design ERROR"
-#   "write_bitstream Complete!"
-if {[string match "*route_design Complete*" $__impl_status] ||
-     [string match "*write_bitstream*" $__impl_status]} {
-    set __stage "post-route"
-} elseif {[string match "*place_design Complete*" $__impl_status]} {
-    set __stage "post-place"
-} elseif {[string match "*synth_design Complete*" $__synth_status]} {
-    set __stage "post-synth"
-}
+# run 状态不能证明 current_design 的阶段（可能仍打开 synth 或另一个 DCP）。
+# 当前阶段由 Python 读取 report_timing_summary 的 Design State 报告头；这里
+# 仅提供 run 状态背景。没有报告头时必须保持 unknown。
 puts "VMCP_STAGE:stage=$__stage|synth_status=$__synth_status|impl_status=$__impl_status"
+if {[catch {report_route_status -return_string} __route_report]} {
+    puts "VMCP_TIMING_ROUTE_ERROR:$__route_report"
+} else {
+    foreach __route_line [split $__route_report "\n"] {
+        puts "VMCP_TIMING_ROUTE:$__route_line"
+    }
+}
 """
 
 # --------------------------------------------------------------------------- #
@@ -785,9 +778,10 @@ set __impl [get_runs {impl_run}]
 set __status [get_property STATUS $__impl]
 set __dir [get_property DIRECTORY $__impl]
 set __log "$__dir/runme.log"
-set __cw 0
+set __cw -1
 set __samples [list]
 if {{[file exists $__log]}} {{
+    set __cw 0
     set __fp [open $__log r]
     while {{[gets $__fp __line] >= 0}} {{
         if {{[string match "CRITICAL WARNING:*" $__line]}} {{
@@ -800,6 +794,11 @@ if {{[file exists $__log]}} {{
     close $__fp
 }}
 puts "VMCP_PRE_BIT:status=$__status,critical_warnings=$__cw"
+if {{[catch {{get_property TOP [get_filesets [get_property SRCSET $__impl]]}} __top]}} {{
+    puts "VMCP_PRE_BIT_TOP:"
+}} else {{
+    puts "VMCP_PRE_BIT_TOP:$__top"
+}}
 foreach __s $__samples {{
     puts "VMCP_PRE_BIT_CW:$__s"
 }}

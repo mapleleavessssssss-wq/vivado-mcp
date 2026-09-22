@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### 工作流分发与 CDC 证据
+
+- 新增 `get_cdc_report`：现场/离线原始报告转有界 JSON，区分规则检查条目、时钟对、明细与豁免，缺失或空报告保持未验证，不授予完整签核。
+- 五份 Skills 随 Python 包分发，增加 `skills list` / `skills export`；显式目录导出保留已有修改，不改变客户端配置。对应 MCP Prompt 读取同一正文。
+- 增加 CDC 与 XDC 编写/覆盖核对 Skills，追加工程接管、波形查询和约束编写 Prompt；原八项名称与顺序保留。
+- 全流程补静态预检、适用时的有限自检仿真和逐阶段结果；缺 testbench 明示功能未验证，构建成功不掩盖仿真失败。
+
+### 时序证据、波形查询与 Skills
+
+- `get_timing_report` 新增 JSON 输出、离线报告读取和 JSON 基线比较；保留默认文本调用。结构化结果包含 setup / hold / pulse-width 指标、来源摘要、设计阶段、缺失证据和有条件的观测差值，不凭数值差异宣称完整 signoff。
+- 修正设计阶段与烧录就绪检查中的证据判断：其他 run 已完成不能证明当前打开的是布线后设计；缺失日志、未知计数与不完整时序不能成为 READY。
+- 新增只读 `query_waveform`，有界解析 VCD 的层次、向量、X/Z 和时间窗内事件，支持值匹配、变化、未知值、多信号相等条件。当前不支持 WDB/FST，不执行任意表达式，不将查询结果当成仿真 PASS。
+- 新增三个仓库 Skills：工程接管、时序收敛、波形排障；更新现有 timing / simulation Prompts，并保留八个 Prompt 名称与顺序。
+- 移除 PITFALLS 踩坑功能及 `PITFALLS.md`：删除基于关键词追加手写建议的框架和参数覆盖结果中的 quirk 附注；保留 Tcl 原始执行摘要、超时状态说明与结构化诊断。
+- 波形工具的用法见 `docs/DIAGNOSTICS_GUIDE.md`，移除关于系统禁止自动截图的绝对化描述。
+
 ### GUI 启动诊断
 
 - 从 [PR #5](https://github.com/mapleleavessssssss-wq/vivado-mcp/pull/5)

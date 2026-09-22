@@ -55,6 +55,7 @@ packages = ["src/vivado_mcp"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "scripts/vivado_mcp_server.tcl" = "vivado_mcp/scripts/vivado_mcp_server.tcl"
+"skills" = "vivado_mcp/skills"
 
 [tool.ruff]
 target-version = "py310"

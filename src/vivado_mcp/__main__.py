@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from vivado_mcp import __version__
@@ -62,6 +63,18 @@ def main() -> None:
     # version
     sub.add_parser("version", help="显示版本号并退出。")
 
+    # skills：本地资源读取/显式导出，不启动 Vivado 或 MCP 服务。
+    p_skills = sub.add_parser("skills", help="查看或导出随包提供的 FPGA Skills。")
+    skill_commands = p_skills.add_subparsers(dest="skills_cmd", required=True)
+    p_skill_list = skill_commands.add_parser("list", help="列出 Skills 与对应 MCP Prompts。")
+    p_skill_list.add_argument("--json", action="store_true", help="输出 JSON 列表。")
+    p_skill_export = skill_commands.add_parser("export", help="导出到显式目录，冲突不覆盖。")
+    p_skill_export.add_argument("destination", metavar="DEST", help="目标 Skills 目录。")
+    p_skill_export.add_argument(
+        "--skill", action="append", dest="skill_names", metavar="NAME",
+        help="只导出指定 Skill，可重复；默认导出全部。",
+    )
+
     # doctor
     p_doctor = sub.add_parser(
         "doctor",
@@ -97,6 +110,29 @@ def main() -> None:
 
     if args.cmd == "version":
         print(f"vivado-mcp {__version__}")
+        return
+
+    if args.cmd == "skills":
+        from vivado_mcp.workflows import export_workflows, list_workflows
+
+        try:
+            if args.skills_cmd == "list":
+                entries = list_workflows()
+                if args.json:
+                    print(json.dumps(entries, ensure_ascii=False, indent=2))
+                else:
+                    for entry in entries:
+                        print(f"{entry['name']} -> {entry['prompt']}\n  {entry['description']}")
+            else:
+                result = export_workflows(args.destination, args.skill_names)
+                print(f"导出目录: {result['destination']}")
+                for name in result["exported"]:
+                    print(f"已导出: {name}")
+                for name in result["skipped"]:
+                    print(f"已存在且相同，跳过: {name}")
+        except (OSError, ValueError) as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            sys.exit(2)
         return
 
     if args.cmd == "doctor":

@@ -7,6 +7,7 @@
 
 import json
 import logging
+import re
 
 from mcp.server.mcpserver import Context
 
@@ -15,6 +16,16 @@ from vivado_mcp.analysis.ip_status_parser import format_ip_status_report, parse_
 from vivado_mcp.analysis.project_parser import format_project_info, parse_project_info
 from vivado_mcp.analysis.run_progress_parser import format_run_progress, parse_run_progress
 from vivado_mcp.analysis.suggestion_engine import format_suggestion, suggest_next
+from vivado_mcp.analysis.timing_evidence import (
+    MAX_REPORT_BYTES,
+    compare_timing_baseline,
+    format_readiness_evidence,
+    make_timing_evidence,
+    physical_design_stage,
+    read_bounded_text,
+    report_context,
+    timing_error,
+)
 from vivado_mcp.analysis.timing_parser import (
     derive_stage_warning,
     format_timing_report,
@@ -23,7 +34,7 @@ from vivado_mcp.analysis.timing_parser import (
     parse_violating_paths,
 )
 from vivado_mcp.analysis.util_parser import format_utilization_report, parse_utilization
-from vivado_mcp.analysis.warning_parser import parse_diag_counts, parse_pre_bitstream
+from vivado_mcp.analysis.warning_parser import parse_diag_counts
 from vivado_mcp.server import _NO_SESSION, _require_session, mcp
 from vivado_mcp.tcl_scripts import (
     CHECK_PRE_BITSTREAM,
@@ -80,26 +91,53 @@ async def get_io_report(
 async def get_timing_report(
     session_id: str = "default",
     ctx: Context = None,
+    output_format: str = "text",
+    report_file: str = "",
+    baseline_file: str = "",
 ) -> str:
     """获取结构化时序报告。
 
     执行 report_timing_summary 并解析为结构化摘要 + 关键路径详情。
-    返回人类可读的中文时序分析报告，包含 PASS/FAIL 状态判定。
+    默认返回中文摘要；JSON 模式返回可保存的版本化证据。report_file 可离线
+    读取 UTF-8 Vivado 原始报告，无需会话。基线比较只给上下文匹配的观察差值，
+    不证明约束等价或完整签核；本工具不写文件。
 
     Args:
         session_id: 目标会话 ID。
+        output_format: text（默认）或 json；json 模式错误也返回 JSON。
+        report_file: 可选原始时序报告路径，最多 16 MiB；不是 JSON 快照。
+        baseline_file: 可选之前保存的完整 JSON 返回值路径，最多 4 MiB。
     """
+    def error(message: str) -> str:
+        if output_format == "json":
+            return json.dumps(
+                timing_error(message, session_id, report_file), ensure_ascii=False, indent=2,
+            )
+        return message
+
+    if output_format not in ("text", "json"):
+        return "[ERROR] output_format 必须为 text 或 json"
+    if report_file:
+        try:
+            raw = read_bounded_text(report_file, MAX_REPORT_BYTES)
+            return _format_timing_result(
+                raw, parse_timing_summary(raw), output_format, "", report_file, baseline_file,
+            )
+        except (OSError, ValueError, UnicodeError) as exc:
+            return error(f"[ERROR] 读取时序报告失败: {exc}")
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return error(_NO_SESSION.format(sid=session_id))
 
     # 第一步:查询当前设计阶段,后面附加到 TimingReport 让用户知道数据来源
     # Bug 2 修复:区分 post-synth 估算 vs post-route 最终,避免误判
     stage, synth_status, impl_status = "unknown", "", ""
+    live_stage_output = ""
     try:
         stage_result = await session.execute(QUERY_DESIGN_STAGE, timeout=15.0)
         if not stage_result.is_error:
             stage, synth_status, impl_status = parse_design_stage(stage_result.output)
+            live_stage_output = stage_result.output
     except Exception as e:
         # 阶段查询失败不致命,继续跑时序报告,source_stage 保持 "unknown"
         # 但把具体原因打出来,避免报告里 stage=unknown 让人困惑
@@ -111,7 +149,7 @@ async def get_timing_report(
             "report_timing_summary -return_string", timeout=120.0
         )
         if result.is_error:
-            return (
+            return error(
                 f"[ERROR] 获取时序报告失败（rc={result.return_code}）：\n"
                 f"{result.output}\n\n"
                 "提示: report_timing_summary 需要打开综合或实现后的设计。"
@@ -120,6 +158,9 @@ async def get_timing_report(
         timing_report = parse_timing_summary(result.output)
 
         # 注入阶段信息
+        stage, _ = report_context(result.output)
+        if stage == "unknown":
+            stage, _ = physical_design_stage(live_stage_output)
         source_detail, stage_warning = derive_stage_warning(stage, synth_status, impl_status)
         timing_report.source_stage = stage
         timing_report.source_detail = source_detail
@@ -144,14 +185,57 @@ async def get_timing_report(
                     timing_report.violating_paths = parse_violating_paths(
                         paths_result.output
                     )
+                    path_errors = re.findall(r"^VMCP_PATH_ERROR:(.+)$", paths_result.output, re.M)
+                    if path_errors:
+                        timing_report.violating_paths_error = "; ".join(path_errors)
+                        logger.warning("违例路径查询部分失败: %s", path_errors)
             except Exception as e:
                 err_msg = f"{type(e).__name__}: {e}"
                 timing_report.violating_paths_error = err_msg
                 logger.warning("违例路径查询异常: %s", err_msg)
 
-        return format_timing_report(timing_report)
+        return _format_timing_result(
+            result.output, timing_report, output_format, session_id, "", baseline_file,
+            live_stage_output,
+        )
     except Exception as e:
-        return f"[ERROR] 获取时序报告失败: {e}"
+        logger.warning("获取时序报告失败: %s", e)
+        return error(f"[ERROR] 获取时序报告失败: {e}")
+
+
+def _format_timing_result(
+    raw, report, output_format, session_id, report_file, baseline_file, live_stage_output="",
+):
+    evidence = make_timing_evidence(
+        raw, report, session_id=session_id, report_file=report_file,
+        live_stage_output=live_stage_output,
+    )
+    report.source_stage = evidence["stage"]
+    if baseline_file:
+        evidence["comparison"] = compare_timing_baseline(evidence, baseline_file)
+    if output_format == "json":
+        return json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False)
+    output = format_timing_report(report)
+    # 新证据解析保留部分 NA / pulse-width 数据；旧摘要不能抢先宣布 PASS。
+    status = evidence["verdict"]["status"]
+    if status != "met_observed_checks":
+        label = {
+            "violated": "FAIL (已观察到时序违例)",
+            "incomplete": "未知 [DEGRADED] (时序证据不完整)",
+            "unavailable": "无时序数据或未知 [DEGRADED] (时序证据不可用)",
+        }[status]
+        output = f"=== 时序分析摘要 === 状态: {label}\n" + output.split("\n", 1)[1]
+    if evidence["diagnostics"]:
+        output += "\n[DEGRADED] " + "；".join(evidence["diagnostics"])
+    output += f"\n证据判定: {evidence['verdict']['status']}；不代表完整签核。"
+    if report.source_stage == "unknown":
+        output += "\n[DEGRADED] 报告头未提供可确认的设计阶段；run 完成状态不能替代当前设计阶段。"
+    if evidence["comparison"]:
+        comparison = evidence["comparison"]
+        output += f"\n基线比较: {comparison['status']}；" + "；".join(comparison["reasons"])
+        if comparison["deltas"]:
+            output += "\n" + json.dumps(comparison["deltas"], ensure_ascii=False)
+    return output
 
 
 @mcp.tool()
@@ -160,7 +244,7 @@ async def check_bitstream_readiness(
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
-    """烧板前一键检查:综合判断工程是否可以安全生成比特流。
+    """检查比特流生成前的实现状态、时序摘要和严重警告。
 
     这个工具是"发车前的最后一瞥":在你打算 generate_bitstream 或 program_device
     之前,一次性给出 PASS/BLOCK/WARN 的综合结论,避免烧板后才发现问题。
@@ -171,7 +255,7 @@ async def check_bitstream_readiness(
     - 时序是否收敛(WNS/WHS 是否 met)
 
     返回结论:
-    - READY:可以安全烧板
+    - READY:本次有限检查通过；不证明完整签核或硬件功能
     - BLOCK:存在阻塞性问题(route 未完成 / 时序违例 / 大量 CW)
     - WARN:可以生成但有风险(少量 CW 或估算时序偏低)
 
@@ -188,124 +272,36 @@ async def check_bitstream_readiness(
     if not session:
         return _NO_SESSION.format(sid=session_id)
 
-    # 1. 查询实现状态 + CW 计数 + 样本
     try:
         pre_result = await session.execute(
-            CHECK_PRE_BITSTREAM.format(impl_run=impl_run), timeout=30.0
+            CHECK_PRE_BITSTREAM.format(impl_run=impl_run) + QUERY_DESIGN_STAGE, timeout=30.0,
         )
-        status, cw_count, samples = parse_pre_bitstream(pre_result.output)
-    except Exception as e:
-        return f"[ERROR] 查询实现状态失败: {e}"
-
-    # 2. 查询时序摘要(尽力而为,失败不致命 —— 但一定要打出原因)
-    timing_met = None
-    timing_line = ""
-    timing_err: str = ""
-    # True = 时序子查询失败(rc 错误/格式不识别/查询异常),判定本身不可信;
-    # 与 NA(数据本来就不存在,WARN 语义成立)分流,前者 verdict 附 [DEGRADED]
-    timing_degraded = False
-    try:
-        timing_raw = await session.execute(
-            "report_timing_summary -return_string", timeout=60.0
-        )
-        if not timing_raw.is_error:
-            tr = parse_timing_summary(timing_raw.output)
-            if tr.summary.parse_status == "ok":
-                timing_met = tr.summary.timing_met
-                timing_line = (
-                    f"  WNS = {tr.summary.wns:+.3f} ns  WHS = {tr.summary.whs:+.3f} ns  "
-                    f"失败端点 = {tr.summary.failing_endpoints}/{tr.summary.total_endpoints}"
-                )
-            else:
-                # NA / 格式不识别:timing_met 保持 None 走"未能读取"提示,
-                # 绝不能把全零占位摘要当 PASS/FAIL 参与判定
-                if tr.summary.parse_status == "no_timing_data":
-                    timing_err = "时序摘要为 NA(设计无时序约束或无可分析端点)"
-                else:
-                    timing_err = "时序报告格式不识别,未能解析 Design Timing Summary"
-                    timing_degraded = True
-                logger.warning(
-                    "check_bitstream_readiness 时序摘要降级(parse_status=%s): %s",
-                    tr.summary.parse_status, timing_err,
-                )
-        else:
-            timing_err = (
-                f"report_timing_summary rc={timing_raw.return_code}: "
-                f"{timing_raw.output[:200]}"
+        if pre_result.is_error:
+            return (
+                f"[ERROR] [DEGRADED] 查询实现状态失败 rc={pre_result.return_code}: "
+                f"{pre_result.output[:500]}"
             )
-            timing_degraded = True
-    except Exception as e:
-        timing_err = f"{type(e).__name__}: {e}"
-        timing_degraded = True
-        logger.warning("check_bitstream_readiness 时序查询失败: %s", timing_err)
+    except Exception as exc:
+        logger.warning("查询实现状态失败: %s", exc)
+        return f"[ERROR] [DEGRADED] 查询实现状态失败: {exc}"
 
-    # 3. 判定总体结论
-    is_routed = "route_design Complete" in status or "write_bitstream" in status
-    has_impl_error = "ERROR" in status.upper()
-
-    blockers: list[str] = []
-    warnings_list: list[str] = []
-
-    if has_impl_error:
-        blockers.append(f"impl_1 执行错误: {status}")
-    elif not is_routed:
-        blockers.append(f"impl_1 未完成布线(当前状态: {status or '未启动'})")
-
-    if timing_met is False:
-        blockers.append("时序违例(WNS/WHS 为负)")
-    elif timing_met is None and is_routed:
-        # 把具体失败原因显示出来,而不是笼统的"不可用"
-        detail = f": {timing_err}" if timing_err else ""
-        warnings_list.append(f"未能读取时序摘要{detail}")
-
-    if cw_count > 0:
-        if cw_count >= 5:
-            blockers.append(f"CRITICAL WARNING 数量过多: {cw_count} 条")
+    timing_output, timing_error_message = None, ""
+    try:
+        result = await session.execute("report_timing_summary -return_string", timeout=60.0)
+        if result.is_error:
+            timing_error_message = (
+                f"report_timing_summary rc={result.return_code}: {result.output[:200]}"
+            )
         else:
-            warnings_list.append(f"存在 {cw_count} 条 CRITICAL WARNING,建议排查")
-
-    # 4. 构造报告
-    if blockers:
-        verdict = "BLOCK (阻塞,不建议生成比特流)"
-    elif warnings_list:
-        verdict = "WARN (可生成,但有风险)"
-    else:
-        verdict = "READY (可以安全生成比特流)"
-
-    # 时序子查询失败 ≠ 数据不存在:判定不可信,verdict 行附 [DEGRADED] 标记
-    # (BLOCK 由实现状态等可信信号触发,结论已足够强,不叠加标记)
-    if timing_degraded and not blockers:
-        verdict += " [DEGRADED]"
-
-    out: list[str] = [f"=== 烧板前检查: {verdict} ==="]
-    out.append(f"实现状态: {status or 'UNKNOWN'}")
-    out.append(f"CRITICAL WARNING: {cw_count if cw_count >= 0 else '无法读取'}")
-    if timing_line:
-        out.append("时序摘要:")
-        out.append(timing_line)
-
-    if blockers:
-        out.append("")
-        out.append("阻塞问题:")
-        for b in blockers:
-            out.append(f"  [X] {b}")
-    if warnings_list:
-        out.append("")
-        out.append("风险提示:")
-        for w in warnings_list:
-            out.append(f"  [!] {w}")
-
-    if samples and cw_count > 0:
-        out.append("")
-        out.append(f"CRITICAL WARNING 样本(前 {min(len(samples), 5)} 条):")
-        for s in samples[:5]:
-            out.append(f"  - {s}")
-
-    if blockers:
-        out.append("")
-        out.append("建议: 运行 get_critical_warnings 查看详情,修复后再烧板。")
-
-    return "\n".join(out)
+            timing_output = result.output
+    except Exception as exc:
+        timing_error_message = f"{type(exc).__name__}: {exc}"
+    output, diagnostics = format_readiness_evidence(
+        pre_result.output, timing_output, timing_error_message, impl_run,
+    )
+    for message in diagnostics:
+        logger.warning("%s", message)
+    return output
 
 
 @mcp.tool()
@@ -608,6 +604,8 @@ async def get_pre_commit_summary(
         )
         if not cr.is_error:
             errs, cws, warns = parse_diag_counts(cr.output)
+            if errs < 0 or cws < 0:
+                sample_failures.append("ERROR/CW 计数无法读取")
         else:
             sample_failures.append(f"CW 计数 rc={cr.return_code}")
     except Exception as e:

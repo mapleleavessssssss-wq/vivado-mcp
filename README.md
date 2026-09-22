@@ -7,16 +7,16 @@
 
 **让 Claude Code、Cursor、Codex 等 AI Agent 安全驱动本地 Xilinx Vivado。**
 
-30 个精选 MCP 工具覆盖会话、综合、实现、时序、XDC、IP、波形与烧录；其余 Vivado 能力由通用 `run_tcl` 承载。相比把每条 Tcl 命令包装成工具，这种设计占用更少上下文，也更容易跨 Vivado 版本维护。
+32 个 MCP 工具覆盖会话、综合、实现、时序、CDC、XDC、IP、波形与烧录。可保存结构化时序结果、比较两次测量、离线查询 VCD 中的未知值与握手事件；通用 Vivado 操作由 `run_tcl` 承载。
 
-| 30 个精选工具 | 8 个证据驱动工作流 | 2 个实时 Resources | GUI / Tcl / attach 三种会话 |
+| 32 个精选工具 | 11 个工作流 Prompt + 5 个 Skills | 2 个实时 Resources | GUI / Tcl / attach 三种会话 |
 |---:|---:|---:|---:|
 
 > 本项目控制的是**你本机安装的 Vivado**，不是云端综合服务。命令在当前用户权限下执行；工具说明和诊断建议以中文为主。
 >
-> **English:** A lean MCP server for driving local Xilinx Vivado from AI agents. It provides 30 curated tools, 8 evidence-gated workflow prompts, GUI/headless/attach sessions, and raw Tcl escape hatches.
+> **English:** A local Vivado MCP server with 32 tools, structured timing evidence and baseline comparison, bounded offline VCD queries, 11 workflow prompts, and 5 reusable skills.
 
-**导航**：[快速开始](#快速开始) · [为什么是 30 个工具](#设计哲学--为什么是-30-个工具而不是-500-个) · [工作流 Prompts](#工作流-prompts) · [工具列表](#工具列表) · [会话模式](#会话模式) · [架构](#架构) · [CLI](#cli-参考) · [反馈](#反馈与-bug-提交)
+**导航**：[快速开始](#快速开始) · [实际调试场景](#实际调试场景) · [工具设计](#工具设计) · [工作流 Prompts](#工作流-prompts) · [工具列表](#工具列表) · [调试指南与 Skills](docs/DIAGNOSTICS_GUIDE.md) · [CLI](#cli-参考) · [反馈](#反馈与-bug-提交)
 
 ## 环境要求
 
@@ -106,7 +106,7 @@ VIVADO_PATH = "D:/Xilinx/Vivado/2019.1/bin/vivado.bat"
 
 ### 5. 重启 MCP 客户端
 
-配置完成后重启客户端，即可加载 30 个工具、8 个工作流 Prompt 和 2 个会话状态 Resource。
+配置完成后重启客户端，即可加载 32 个工具、11 个工作流 Prompt 和 2 个会话状态 Resource。五个 [Skills](skills/) 已随 Python 包分发，可显式导出到自选目录；不会自动修改客户端配置。对应 Prompt 从同一正文读取。
 
 ### 6. 冒烟验证
 
@@ -142,13 +142,25 @@ pip install -e ".[dev]"
 
 各版本的完整变更和迁移说明见 [CHANGELOG](CHANGELOG.md)。
 
-## 设计哲学 — 为什么是 30 个工具而不是 500 个？
+## 实际调试场景
+
+| 你想解决的问题 | 使用方式 | 得到什么 |
+|---|---|---|
+| 修改 RTL 后，时序到底变了多少？ | `get_timing_report(output_format="json")`，保存结果后在下一轮传 `baseline_file` | setup / hold / pulse-width 指标、设计阶段、同阶段可比指标的差值；不会把综合估算当成最终验收 |
+| 同事只发来一份时序报告 | `get_timing_report(report_file="reports/timing.rpt", output_format="json")` | 无需 Vivado 会话即可分析；报告的来源、缺失字段与未验证项明确列出 |
+| 仿真某处出现 X/Z，或握手是否发生？ | `query_waveform(file_path="sim/trace.vcd", ...)` | 信号层次、时间窗内变化、未知值与条件匹配；输出数量有上限 |
+| 拿到 CDC 报告，想定位跨域风险 | `get_cdc_report(report_file="reports/cdc.rpt")` | 时钟对、规则和严重级别、明细、豁免与缺失证据；不凭零告警宣称签核 |
+| 接手陌生工程，不知道从哪开始 | [工程接管 Skill](skills/vivado-project-bringup/SKILL.md) | 环境与工程摸底、首个阻塞问题、后续工具调用路线 |
+
+完整参数、可复制例子和 Skills 使用方法见 [调试指南](docs/DIAGNOSTICS_GUIDE.md)。波形查询当前支持 **VCD**；WDB/FST 请先使用相应工具导出 VCD。
+
+## 工具设计
 
 部分同类 Vivado MCP 采用数百个细粒度工具，其中许多只是单条 Tcl 的包装。问题是：
 
-- **每个工具都占用 AI 上下文**（工具签名注入到每次系统提示）→ 调不调都烧 token
-- **大模型比我们更会拼 Tcl**（`create_bd_cell` 这种就是写一行 Tcl 的事）
-- **绝大多数 facade 工具做的事 `run_tcl("...")` 能做**
+- 过多相似入口增加工具选择和维护成本；具体上下文开销取决于客户端如何发现、加载工具。
+- 单条 Tcl 操作可直接由 `run_tcl` 或 `safe_tcl` 完成。
+- 结构化分析、可靠的多步操作和离线数据处理值得提供专门入口。
 
 本项目只保留**真正有本地价值**的工具——Tcl 做不了或做不好的事：
 
@@ -162,8 +174,8 @@ pip install -e ".[dev]"
 ## 特性
 
 - **三种会话模式**：GUI 可视化、Tcl 无头运行，以及只连接现有 GUI 的 attach
-- **30 个精选工具** — 覆盖完整 FPGA 开发流程、智能诊断、离线解析和外部工具链联动
-- **8 个证据驱动工作流** — 每个流程都要求新鲜基线、最小安全修改、复测门禁与明确停止条件
+- **32 个精选工具** — 覆盖 FPGA 开发流程、智能诊断、离线解析和外部工具链联动
+- **11 个证据驱动工作流** — 每个流程都要求新鲜基线、最小安全修改、复测门禁与明确停止条件
 - **一条命令自检** — `doctor` 只读定位环境问题，`doctor --fix` 才执行受限、可备份的修复
 - **可靠的长任务协议** — 综合/实现支持 `wait=False` 立即返回 job id，再由 `get_run_progress` 查询
 - **超时响应不串台** — 每个 session 保留在途响应所有权；旧响应完成前拒绝下一命令，不会把 FIRST 的结果交给 SECOND
@@ -179,6 +191,16 @@ pip install -e ".[dev]"
 
 Prompts 解决的是“按什么顺序做、什么证据才算完成”，不会增加工具数量。正文只在选择该 Prompt 时加载，不会全部常驻上下文。
 
+五个可分发 Skill 与对应 Prompt 使用同一份正文。查看及导出：
+
+```powershell
+vivado-mcp skills list
+vivado-mcp skills export ./fpga-skills
+vivado-mcp skills export ./fpga-skills --skill vivado-cdc-audit
+```
+
+将导出的目录按客户端支持的方式导入即可。导出不覆盖已有修改：内容相同则跳过，冲突则报错，可选新目录重新导出。无需安装 SynthPilot 或 oh-my-fpga。
+
 | Prompt | 用途 | 核心门禁 |
 |---|---|---|
 | `fpga_workflow` | RTL 到 bitstream 的完整流程 | 上游失败不进入下游，post-route signoff 后才写 bitstream |
@@ -189,6 +211,9 @@ Prompts 解决的是“按什么顺序做、什么证据才算完成”，不会
 | `simulation_bringup` | XSim 编译、运行与失败分类 | compile 不等于 pass；必须有非零测试和新鲜运行结果 |
 | `cdc_audit` | CDC crossing 审计 | 不用 waiver 隐藏真实 crossing，约束必须有结构证据 |
 | `ila_hardware_debug` | ILA 插入、烧录与采波 | bit/ltx 配对、明确 JTAG target、有限等待，禁止全机 kill XSim |
+| `project_bringup` | 接管或建立工程，按请求范围推进 | 静态预检、功能验证和构建逐阶段记录 |
+| `waveform_debug` | 已有 VCD 离线查询与必要时导出 | 明确信号、窗口、截断与独立测试结论 |
+| `constraints_authoring` | 编写或审查 XDC | 参数来自接口/板级事实，验证对象、min/max 与例外覆盖 |
 
 ## 会话模式
 
@@ -289,10 +314,11 @@ get_run_progress(run_name="synth_1", session_id="default")
 | 工具 | 说明 |
 |------|------|
 | `get_io_report` | IO 引脚报告（JSON），自动判定 GT/GPIO 类型 |
-| `get_timing_report` | 时序报告,含 PASS/FAIL 判定、**数据来源标注**(post-synth 估算 vs post-route 最终)、关键路径详情。**0.3.9** 违例时自动附 Top N 违例路径 + 5 种模式分类(CDC/HIGH_FANOUT/LONG_COMBO/IO_UNREGISTERED/UNKNOWN)+ 具体 Tcl 修复命令 |
+| `get_timing_report` | 文本 / JSON 时序证据，标注设计阶段；支持 `report_file` 离线报告与 `baseline_file` 基线对比，含 setup / hold / pulse-width 指标和违例路径分析。缺数据不能判为通过 |
+| `get_cdc_report` | 现场/离线 CDC JSON，按规则与时钟对统计报告检查条目，保留豁免和明细截断信息；不修改约束、不判完整签核 |
 | `get_utilization_report` | **0.3.0** 结构化资源占用(LUT/FF/BRAM/DSP/IOB),> 90% 标 CRITICAL,70-90% 标 WARN |
 
-> 通用报告（power / drc / clock / methodology / cdc 等）请直接用
+> 通用报告（power / drc / clock / methodology 等）请直接用
 > `run_tcl("report_power -return_string")`，无需包装。
 
 ### 波形显示(XSim)
@@ -300,6 +326,12 @@ get_run_progress(run_name="synth_1", session_id="default")
 |------|------|
 | `set_wave_zoom` | **0.3.22** 设置波形时间缩放窗:改 .wcfg XML → close -force → open 重载(Vivado 2019.1 无 Tcl zoom 命令,跨命令协议封装) |
 | `set_wave_analog` | **0.3.22** 把信号设为 Analog 模拟显示:自动补 STYLE_ 前缀 + 全路径/显示名寻址 + 空对象判空(三个实测静默坑一次封掉)。注意先 zoom 后 analog(重载会冲掉 analog 设置) |
+
+### 波形数据查询（无需 Vivado 会话）
+
+| 工具 | 功能 |
+|---|---|
+| `query_waveform` | 读取 VCD，发现信号层次、查询指定时间窗、匹配值 / 变化 / X/Z / 多信号相等条件。返回 timescale、初值、有限事件及截断标志；不据此直接判定仿真通过 |
 
 ## 可选:Claude Code Hook 配置示例
 
@@ -475,10 +507,11 @@ AI:  [get_timing_report]
 ```
 用户: 修好后准备烧板
 AI:  [check_bitstream_readiness]
-     结论: READY — route_design Complete / WNS +0.026 ns / CW=8 (GT_LOC 都是 IP 内部,可忽略)
+     核对目标实现 run、当前打开设计阶段、setup/hold/pulse-width 和 CW 查询是否完整。
+     只有证据完整且不存在阻塞项才继续；CW=8 时不能当成 READY。
 
-     [generate_bitstream]          # 自动拦截:有 CW 会阻止,可 force=True 跳过
-     [program_device(bitstream_path="impl_1/top.bit")]
+     [generate_bitstream]          # 先解决诊断问题，默认不跳过检查
+     [program_device(bitstream_path="impl_1/top.bit")]  # 用户要求烧录且已确认设备时
 ```
 
 ### 常用旁路工具
@@ -506,8 +539,8 @@ safe_tcl("set_property PACKAGE_PIN {0} [get_ports {1}]", args=["W5", "clk"])
 ```mermaid
 flowchart LR
     Agent["Claude Code / Cursor / Codex"] -->|"stdio MCP"| MCP["vivado-mcp"]
-    MCP --> Tools["30 Tools"]
-    MCP --> Prompts["8 Workflow Prompts"]
+    MCP --> Tools["32 Tools"]
+    MCP --> Prompts["11 Workflow Prompts"]
     MCP --> Resources["2 Session Resources"]
     Tools --> Tcl["SubprocessSession\nmode=tcl"]
     Tools --> Gui["GuiSession\nmode=gui"]
@@ -533,6 +566,8 @@ flowchart LR
 | `vivado-mcp uninstall [path]` | 从 Vivado_init.tcl 移除 |
 | `vivado-mcp doctor [path] [--port 9999] [--json]` | 只读检查环境与连接 |
 | `vivado-mcp doctor --fix [--client all\|claude-code\|codex]` | 备份后修复可安全自动处理的配置 |
+| `vivado-mcp skills list [--json]` | 查看随包分发的五项工作流与 Prompt 映射 |
+| `vivado-mcp skills export DEST [--skill NAME]` | 导出到指定目录；保留已有修改，不自动配置客户端 |
 | `vivado-mcp version` | 显示版本 |
 
 ## 开发
@@ -598,7 +633,7 @@ ruff check src/ tests/
 - [迁移指南 0.1 → 0.2](docs/MIGRATION_0.1_to_0.2.md) — 每个被删工具的 run_tcl/safe_tcl 替代
 - [审计报告](docs/AUDIT_REPORT.md) — 0.1.0 的 7 个 bug 根因分析
 - [IP 调试实践手册](docs/IP_DEBUG_GUIDE.md) — PCIe GT 映射调试、XCI 配置对比等实战
-- [PITFALLS](PITFALLS.md) — MCP 物理上无法替你做的事(需手动操作)
+- [调试指南](docs/DIAGNOSTICS_GUIDE.md) — 时序对比、VCD 查询、Skills 与波形显示
 
 ## 许可证
 

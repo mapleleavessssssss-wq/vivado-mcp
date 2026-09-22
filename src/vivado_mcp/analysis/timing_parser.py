@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass, field
 
@@ -86,6 +87,12 @@ class TimingSummary:
     # 非 "ok" 时数值全零、timing_met 取保守值 False,消费方必须先看本字段,
     # 绝不能把"没解析到数据"当成 PASS。
     parse_status: str = "ok"
+    hold_failing_endpoints: int | None = None
+    hold_total_endpoints: int | None = None
+    wpws: float | None = None
+    tpws: float | None = None
+    pulse_width_failing_endpoints: int | None = None
+    pulse_width_total_endpoints: int | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +162,20 @@ def _degraded_summary(status: str) -> TimingSummary:
     )
 
 
+def summary_tokens(text: str) -> list[str] | None:
+    """提取总摘要数据行，绝不把逐时钟表格当成设计总表。"""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if _SUMMARY_HEADER_RE.match(line.strip()):
+            for candidate in lines[i + 1:i + 5]:
+                candidate = candidate.strip()
+                if candidate and not candidate.startswith("---"):
+                    tokens = candidate.split()
+                    return tokens if len(tokens) >= 8 else None
+            return None
+    return None
+
+
 def _parse_summary_table(text: str) -> TimingSummary:
     """从 Design Timing Summary 表格解析摘要行。
 
@@ -167,31 +188,8 @@ def _parse_summary_table(text: str) -> TimingSummary:
     数据行是 NA(无约束设计) → parse_status="no_timing_data"。
     两种情况都不抛异常、不默认 PASS。
     """
-    lines = text.splitlines()
-
-    # 寻找 Design Timing Summary 区段内的表头行
-    header_idx: int | None = None
-    for i, line in enumerate(lines):
-        if _SUMMARY_HEADER_RE.search(line):
-            header_idx = i
-            break
-
-    if header_idx is None:
-        return _degraded_summary("unrecognized")
-
-    # 跳过分隔线（一行或多行 -------），找到第一行数据
-    data_line: str | None = None
-    for j in range(header_idx + 1, min(header_idx + 5, len(lines))):
-        stripped = lines[j].strip()
-        if stripped and not stripped.startswith("---"):
-            data_line = stripped
-            break
-
-    if data_line is None:
-        return _degraded_summary("unrecognized")
-
-    tokens = data_line.split()
-    if len(tokens) < 8:
+    tokens = summary_tokens(text)
+    if tokens is None or re.search(r"^\s*ERROR\s*:", text, re.M):
         return _degraded_summary("unrecognized")
 
     # 无时序约束/无 setup 端点的设计,Vivado 打印 'NA NA NA ...':
@@ -206,11 +204,32 @@ def _parse_summary_table(text: str) -> TimingSummary:
         total_setup = int(tokens[3])
         whs = float(tokens[4])
         ths = float(tokens[5])
-        # tokens[6] = THS Failing, tokens[7] = THS Total（暂不单独存储）
+        failing_hold, total_hold = int(tokens[6]), int(tokens[7])
+        wpws = tpws = failing_pulse = total_pulse = None
+        if len(tokens) >= 12:
+            wpws, tpws, failing_pulse, total_pulse = [
+                None if token.upper() in ("NA", "N/A", "--") else converter(token)
+                for token, converter in zip(tokens[8:12], (float, float, int, int), strict=True)
+            ]
+        if not all(math.isfinite(v) for v in (wns, tns, whs, ths)):
+            raise ValueError("non-finite summary")
+        if not (0 <= failing_setup <= total_setup and 0 <= failing_hold <= total_hold):
+            raise ValueError("invalid endpoint count")
+        if tns > 0 or ths > 0 or (tpws is not None and tpws > 0):
+            raise ValueError("positive total negative slack")
+        if any(value is not None and not math.isfinite(value) for value in (wpws, tpws)):
+            raise ValueError("invalid pulse-width summary")
+        if any(value is not None and value < 0 for value in (failing_pulse, total_pulse)):
+            raise ValueError("invalid pulse-width endpoint count")
+        if (failing_pulse is not None and total_pulse is not None
+                and failing_pulse > total_pulse):
+            raise ValueError("invalid pulse-width endpoint count")
     except ValueError:
         # 数据行 token 不是数值(未知格式变体):显式标记格式不识别,不抛异常
         return _degraded_summary("unrecognized")
 
+    if total_setup == 0 and total_hold == 0:
+        return _degraded_summary("no_timing_data")
     return TimingSummary(
         wns=wns,
         tns=tns,
@@ -218,7 +237,19 @@ def _parse_summary_table(text: str) -> TimingSummary:
         ths=ths,
         failing_endpoints=failing_setup,
         total_endpoints=total_setup,
-        timing_met=(wns >= 0 and whs >= 0),
+        timing_met=(
+            wns >= 0 and whs >= 0 and tns >= 0 and ths >= 0
+            and failing_setup == 0 and failing_hold == 0
+            and all(value is None or value >= 0 for value in (wpws, tpws))
+            and failing_pulse in (None, 0)
+        ),
+        hold_failing_endpoints=failing_hold,
+        hold_total_endpoints=total_hold,
+        wpws=wpws,
+        tpws=tpws,
+        pulse_width_failing_endpoints=failing_pulse,
+        pulse_width_total_endpoints=total_pulse,
+        parse_status="partial" if total_setup == 0 or total_hold == 0 else "ok",
     )
 
 
@@ -420,7 +451,7 @@ def format_timing_report(report: TimingReport) -> str:
     elif s.parse_status != "ok":
         status = "未知 [DEGRADED] (时序报告格式不识别)"
     else:
-        status = "PASS (时序满足)" if s.timing_met else "FAIL (时序违例)"
+        status = "PASS (已观察的时序检查满足)" if s.timing_met else "FAIL (时序违例)"
     lines.append(f"=== 时序分析摘要 === 状态: {status}")
 
     # Bug 2 修复:数据来源元信息(在 PASS/FAIL 旁边,用户不会漏看)
@@ -428,7 +459,7 @@ def format_timing_report(report: TimingReport) -> str:
         stage_label = {
             "post-synth": "post-synth (综合后估算,非最终结果)",
             "post-place": "post-place (布局后估算,尚未布线)",
-            "post-route": "post-route (布线后最终结果)",
+            "post-route": "post-route (布线后结果，非完整签核)",
         }.get(report.source_stage, report.source_stage)
         lines.append(f"数据来源: {stage_label}")
         if report.source_detail:
@@ -453,6 +484,12 @@ def format_timing_report(report: TimingReport) -> str:
 
         # Hold 指标
         lines.append(f"  Hold   WHS = {s.whs:+.3f} ns   THS = {s.ths:.3f} ns")
+        if s.hold_failing_endpoints is not None:
+            lines.append(
+                f"         失败端点: {s.hold_failing_endpoints} / {s.hold_total_endpoints}"
+            )
+        if s.wpws is not None and s.tpws is not None:
+            lines.append(f"  Pulse  WPWS = {s.wpws:+.3f} ns   TPWS = {s.tpws:.3f} ns")
         lines.append("")
 
         # 违例警告

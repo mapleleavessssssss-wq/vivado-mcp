@@ -105,9 +105,8 @@ async def _query_fileset_overrides(session) -> list[str]:
 
     Returns:
         要追加进结果的行列表:成功时两行 ``applied_generic: ...`` /
-        ``applied_verilog_define: ...``(空值明示「(无)」;generic 有值时
-        行尾追加 vivado-quirks §3 提醒 —— fileset generic 显示有值不保证
-        综合实际生效);查询失败时一行 ``[DEGRADED]``(含具体原因,不阻塞主流程)。
+        ``applied_verilog_define: ...``(空值明示「(无)」);
+        查询失败时一行 ``[DEGRADED]``(含具体原因,不阻塞主流程)。
     """
     try:
         ov = await session.execute(QUERY_FILESET_OVERRIDES, timeout=15.0)
@@ -134,16 +133,8 @@ async def _query_fileset_overrides(session) -> list[str]:
             applied_vdefine = (
                 s[len("VMCP_FS_OVERRIDE:verilog_define="):].strip() or "(无)"
             )
-    generic_line = f"applied_generic: {applied_generic}"
-    if applied_generic != "(无)":
-        # vivado-quirks §3:fileset 级 generic 即便显示有值(综合日志都打印
-        # bound to:)也可能没真生效(类型不匹配/缓存走错分支),行尾明示防误信。
-        generic_line += (
-            "(注意 2019.1 quirk: fileset generic 显示有值不保证综合实际生效,"
-            "关键参数请核对 runme.log 的 'bound to:' 行,见 vivado-quirks §3)"
-        )
     return [
-        generic_line,
+        f"applied_generic: {applied_generic}",
         f"applied_verilog_define: {applied_vdefine}",
     ]
 

@@ -721,15 +721,12 @@ class TestLaunchAndWaitDiag:
             session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
         )
 
-        assert "applied_generic: WIDTH=8 DEPTH=16" in result
-        assert "applied_verilog_define: (无)" in result
-        # 审计 P2:generic 有值时行尾追加 quirk 提醒(显示有值 ≠ 实际生效)
-        assert "不保证综合实际生效" in result
-        assert "bound to:" in result
+        assert "applied_generic: WIDTH=8 DEPTH=16" in result.splitlines()
+        assert "applied_verilog_define: (无)" in result.splitlines()
 
     @pytest.mark.asyncio
-    async def test_no_quirk_note_when_generic_empty(self):
-        """B4: generic 为 (无) 时不追加 quirk 提醒(提醒只针对「显示有值」场景)。"""
+    async def test_empty_overrides_shown(self):
+        """未设置参数覆盖时明确返回空值。"""
         from vivado_mcp.tools.flow_tools import _launch_and_wait
 
         session = AsyncMock()
@@ -748,8 +745,8 @@ class TestLaunchAndWaitDiag:
             session, "synth_1", jobs=4, timeout_minutes=30, label="综合", ctx=ctx
         )
 
-        assert "applied_generic: (无)" in result
-        assert "不保证综合实际生效" not in result
+        assert "applied_generic: (无)" in result.splitlines()
+        assert "applied_verilog_define: (无)" in result.splitlines()
 
     @pytest.mark.asyncio
     async def test_overrides_query_error_degraded(self):

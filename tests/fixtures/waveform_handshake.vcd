@@ -1,0 +1,30 @@
+$date September 22, 2026 $end
+$version Handshake regression fixture (VCD event syntax) $end
+$timescale 1 ns $end
+$scope module top $end
+$var wire 1 ! clk $end
+$var wire 1 " valid $end
+$var wire 1 # ready $end
+$var wire 8 $ data [7:0] $end
+$scope module dut $end
+$var wire 8 $ data_alias [7:0] $end
+$var reg 4 % state [3:0] $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+0! 0" 0# bx $ bz %
+$end
+#5
+1! 1" b1 $ b0 %
+#10
+0! 1# b10 $
+#10
+b11 $
+#15
+1! 0" bx $
+#20
+0! 0# bz $
+#25
+1! b11111111 $
