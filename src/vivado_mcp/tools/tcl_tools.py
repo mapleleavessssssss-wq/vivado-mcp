@@ -164,7 +164,7 @@ _PLACEHOLDER_RE = re.compile(r"\{([0-9]+)\}")
 @mcp.tool()
 async def safe_tcl(
     template: str,
-    args: list[str] = None,
+    args: list[str] | None = None,
     session_id: str = "default",
     timeout: int = 120,
     ctx: Context = None,

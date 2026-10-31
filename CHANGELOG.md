@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### 修复
+
+- `safe_tcl` 的 `args`、`set_wave_zoom` 的 `wcfg`、`set_wave_analog` 的 `min` / `max` 改为接受 null：之前 schema 公布 `"default": null`，客户端显式传回 null 却被参数校验拒绝。
+
 ## [0.3.27] — 2026-10-31
 
 > 本版修复 MCP 启动的 Vivado 跑不了 `launch_simulation` 的问题,

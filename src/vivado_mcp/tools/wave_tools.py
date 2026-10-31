@@ -143,7 +143,7 @@ def _parse_analog_result(raw: str, signals: list[str]) -> tuple[list[str], list[
 async def set_wave_zoom(
     start_ns: float,
     end_ns: float,
-    wcfg: str = None,
+    wcfg: str | None = None,
     session_id: str = "default",
     ctx: Context = None,
 ) -> str:
@@ -214,8 +214,8 @@ async def set_wave_zoom(
 @mcp.tool()
 async def set_wave_analog(
     signals: list[str],
-    min: float = None,
-    max: float = None,
+    min: float | None = None,
+    max: float | None = None,
     interp: str = "LINEAR",
     height: int = 120,
     session_id: str = "default",
