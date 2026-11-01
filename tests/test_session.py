@@ -473,7 +473,7 @@ class TestStartSessionCurdirWarning:
                 return session, "banner"
 
         monkeypatch.setattr(session_tools, "_get_manager", lambda ctx: FakeManager())
-        monkeypatch.setattr(session_tools, "_check_ascii_paths", lambda p: "")
+        monkeypatch.setattr(session_tools, "_check_ascii_paths", lambda p, cwd=None: "")
         monkeypatch.setattr(
             session_tools, "_check_win_curdir_policy", lambda: "\nCURDIR_WARN"
         )

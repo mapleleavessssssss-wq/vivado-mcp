@@ -12,7 +12,7 @@ from vivado_mcp.analysis.xci_parser import (
     format_xci_compare,
     parse_xci,
 )
-from vivado_mcp.server import _NO_SESSION, _require_session, mcp
+from vivado_mcp.server import _no_session, _require_session, mcp
 from vivado_mcp.tcl_scripts import INSPECT_IP_PARAMS
 from vivado_mcp.vivado.tcl_utils import validate_identifier
 
@@ -74,7 +74,7 @@ async def inspect_ip_params(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     # 执行 Tcl 脚本
     tcl = INSPECT_IP_PARAMS.format(ip_name=ip_name)

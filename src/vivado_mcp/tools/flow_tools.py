@@ -16,7 +16,7 @@ import time
 from mcp.server.mcpserver import Context
 
 from vivado_mcp.analysis.warning_parser import parse_diag_counts, parse_pre_bitstream
-from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
+from vivado_mcp.server import _no_session, _require_session, _safe_execute, mcp
 from vivado_mcp.tcl_scripts import (
     CHECK_PRE_BITSTREAM,
     COUNT_WARNINGS,
@@ -337,7 +337,7 @@ async def run_synthesis(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     return await _launch_and_wait(
         session, run_name, jobs, timeout_minutes, "综合", ctx, wait=wait
@@ -373,7 +373,7 @@ async def run_implementation(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     return await _launch_and_wait(
         session, run_name, jobs, timeout_minutes, "实现", ctx, wait=wait
@@ -408,7 +408,7 @@ async def generate_bitstream(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     # 前置安全检查：force=False 时检测 CRITICAL WARNING。
     # 检查本身失败时不拦截,但必须降级为显式 [DEGRADED](追加进最终返回),
@@ -561,6 +561,8 @@ async def program_device(
     # 路径预检:避免半路 program_hw_devices 才报 "file not found",
     # 此时 hw_server / hw_target 已连上,留下脏状态。
     import os
+    # Vivado 的工作目录和 MCP 进程不同。先转绝对路径,两边才是同一个文件。
+    bitstream_path = os.path.abspath(bitstream_path)
     if not os.path.isfile(bitstream_path):
         return (
             f"[ERROR] 比特流文件不存在: {bitstream_path}\n"
@@ -592,7 +594,7 @@ async def program_device(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     bit_tcl = to_tcl_path(bitstream_path)
 

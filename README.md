@@ -261,8 +261,8 @@ get_run_progress(run_name="synth_1", session_id="default")
 | 工具 | 说明 |
 |------|------|
 | `start_session` | 启动 Vivado 会话（gui/tcl/attach 三种模式） |
-| `stop_session` | 关闭指定会话(B13 修复:taskkill /T 递归杀进程树 + 清 vivado_pid*.str) |
-| `list_sessions` | 列出所有活跃会话 |
+| `stop_session` | 关闭指定会话:taskkill /T 递归杀进程树,只删本实例的 `vivado_pid<pid>.str`,专用工作目录再删 `.Xil/`,其他文件保留。attach 和 Vivado 意外退出后不删文件;对已退出的会话,清除它的退出记录 |
+| `list_sessions` | 列出所有会话,含工作目录、`vivado_pid`、`launcher_pid`、弹窗,以及已退出会话的退出诊断 |
 
 ### Tcl 执行（核心）
 | 工具 | 说明 |
@@ -349,7 +349,7 @@ get_run_progress(run_name="synth_1", session_id="default")
 | `xdc-lint` | 保存任意 `.xdc` 文件后 | 纯 Python 静态检查:PIN_CONFLICT / 漏 IOSTANDARD / create_clock 缺 -period 等,无需等综合 |
 | `verilog-lint` | 保存任意 `.v` / `.sv` 文件后 | 零依赖预检:module 名匹配文件名 / endmodule 存在 / 括号配对 |
 | `iverilog-check` | 保存任意 `.v` / `.sv` 文件后 | **0.3.4** iverilog 或 verilator 语法+连接性检查,未装静默跳过,有 error 时阻断 |
-| `session-guard` | Claude 停下时 | 扫 `vivado_pid*.str` 文件,提醒清理未关闭的 Vivado session |
+| `session-guard` | Claude 停下时 | 扫当前目录的 `vivado_pid*.str` 文件,提醒清理未关闭的 Vivado session。MCP 启动的实例默认写到独立工作目录,所以它只对退回继承目录的实例和手动打开的实例有意义 |
 
 <details>
 <summary>可复制的 settings.json 片段(点击展开)</summary>

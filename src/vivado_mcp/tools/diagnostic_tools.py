@@ -41,7 +41,7 @@ from vivado_mcp.analysis.xdc_auto_fixer import (
 )
 from vivado_mcp.analysis.xdc_linter import format_lint_report, lint_xdc_files
 from vivado_mcp.analysis.xdc_parser import XdcConstraint, parse_xdc_file
-from vivado_mcp.server import _NO_SESSION, _require_session, mcp
+from vivado_mcp.server import _no_session, _require_session, mcp
 from vivado_mcp.tcl_scripts import (
     COUNT_WARNINGS,
     EXTRACT_CRITICAL_WARNINGS,
@@ -443,7 +443,7 @@ async def get_critical_warnings(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     # ============== 仿真分支:走独立路径 ==============
     if run_name.startswith("sim_"):
@@ -586,7 +586,7 @@ async def verify_io_placement_tool(
     """
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     # 第一步：从 Vivado 获取 XDC 文件路径列表，然后 Python 读文件解析
     # B3 修复：不再走 Tcl 正则（不支持 -dict），改 Python 文件解析支持两种语法
@@ -664,8 +664,9 @@ async def xdc_lint(
         session = _require_session(ctx, session_id)
         if not session:
             return (
-                "[ERROR] 未传 xdc_paths 且 session 不存在。"
-                "请传 xdc_paths=['xxx.xdc',...] 或先 start_session + 打开项目。"
+                "[ERROR] 未传 xdc_paths,且没有可用会话。"
+                "请传 xdc_paths=['xxx.xdc',...] 或先 start_session + 打开项目。\n"
+                + _no_session(ctx, session_id)
             )
         xdc_paths, err = await _fetch_project_xdc_paths(session)
         if err:
@@ -719,8 +720,9 @@ async def xdc_auto_fix(
         session = _require_session(ctx, session_id)
         if not session:
             return (
-                "[ERROR] 未传 xdc_paths 且 session 不存在。"
-                "请传 xdc_paths=['xxx.xdc',...] 或先 start_session + 打开项目。"
+                "[ERROR] 未传 xdc_paths,且没有可用会话。"
+                "请传 xdc_paths=['xxx.xdc',...] 或先 start_session + 打开项目。\n"
+                + _no_session(ctx, session_id)
             )
         xdc_paths, err = await _fetch_project_xdc_paths(session)
         if err:

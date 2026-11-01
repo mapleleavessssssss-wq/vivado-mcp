@@ -2,6 +2,58 @@
 
 ## [Unreleased]
 
+> 本版让 MCP 启动的 GUI 不再被已知弹窗卡住,Vivado 退出后能看到原因,
+> 并把仿真打印和真实进程信息交给 AI。没有新增 MCP 工具,TCP 协议和
+> `vivado_mcp_server.tcl` 不变,已安装的 `Vivado_init.tcl` 不用重装。
+
+### 行为变化(升级前请看)
+
+- **MCP 启动的 GUI 使用独立工作目录,相对路径的基准变了**:工作目录从 MCP 进程的目录改为
+  `<临时目录>/vivado-mcp/sessions/<session_id>_<时间>_<短 uuid>/`。Tcl 里的相对路径
+  (`open_project foo.xpr`、`source x.tcl`、`launch_simulation` 的相对输出)现在以它为基准,
+  依赖旧基准的脚本要改成绝对路径。实际目录写在 `start_session` 启动信息和 `list_sessions` 的
+  `cwd` 字段。临时目录含非 ASCII 字符或创建失败时,退回继承调用方目录并在启动信息里警告。
+  attach 和 `mode="tcl"` 不变。
+- **`pid` 字段改名**:`list_sessions` 和 `vivado://session/{id}/status` 不再输出 `pid`,
+  改为 `vivado_pid`(Tcl `[pid]`,真实 vivado.exe)和 `launcher_pid`(spawn 的外层进程,
+  Windows 上是 vivado.bat 的 cmd)。attach 只有 `vivado_pid`。查询失败时 `vivado_pid` 为空,
+  启动信息写明原因。`stop_session` 仍按 `launcher_pid` 杀进程树。
+- **`stop_session` 不再扫描并删除 MCP 目录下所有 `vivado_pid*.str`**(旧行为会删掉其他实例的文件):
+  现在只删本实例的 `vivado_pid<pid>.str`,正常停止时再删专用目录下的 `.Xil/`,目录空了就删除目录,
+  其他文件原样保留。attach 什么都不删;Vivado 意外退出后什么都不删;pid 未知时不删 `.str`。
+- **`list_sessions` 不再只是读取**:发现已退出的会话时,会把它转入退出记录并列出。
+  连续调 `list_sessions` → `stop_session` 不会得到"不存在"。
+- **README 的 session-guard 钩子**:MCP 启动的实例不再把 `.str` 写到项目目录,钩子只对
+  退回继承目录的实例和手动打开的实例有意义。
+
+### 修复
+
+- **`Unable to Open File` 弹窗卡住命令**(根因在 Vivado:task 里的 `$finish` 就会弹 2 个,
+  不经过 MCP 也一样):MCP 启动的 GUI 在命令执行期间自动关闭这个标题的弹窗,方式是向该窗口
+  投递 Esc,不抢前台,只处理本会话的 vivado.exe。结果里写明关闭了几个并建议把 `$finish` 移出 task。
+  超时之后才关闭的,说明附到下一条结果上并写清属于之前的命令。attach 会话只报告,不发按键。
+  其他标题(`Background Task`、`Synthesis Completed` 等)只报告,不关闭。非 Windows 没有这些行为。
+- **卡住时看不出是弹窗**:命令超时、"上一条命令仍在执行"、`list_sessions` 这 3 处,
+  现在会写出弹窗标题和主窗口是否被禁用(`blocking_dialogs` / `main_window_disabled` 字段)。
+- **Vivado 退出后只回答"会话不存在"**:现在报告退出码、`vivado_pid`、工作目录、最后一条命令、
+  `hs_err_pid*` 文件路径和正文、Vivado 日志尾部、启动器日志尾部。工具返回、`list_sessions`、
+  `vivado://session/{id}/status` 都能看到;命令执行中断开时,同一条错误里就带上。
+  退出码的文字保持中性:0 为正常退出,非 0 为异常退出,不断言是崩溃。
+  `stop_session` 或同 id 的 `start_session` 清除记录,最多保留最近 10 个。
+- **用户手动关闭 GUI 后会话仍显示存活**:对端正常关闭连接(FIN)时写端不会自动关,
+  `is_alive` 现在同时看 reader 是否已读到 EOF。
+- **GUI 模式看不到 `$display`**:它不进 Tcl 返回值,只进 `-log` 文件。MCP 启动的 GUI 里,
+  命令位置出现 `run`、`launch_simulation`、`relaunch_sim` 时,把日志新增内容附到结果后,
+  超时错误也附;最多保留尾部 8000 字符,截断时写明总字节数和日志路径。
+  `source` 脚本里的 `run` 不附,到 `startup_log` 路径查看。attach 会话附一行 `[DEGRADED]` 说明。
+- **中文路径警告只看 MCP 进程的目录**:现在检查 Vivado 的实际工作目录。
+- **超时后迟到的异常用户看不到**:日志级别从 debug 提到 warning。
+
+### 文档
+
+- `run_tcl` 说明增加:task 里的 `$finish` 会弹窗;Tcl 8.5 没有 `lmap`;
+  `create_bd_port` 没有 `-freq_hz`,用 `set_property CONFIG.FREQ_HZ`;仿真打印的获取方式。
+
 ## [0.3.27] — 2026-10-31
 
 > 本版修复 MCP 启动的 Vivado 跑不了 `launch_simulation` 的问题,

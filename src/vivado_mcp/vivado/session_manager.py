@@ -15,6 +15,7 @@ from vivado_mcp.vivado.base_session import BaseSession
 from vivado_mcp.vivado.gui_session import (
     _PENDING_SPAWN_PORTS,
     GuiSession,
+    format_death_report,
     probe_vmcp_server,
 )
 from vivado_mcp.vivado.session import SubprocessSession
@@ -38,6 +39,11 @@ _EXTERNAL_PROBE_TIMEOUT = 0.3  # 单端口超时,并发 probe,RST 会立即返�
 # 已管理会话的探活超时(PRD A1):并发 fresh-connection probe,每个 <=1s。
 # is_alive 只看 socket 半边状态,Vivado 挂死时仍报 True,必须真发一次请求验证
 _KNOWN_PROBE_TIMEOUT = 1.0
+# 已退出会话的记录上限,超过时淘汰最旧的。
+_MAX_DEAD_RECORDS = 10
+# 列表里每条记录的每段尾部上限。单条诊断保留完整长度。
+_LISTED_TAIL_CHARS = 1000
+_TAIL_FIELDS = ("hs_err_text", "log_tail", "launcher_tail")
 
 
 def _validate_session_id(session_id: str) -> str:
@@ -48,6 +54,44 @@ def _validate_session_id(session_id: str) -> str:
             f"仅允许字母、数字、下划线、连字符，长度 1~64。"
         )
     return session_id
+
+
+def _build_death_report(session_id: str, session: BaseSession) -> dict:
+    """生成退出诊断。诊断自身出错不能影响调用它的工具,失败时降级为最小记录。"""
+    try:
+        build = getattr(session, "death_report", None)
+        if build is not None:
+            return build()
+        return {
+            **session.status_dict(),
+            "state": "dead",
+            "is_alive": False,
+            "exit_code": None,
+            "note": "Tcl 模式会话,进程已退出或管道已断开,没有详细诊断。",
+        }
+    except Exception as e:
+        logger.warning("生成会话 '%s' 的退出诊断失败: %s", session_id, e)
+        return {
+            "session_id": session_id,
+            "state": "dead",
+            "is_alive": False,
+            "exit_code": None,
+            "note": f"[DEGRADED] 生成退出诊断失败: {e}",
+        }
+
+
+def _brief_report(report: dict) -> dict:
+    """生成列表用的诊断副本:每段尾部只留最后 1000 字符,存着的诊断不变。"""
+    brief = dict(report)
+    for key in _TAIL_FIELDS:
+        text = brief.get(key)
+        if text and len(text) > _LISTED_TAIL_CHARS:
+            brief[key] = text[-_LISTED_TAIL_CHARS:]
+            brief["tails_truncated"] = (
+                f"每段尾部只显示最后 {_LISTED_TAIL_CHARS} 字符,"
+                "完整内容看 vivado://session/<id>/status"
+            )
+    return brief
 
 
 class SessionManager:
@@ -64,6 +108,10 @@ class SessionManager:
         # 主清理路径仍是 GuiSession 自持 pid + 自洽 stop;这里只做"self._proc
         # 引用失联时仍知道该清哪个端口/进程"的二级记录。
         self._port_map: dict[str, tuple[int | None, int | None]] = {}
+        # 已退出会话:session_id → (会话对象, 退出诊断),按退出先后排列。
+        # 对象留着是因为外层进程和临时脚本要等 stop 才清理。
+        self._dead: dict[str, tuple[BaseSession, dict]] = {}
+        self._evicting: set[asyncio.Task[None]] = set()
 
     @property
     def default_vivado_path(self) -> str:
@@ -74,11 +122,63 @@ class SessionManager:
         _validate_session_id(session_id)
         session = self._sessions.get(session_id)
         if session and not session.is_alive:
-            # 会话存在但进程已死，清理掉
-            logger.warning("会话 '%s' 已失效，自动清理。", session_id)
-            del self._sessions[session_id]
+            # 会话存在但进程已死，转入退出记录，保留诊断
+            logger.warning("会话 '%s' 已失效，转入退出记录。", session_id)
+            self._retire(session_id)
             return None
         return session
+
+    def _retire(self, session_id: str) -> None:
+        """把已退出的会话从 _sessions 移到 _dead,并限制记录数量。"""
+        session = self._sessions.pop(session_id, None)
+        self._port_map.pop(session_id, None)
+        if session is None:
+            return
+        replaced = self._dead.pop(session_id, None)
+        if replaced is not None:
+            self._stop_in_background(session_id, replaced[0])
+        self._dead[session_id] = (session, _build_death_report(session_id, session))
+        while len(self._dead) > _MAX_DEAD_RECORDS:
+            oldest = next(iter(self._dead))
+            logger.warning("退出记录超过 %d 个,淘汰最旧的 '%s'", _MAX_DEAD_RECORDS, oldest)
+            self._stop_in_background(oldest, self._dead.pop(oldest)[0])
+
+    def _stop_in_background(self, session_id: str, session: BaseSession) -> None:
+        """被淘汰的记录仍要 stop(外层进程可能还在)。_retire 是同步的,只能排任务。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("没有事件循环,未能清理被淘汰的会话 '%s'", session_id)
+            return
+        task = loop.create_task(self._stop_quietly(session_id, session))
+        self._evicting.add(task)
+        task.add_done_callback(self._evicting.discard)
+
+    @staticmethod
+    async def _stop_quietly(session_id: str, session: BaseSession) -> None:
+        try:
+            await session.stop()
+        except Exception as e:
+            logger.warning("清理已退出的会话 '%s' 失败: %s", session_id, e)
+
+    def dead_report(self, session_id: str) -> dict | None:
+        """取已退出会话的诊断,没有记录返回 None。"""
+        entry = self._dead.get(session_id)
+        if entry is None:
+            return None
+        session, report = entry
+        # 退休时外层进程可能还没被回收,退出码之后才拿得到。
+        if report.get("exit_code") is None and getattr(session, "exit_code", None) is not None:
+            report = _build_death_report(session_id, session)
+            self._dead[session_id] = (session, report)
+        return report
+
+    def no_session_message(self, session_id: str) -> str:
+        """拿不到会话时给工具层的错误文本。"""
+        report = self.dead_report(session_id)
+        if report is not None:
+            return format_death_report(report)
+        return f"[ERROR] 会话 '{session_id}' 不存在。请先调用 start_session。"
 
     async def start_session(
         self,
@@ -116,6 +216,16 @@ class SessionManager:
             return existing, (
                 f"会话 '{session_id}' 已在运行中（mode={existing.mode}）。"
             )
+
+        # 同 id 的退出记录作废。旧对象的外层进程和临时脚本要先清理。
+        stale_note = ""
+        stale = self._dead.pop(session_id, None)
+        if stale is not None:
+            try:
+                await stale[0].stop()
+            except Exception as e:
+                logger.warning("清理已退出的旧会话 '%s' 失败: %s", session_id, e)
+                stale_note = f"\n[DEGRADED] 清理已退出的旧会话失败: {e}"
 
         path = vivado_path or self._default_vivado_path
 
@@ -162,7 +272,7 @@ class SessionManager:
             getattr(session, "pid", None),
         )
 
-        return session, banner
+        return session, banner + stale_note
 
     async def get_or_start(
         self,
@@ -189,8 +299,11 @@ class SessionManager:
             操作结果描述。
         """
         session = self._sessions.get(session_id)
+        if session and not session.is_alive:
+            self._retire(session_id)
+            session = None
         if not session:
-            return f"会话 '{session_id}' 不存在。"
+            return await self._stop_dead_session(session_id)
 
         # stop 成功后再 pop:stop 抛异常时会话保留在 _sessions/_port_map,
         # AI 看到 [ERROR] 后可重试 stop_session。pop-before-stop 会让重试
@@ -199,7 +312,23 @@ class SessionManager:
         await session.stop()
         self._sessions.pop(session_id, None)
         self._port_map.pop(session_id, None)
+        # stop 期间若有工具调用 get(),会把正在关闭的会话误转入退出记录。
+        self._dead.pop(session_id, None)
         return f"会话 '{session_id}' 已关闭。"
+
+    async def _stop_dead_session(self, session_id: str) -> str:
+        """清理已退出的会话并清除记录。stop 失败时保留记录,异常上抛,可重试。"""
+        report = self.dead_report(session_id)
+        if report is None:
+            return f"会话 '{session_id}' 不存在。"
+        await self._dead[session_id][0].stop()
+        self._dead.pop(session_id, None)
+        code = report.get("exit_code")
+        kept = f"工作目录 {report['cwd']} 里的文件未删除。" if report.get("cwd") else ""
+        return (
+            f"会话 '{session_id}' 的 Vivado 此前已退出"
+            f"(退出码 {'未知' if code is None else code}),已清理并清除记录。{kept}"
+        )
 
     async def close_all(self) -> None:
         """关闭所有会话（lifespan cleanup）。"""
@@ -213,13 +342,20 @@ class SessionManager:
                 except Exception as e:
                     logger.error("关闭会话 '%s' 失败: %s", sid, e)
 
+        for sid in list(self._dead):
+            session, _ = self._dead.pop(sid)
+            await self._stop_quietly(sid, session)
+        if self._evicting:
+            await asyncio.gather(*self._evicting)
+
         logger.info("所有 Vivado 会话已清理完毕。")
 
     async def list_sessions(self, probe_external: bool = True) -> list[dict]:
-        """列出所有会话的状态信息(含死会话,标记 is_alive=False)。
+        """列出所有会话的状态信息(含已退出会话的诊断,标记 is_alive=False)。
 
-        纯只读,不会清理死会话 —— 否则 AI 连续调 list → stop 时第二次会
-        拿到 "会话不存在" 的误导反馈。需要清理时显式调 prune_dead()。
+        已退出的会话会转入退出记录并列出,不会丢失:AI 连续调 list → stop 时,
+        stop_session 仍能找到它,不会得到 "会话不存在"。记录要 stop_session 或
+        同 id 的 start_session 才清除。
 
         Args:
             probe_external: 是否主动 probe 9999..10003 发现未被 MCP 管理的
@@ -235,11 +371,13 @@ class SessionManager:
             的参数(MCP 没管它,无权关闭)。探活失败的已管理会话带
             ``responsive=False`` + 中性 note(未响应 ≠ 已死,is_alive 不翻转)。
         """
+        self.prune_dead()
         sessions = list(self._sessions.values())
         known = [s.status_dict() for s in sessions]
+        dead = [_brief_report(self.dead_report(sid)) for sid in list(self._dead)]
 
         if not probe_external:
-            return known
+            return known + dead
 
         # —— PRD A1:已管理会话探活目标筛选 ——
         # 用 fresh-connection 的 probe_vmcp_server 而非在会话自有连接上探活:
@@ -322,15 +460,14 @@ class SessionManager:
                 ),
             })
 
-        return known + external
+        return known + dead + external
 
     def prune_dead(self) -> list[str]:
-        """清理已死亡的会话条目,返回被清理的 session_id 列表。"""
+        """把已死亡的会话转入退出记录,返回被转入的 session_id 列表。"""
         dead = [
             sid for sid, s in self._sessions.items()
             if not s.is_alive
         ]
         for sid in dead:
-            del self._sessions[sid]
-            self._port_map.pop(sid, None)
+            self._retire(sid)
         return dead

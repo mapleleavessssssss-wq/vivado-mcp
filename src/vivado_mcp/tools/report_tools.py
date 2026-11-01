@@ -35,7 +35,7 @@ from vivado_mcp.analysis.timing_parser import (
 )
 from vivado_mcp.analysis.util_parser import format_utilization_report, parse_utilization
 from vivado_mcp.analysis.warning_parser import parse_diag_counts
-from vivado_mcp.server import _NO_SESSION, _require_session, mcp
+from vivado_mcp.server import _no_session, _require_session, mcp
 from vivado_mcp.tcl_scripts import (
     CHECK_PRE_BITSTREAM,
     COUNT_WARNINGS,
@@ -66,7 +66,7 @@ async def get_io_report(
     """
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     # 直接获取完整输出（不经 _safe_execute，避免 .summary 截断）
     try:
@@ -127,7 +127,7 @@ async def get_timing_report(
             return error(f"[ERROR] 读取时序报告失败: {exc}")
     session = _require_session(ctx, session_id)
     if not session:
-        return error(_NO_SESSION.format(sid=session_id))
+        return error(_no_session(ctx, session_id))
 
     # 第一步:查询当前设计阶段,后面附加到 TimingReport 让用户知道数据来源
     # Bug 2 修复:区分 post-synth 估算 vs post-route 最终,避免误判
@@ -270,7 +270,7 @@ async def check_bitstream_readiness(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     try:
         pre_result = await session.execute(
@@ -327,7 +327,7 @@ async def get_utilization_report(
     """
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     try:
         result = await session.execute(
@@ -364,7 +364,7 @@ async def get_project_info(
     """
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     try:
         result = await session.execute(QUERY_PROJECT_INFO, timeout=30.0)
@@ -409,7 +409,7 @@ async def get_run_progress(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     try:
         result = await session.execute(
@@ -451,7 +451,7 @@ async def get_next_suggestion(
     """
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     try:
         result = await session.execute(QUERY_PROJECT_INFO, timeout=30.0)
@@ -486,7 +486,7 @@ async def get_ip_status(
     """
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     try:
         result = await session.execute(
@@ -533,7 +533,7 @@ async def get_pre_commit_summary(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     # 采样失败列表:任何一项失败都降级 verdict,commit 摘要不能撒谎
     # 空列表 = 全部采样成功,有元素 = 至少一项降级

@@ -16,19 +16,24 @@ from __future__ import annotations
 import asyncio
 import atexit
 import codecs
+import errno
 import importlib.resources
 import json
 import logging
 import os
 import re
+import shutil
 import socket
 import tempfile
 import time
 import uuid
+from collections.abc import Collection
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from vivado_mcp.tcl_scripts import QUERY_CURRENT_PROJECT
+from vivado_mcp.tcl_scripts import QUERY_CURRENT_PROJECT, QUERY_VIVADO_PROCESS
+from vivado_mcp.vivado import win32_dialogs
 from vivado_mcp.vivado.base_session import BaseSession, SessionState, vivado_child_env
 from vivado_mcp.vivado.tcl_utils import TclResult, clean_output, decode_vivado_output
 
@@ -55,6 +60,34 @@ _PENDING_SPAWN_PORTS: set[int] = set()
 
 # current_project 一次性查询(PRD A2)的独立短连接超时。模块级常量便于测试覆盖。
 _CURPROJ_TIMEOUT = 5.0
+# 真实 vivado pid / pwd 一次性查询的超时。
+_PROC_QUERY_TIMEOUT = 5.0
+
+# 自动关闭的弹窗白名单:标题必须完全相等。其他弹窗只报告,不发按键。
+_AUTO_DISMISS_TITLES = frozenset({"Unable to Open File"})
+_DIALOG_POLL_INTERVAL = 1.0  # 巡检间隔
+_DIALOG_MIN_AGE = 1.0  # 窗口存在这么久才发 Esc,给它留出完成创建的时间
+_DIALOG_RETRY_INTERVAL = 2.0  # 同一窗口两次 Esc 的最小间隔
+_DIALOG_MAX_ATTEMPTS = 3  # 同一窗口最多发几次 Esc
+_DIALOG_SETTLE_POLLS = 5  # 命令结束后,再确认几次发过 Esc 的窗口是否消失
+_DIALOG_SETTLE_INTERVAL = 0.1
+_DIALOG_JOIN_TIMEOUT = 2.0  # 等巡检任务收尾的上限
+
+# 仿真打印($display)不进 Tcl 返回值,只进 -log 文件。命令位置出现这些命令时附日志增量。
+# 后面必须跟空白、命令结束符或串尾,所以 run_tcl / launch_runs / get_runs 都不匹配。
+_SIM_COMMAND_RE = re.compile(
+    r"(?:^|[;\[{])\s*(?:run|launch_simulation|relaunch_sim)(?=[\s;\]}]|$)", re.M
+)
+_SIM_LOG_MAX_CHARS = 8000
+
+_LAST_COMMAND_CHARS = 200
+_EXIT_WAIT_TIMEOUT = 2.0  # 连接断开后等外层进程退出、拿退出码的上限
+_CRASH_FILE_LIMIT = 10
+
+
+def _safe_session_id(session_id: str) -> str:
+    """把 session_id 收敛成可放进文件名的字符。"""
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)[:64] or "session"
 
 
 def _new_startup_log_path(session_id: str) -> Path:
@@ -65,9 +98,50 @@ def _new_startup_log_path(session_id: str) -> Path:
             str(Path(tempfile.gettempdir()) / "vivado-mcp" / "logs"),
         )
     ).expanduser().resolve()
-    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", session_id)[:64] or "session"
+    safe_id = _safe_session_id(session_id)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return root / f"vivado_{safe_id}_{stamp}_{uuid.uuid4().hex}.log"
+
+
+def _new_session_workdir(session_id: str) -> tuple[Path | None, str]:
+    """创建本次 spawn 专用的工作目录,返回 (目录, 退回原因)。
+
+    Vivado 2019.x 在非 ASCII 路径下可能崩溃,所以临时目录含非 ASCII 字符时不用它。
+    无法使用时返回 ``(None, 原因)``,调用方退回继承 MCP 进程的目录。
+    """
+    try:
+        root = Path(tempfile.gettempdir()).resolve() / "vivado-mcp" / "sessions"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = root / f"{_safe_session_id(session_id)}_{stamp}_{uuid.uuid4().hex[:8]}"
+        if not str(path).isascii():
+            reason = f"临时目录含非 ASCII 字符: {path}"
+        else:
+            path.mkdir(parents=True)
+            return path, ""
+    except OSError as exc:
+        reason = f"创建工作目录失败: {exc}"
+    logger.warning("会话 '%s' 退回继承调用方工作目录: %s", session_id, reason)
+    return None, reason
+
+
+def _decode_log_bytes(raw: bytes, clipped: bool) -> str:
+    """解码从日志中间读出的字节段。``clipped`` 表示开头可能切开了多字节字符。
+
+    窗口可能从半个多字节字符开始，文件末尾也可能仍在写入。
+    先对齐编码边界，避免有效 UTF-8 因截断而整段误走系统 ANSI 回退。
+    """
+    encodings = ("utf-8", "mbcs") if os.name == "nt" else ("utf-8",)
+    for encoding in encodings:
+        for skip in range(min(4, len(raw)) if clipped else 1):
+            decoder = codecs.getincrementaldecoder(encoding)()
+            try:
+                decoder.decode(raw[skip:], final=False)
+            except UnicodeDecodeError:
+                continue
+            pending, _ = decoder.getstate()
+            aligned = raw[skip:len(raw) - len(pending)]
+            return decode_vivado_output(aligned)
+    return decode_vivado_output(raw)
 
 
 def _tail_text_file(path: Path | None, max_chars: int = 4000) -> str:
@@ -87,21 +161,30 @@ def _tail_text_file(path: Path | None, max_chars: int = 4000) -> str:
     except OSError as exc:
         logger.warning("读取启动日志 %s 失败，保留原始启动错误: %s", path, exc)
         return ""
+    return _decode_log_bytes(raw, offset > 0)[-max_chars:].strip()
 
-    # 尾部窗口可能从半个多字节字符开始，文件末尾也可能仍在写入。
-    # 先对齐编码边界，避免有效 UTF-8 因截断而整段误走系统 ANSI 回退。
-    encodings = ("utf-8", "mbcs") if os.name == "nt" else ("utf-8",)
-    for encoding in encodings:
-        for skip in range(min(4, len(raw)) if offset else 1):
-            decoder = codecs.getincrementaldecoder(encoding)()
-            try:
-                decoder.decode(raw[skip:], final=False)
-            except UnicodeDecodeError:
-                continue
-            pending, _ = decoder.getstate()
-            aligned = raw[skip:len(raw) - len(pending)]
-            return decode_vivado_output(aligned)[-max_chars:].strip()
-    return decode_vivado_output(raw)[-max_chars:].strip()
+
+def _read_log_delta(path: Path, offset: int, max_chars: int) -> tuple[str, int, bool]:
+    """读取日志从 offset 起新增的内容,返回 ``(尾部文本, 新增字节数, 是否截断)``。
+
+    只读有界尾部,读取限制作用在字节 IO 上。读取失败时抛 OSError,由调用方降级。
+    """
+    max_bytes = max_chars * 4
+    with path.open("rb") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        if size < offset:
+            # 日志变短说明被轮转或截断,文件里全是发送命令之后的内容。
+            logger.warning("日志 %s 比命令发送前短(%d < %d),从头读取", path, size, offset)
+            offset = 0
+        total = size - offset
+        if total <= 0:
+            return "", 0, False
+        start = max(offset, size - max_bytes)
+        handle.seek(start)
+        raw = handle.read(size - start)
+    text = _decode_log_bytes(raw, start > 0)
+    truncated = start > offset or len(text) > max_chars
+    return text[-max_chars:].strip(), total, truncated
 
 
 def _describe_text_file(path: Path | None) -> str:
@@ -116,6 +199,49 @@ def _describe_text_file(path: Path | None) -> str:
         logger.warning("检查启动日志 %s 失败: %s", path, exc)
         return f"{path} (状态读取失败: {exc})"
     return f"{path} (已存在，{size} 字节)"
+
+
+def format_death_report(report: dict) -> str:
+    """把退出诊断转成中文文本。文字保持中性:只说退出码,不断言是崩溃。"""
+    sid = report.get("session_id", "?")
+    code = report.get("exit_code")
+    if code is None:
+        head = f"[ERROR] 会话 '{sid}' 的 Vivado 连接已断开,可能已退出,退出码未知。"
+    elif code == 0:
+        head = f"[ERROR] 会话 '{sid}' 的 Vivado 已退出:正常退出(退出码 0)。"
+    else:
+        head = f"[ERROR] 会话 '{sid}' 的 Vivado 已退出:异常退出(退出码 {code})。"
+    lines = [head, f"模式: {report.get('mode', '未知')}"]
+    for label, key in (
+        ("vivado_pid", "vivado_pid"),
+        ("launcher_pid", "launcher_pid"),
+        ("工作目录", "cwd"),
+        ("最后一条命令", "last_command"),
+        ("运行时长(秒)", "uptime_seconds"),
+        ("说明", "note"),
+    ):
+        value = report.get(key)
+        if value not in (None, ""):
+            lines.append(f"{label}: {value}")
+    if "crash_files" in report:
+        files = report["crash_files"]
+        lines.append(
+            "hs_err 文件: " + ", ".join(files)
+            if files
+            else "hs_err 文件: 工作目录下未找到(若执行过 Tcl cd,可能在其他目录)"
+        )
+    if report.get("hs_err_text"):
+        lines.append(f"hs_err 正文:\n{report['hs_err_text']}")
+    for label, path_key, tail_key in (
+        ("Vivado 日志", "startup_log", "log_tail"),
+        ("启动器日志", "launcher_log", "launcher_tail"),
+    ):
+        if report.get(path_key):
+            lines.append(f"{label}: {_describe_text_file(Path(report[path_key]))}")
+        if report.get(tail_key):
+            lines.append(f"{label}尾部:\n{report[tail_key]}")
+    lines.append("处理: start_session 用同一 id 可重新启动;stop_session 清理并清除这条记录。")
+    return "\n".join(lines)
 
 
 def _make_probe_payload() -> tuple[str, bytes]:
@@ -193,21 +319,17 @@ def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
-def _query_current_project(
-    host: str, port: int, timeout: float = _CURPROJ_TIMEOUT
-) -> tuple[str, str] | None:
-    """一次性独立短连接查询 current_project(PRD A2 横幅提示用)。
+def _query_short_connection(
+    host: str, port: int, script: str, timeout: float
+) -> tuple[str | None, str]:
+    """一次性独立短连接执行 Tcl 脚本,返回 ``(output, 失败原因)``。
 
     **绝不走会话主连接**:主连接上的查询一旦超时,迟到的响应会残留在流上,
     让后续所有 execute 的请求/响应永久错位一格(0.3.22 审计 P1,fake server
     实测复现)。本函数与 :func:`probe_vmcp_server` 同款同步收发:
-    连接 → 发一帧 QUERY_CURRENT_PROJECT → 读一帧 → 关闭,失败即丢弃连接。
-
-    Returns:
-        ``(工程名, 工程目录)``:无项目时工程名为 ``""``,目录取不到时为 ``""``;
-        任何失败返回 None 并 logger.warning 具体原因 —— 失败只意味着 banner 无提示。
+    连接 → 发一帧 → 读一帧 → 关闭,失败即丢弃连接。
     """
-    payload = QUERY_CURRENT_PROJECT.encode("utf-8")
+    payload = script.encode("utf-8")
     header = len(payload).to_bytes(4, "big")
     try:
         with socket.create_connection((host, port), timeout=timeout) as s:
@@ -215,36 +337,35 @@ def _query_current_project(
             s.sendall(header + payload)
             hdr = _recv_exact(s, 4)
             if hdr is None:
-                logger.warning(
-                    "current_project 查询读响应头失败(对端关闭或 %ss 超时),"
-                    "banner 省略项目提示", timeout,
-                )
-                return None
+                return None, f"读响应头失败(对端关闭或 {timeout}s 超时)"
             resp_len = int.from_bytes(hdr, "big")
             if resp_len <= 0 or resp_len > _HANDSHAKE_MAX_RESP:
-                logger.warning(
-                    "current_project 查询响应长度非法: %d,banner 省略项目提示",
-                    resp_len,
-                )
-                return None
+                return None, f"响应长度非法: {resp_len}"
             body = _recv_exact(s, resp_len)
             if body is None:
-                logger.warning(
-                    "current_project 查询读响应体失败(对端关闭或 %ss 超时),"
-                    "banner 省略项目提示", timeout,
-                )
-                return None
+                return None, f"读响应体失败(对端关闭或 {timeout}s 超时)"
             obj = json.loads(body.decode("utf-8"))
-            output = str(obj.get("output", ""))
     except (OSError, socket.timeout) as e:
-        logger.warning(
-            "current_project 查询连接/收发失败(banner 省略项目提示): %s", e
-        )
-        return None
+        return None, f"连接/收发失败: {e}"
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logger.warning(
-            "current_project 查询响应解析失败(banner 省略项目提示): %s", e
-        )
+        return None, f"响应解析失败: {e}"
+    if not isinstance(obj, dict):
+        return None, f"响应不是 JSON 对象,前 200 字: {str(obj)[:200]!r}"
+    return str(obj.get("output", "")), ""
+
+
+def _query_current_project(
+    host: str, port: int, timeout: float = _CURPROJ_TIMEOUT
+) -> tuple[str, str] | None:
+    """一次性独立短连接查询 current_project(PRD A2 横幅提示用)。
+
+    Returns:
+        ``(工程名, 工程目录)``:无项目时工程名为 ``""``,目录取不到时为 ``""``;
+        任何失败返回 None 并 logger.warning 具体原因 —— 失败只意味着 banner 无提示。
+    """
+    output, reason = _query_short_connection(host, port, QUERY_CURRENT_PROJECT, timeout)
+    if output is None:
+        logger.warning("current_project 查询失败,banner 省略项目提示: %s", reason)
         return None
 
     name: str | None = None
@@ -261,6 +382,27 @@ def _query_current_project(
         output[:200],
     )
     return None
+
+
+def _query_vivado_process(
+    host: str, port: int, timeout: float = _PROC_QUERY_TIMEOUT
+) -> tuple[int | None, str | None, str]:
+    """一次性独立短连接查询真实 vivado pid 和 pwd,返回 ``(pid, pwd, 失败原因)``。"""
+    output, reason = _query_short_connection(host, port, QUERY_VIVADO_PROCESS, timeout)
+    if output is None:
+        return None, None, reason
+
+    pid: int | None = None
+    cwd: str | None = None
+    for line in output.splitlines():
+        if line.startswith("VMCP_PROC_PID:"):
+            value = line[len("VMCP_PROC_PID:"):].strip()
+            pid = int(value) if value.isdecimal() else None
+        elif line.startswith("VMCP_PROC_CWD:"):
+            cwd = line[len("VMCP_PROC_CWD:"):].strip() or None
+    if pid is None:
+        return None, cwd, f"输出缺 VMCP_PROC_PID 标记,前 200 字: {output[:200]!r}"
+    return pid, cwd, ""
 
 
 def _cleanup_tmp_scripts_atexit() -> None:
@@ -332,9 +474,26 @@ class GuiSession(BaseSession):
         self._proc: asyncio.subprocess.Process | None = None
         # auto-alloc 出来的确切端口(port==0 路径);显式端口路径下保持 None。
         self._allocated_port: int | None = None
-        # spawn 的 vivado pid,供 stop() 在 self._proc 引用丢失时按 pid 精杀。
-        # attach / 命中外部 GUI 路径本就不 spawn,_pid 保持 None,被 stop 双守卫挡住。
-        self._pid: int | None = None
+        # spawn 的外层进程 pid(vivado.bat 的 cmd),供 stop() 在 self._proc 引用丢失时
+        # 按 pid 精杀进程树。attach / 命中外部 GUI 路径本就不 spawn,保持 None,
+        # 被 stop 双守卫挡住。
+        self._launcher_pid: int | None = None
+        # 真实 vivado.exe 的 pid(Tcl [pid]),查询失败时为 None。
+        self._vivado_pid: int | None = None
+        # 实际工作目录:优先用 Tcl [pwd],查询失败时 spawn 路径用传给子进程的目录。
+        self._cwd: str | None = None
+        # 本实例专用工作目录;退回继承调用方目录或 attach 时为 None。
+        self._workdir: Path | None = None
+        self._workdir_warning: str = ""
+        # 弹窗巡检任务;它只观察在途任务,不碰 _lock / _inflight_task / reader。
+        self._dialog_watcher: asyncio.Task[None] | None = None
+        # 已关闭但还没告诉调用方的弹窗数,归属 _last_command。
+        self._dismissed_dialogs: int = 0
+        # 之前超时的命令留下的说明,还没能附到任何结果上。
+        self._late_dialog_note: str = ""
+        self._last_command: str = ""
+        # 第一次生成退出诊断的时刻,用来冻结运行时长。
+        self._ended_at: float | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connected_port: int | None = None
@@ -371,14 +530,24 @@ class GuiSession(BaseSession):
 
     @property
     def pid(self) -> int | None:
-        """本 session spawn 的 vivado 进程 pid(attach / 外部命中路径为 None)。"""
-        return self._pid
+        """本 session spawn 的外层进程 pid(attach / 外部命中路径为 None)。"""
+        return self._launcher_pid
 
     def status_dict(self) -> dict:
-        """在基类字段上补 pid,便于 list_sessions / 诊断区分自己 spawn 的实例。"""
+        """在基类字段上补 pid 和工作目录,便于 list_sessions / 诊断定位实例。"""
         d = super().status_dict()
-        if self._pid is not None:
-            d["pid"] = self._pid
+        d["vivado_pid"] = self._vivado_pid
+        if self._launcher_pid is not None:
+            d["launcher_pid"] = self._launcher_pid
+        if self._cwd is not None:
+            d["cwd"] = self._cwd
+        if self.is_alive and self._vivado_pid is not None:
+            dialogs = win32_dialogs.list_dialogs(self._vivado_pid)
+            if dialogs:
+                d["blocking_dialogs"] = [w.title for w in dialogs]
+                d["main_window_disabled"] = win32_dialogs.main_window_disabled(
+                    self._vivado_pid
+                )
         if self._startup_log_path is not None:
             d["startup_log"] = str(self._startup_log_path)
         if self._launcher_log_path is not None:
@@ -420,6 +589,10 @@ class GuiSession(BaseSession):
         if self._state in (SessionState.DEAD, SessionState.STOPPED):
             return False
         if self._writer is None:
+            return False
+        # 对端正常关闭(FIN)时 StreamWriter 不会自动关,要看 reader 是否已读到 EOF。
+        # 用户手动关 GUI、Tcl exit 都走这条路,此后这条连接不可能再有响应。
+        if isinstance(self._reader, asyncio.StreamReader) and self._reader.at_eof():
             return False
         # StreamWriter.is_closing() 反映 socket 状态
         return not self._writer.is_closing()
@@ -470,6 +643,15 @@ class GuiSession(BaseSession):
         # 同一对象停用后可重新启动；转为 attach 时不应沿用上次 spawn 的日志。
         self._startup_log_path = None
         self._launcher_log_path = None
+        self._launcher_pid = None
+        self._vivado_pid = None
+        self._cwd = None
+        self._workdir = None
+        self._workdir_warning = ""
+        self._dismissed_dialogs = 0
+        self._late_dialog_note = ""
+        self._last_command = ""
+        self._ended_at = None
         self._closing = False
         self._state = SessionState.STARTING
         logger.info(
@@ -496,7 +678,9 @@ class GuiSession(BaseSession):
                     "会话 '%s' attach 到外部 GUI(端口 %d),跳过 spawn",
                     self.session_id, self._connected_port,
                 )
-                return msg + await self._current_project_hint()
+                return (
+                    msg + await self._process_banner() + await self._current_project_hint()
+                )
             logger.info(
                 "端口 %d 无 vivado-mcp server,走 spawn 新 GUI 路径",
                 self._port_preference,
@@ -522,6 +706,8 @@ class GuiSession(BaseSession):
                 self._state = SessionState.ERROR
                 raise RuntimeError(str(e)) from e
 
+            spawn_path = self._prepare_workdir()
+
             try:
                 self._startup_log_path = _new_startup_log_path(self.session_id)
                 self._launcher_log_path = self._startup_log_path.with_suffix(
@@ -535,7 +721,8 @@ class GuiSession(BaseSession):
                     mode="w", suffix=".tcl", delete=False, encoding="utf-8"
                 ) as tmp:
                     tmp.write(f"set ::VMCP_PORT_PREF {target_port}\n")
-                    tmp.write(f'source "{script_path.as_posix()}"\n')
+                    # -notrace:否则整份脚本逐行回显进日志,诊断的日志尾部全是 ## 行
+                    tmp.write(f'source -notrace "{script_path.as_posix()}"\n')
                     tmp_script = tmp.name
                 self._tmp_script = tmp_script
                 # atexit 兜底:MCP 进程被强杀时仍会清理
@@ -546,7 +733,7 @@ class GuiSession(BaseSession):
                 # 父进程句柄在启动成功、异常或取消时均关闭，子进程持有自己的副本。
                 with self._launcher_log_path.open("xb", buffering=0) as launcher_log:
                     self._proc = await asyncio.create_subprocess_exec(
-                        self.vivado_path,
+                        spawn_path,
                         "-mode", "gui",
                         "-source", tmp_script,
                         "-nojournal", "-log", str(self._startup_log_path),
@@ -554,9 +741,11 @@ class GuiSession(BaseSession):
                         stdout=launcher_log,
                         stderr=asyncio.subprocess.STDOUT,
                         env=vivado_child_env(),
+                        # None = 继承调用方目录(独立工作目录不可用时的退回路径)
+                        cwd=str(self._workdir) if self._workdir is not None else None,
                     )
                 # 记下 pid:stop() 在 self._proc 引用因故丢失时仍能按 pid 精杀
-                self._pid = self._proc.pid
+                self._launcher_pid = self._proc.pid
                 logger.info(
                     "已 spawn Vivado GUI (pid=%s, 目标端口=%d), 等待 TCP server 就绪...",
                     self._proc.pid, target_port,
@@ -610,7 +799,11 @@ class GuiSession(BaseSession):
                             f"端口 {target_port}"
                         )
                         logger.info(msg)
-                        return msg + await self._current_project_hint()
+                        return (
+                            msg
+                            + await self._process_banner()
+                            + await self._current_project_hint()
+                        )
                     logger.debug(
                         "端口 %d 握手失败（可能是其他产品的 server），重试",
                         target_port,
@@ -644,6 +837,47 @@ class GuiSession(BaseSession):
             if spawned:
                 _PENDING_SPAWN_PORTS.discard(target_port)
 
+    def _prepare_workdir(self) -> str:
+        """准备本次 spawn 的工作目录,返回传给子进程的可执行文件路径。
+
+        相对路径的 vivado_path 在指定 cwd 后解析基准会变,这里先转成绝对路径。
+        裸文件名走 PATH 查找,不受 cwd 影响,保持原样。
+        """
+        self._workdir, reason = _new_session_workdir(self.session_id)
+        if self._workdir is not None:
+            self._cwd = str(self._workdir)
+            has_dir = "/" in self.vivado_path or "\\" in self.vivado_path
+            if has_dir and not os.path.isabs(self.vivado_path):
+                return os.path.abspath(self.vivado_path)
+            return self.vivado_path
+        try:
+            self._cwd = os.getcwd()
+        except OSError as exc:
+            logger.warning("读取调用方工作目录失败: %s", exc)
+        self._workdir_warning = (
+            f"\n⚠  警告:未使用独立工作目录,继承调用方目录 {self._cwd or '<未知>'}。"
+            f"原因: {reason}"
+        )
+        return self.vivado_path
+
+    async def _process_banner(self) -> str:
+        """查询真实 vivado pid 和 pwd,生成启动信息。查询失败不影响启动。"""
+        if self._connected_port is None:
+            return ""
+        pid, cwd, reason = await asyncio.to_thread(
+            _query_vivado_process, "127.0.0.1", self._connected_port, _PROC_QUERY_TIMEOUT
+        )
+        self._vivado_pid = pid
+        if cwd is not None:
+            self._cwd = cwd
+        lines = f"\n工作目录: {self._cwd or '<未知>'}(Tcl 相对路径以它为基准)"
+        if pid is None:
+            logger.warning(
+                "会话 '%s' 查询 vivado_pid 失败,不处理弹窗: %s", self.session_id, reason
+            )
+            lines += f"\n[DEGRADED] 未取得 vivado_pid,不会处理弹窗: {reason}"
+        return lines + self._workdir_warning
+
     async def _cleanup_failed_spawn(self) -> None:
         """start() 超时/失败时杀掉自己 spawn 的 Vivado,防止产生孤儿进程。
 
@@ -656,7 +890,7 @@ class GuiSession(BaseSession):
 
         if self._proc is None or self._proc.returncode is not None:
             return
-        kill_pid = self._pid if self._pid is not None else self._proc.pid
+        kill_pid = self._launcher_pid if self._launcher_pid is not None else self._proc.pid
         logger.warning(
             "会话 '%s' 启动失败,清理已 spawn 的 Vivado 进程 (pid=%s)",
             self.session_id, kill_pid,
@@ -767,29 +1001,46 @@ class GuiSession(BaseSession):
     ) -> TclResult:
         """发送 Tcl 命令并等待响应。"""
         if self._closing or not self.is_alive:
+            detail = ""
+            if not self._closing and self._state not in (
+                SessionState.STOPPED, SessionState.STOPPING,
+            ):
+                detail = await self._exit_diagnostics()
             raise RuntimeError(
-                f"会话 '{self.session_id}' 正在关闭或未连接。请先调用 start_session。"
+                f"会话 '{self.session_id}' 正在关闭或未连接。请先调用 start_session。{detail}"
             )
 
         assert self._reader and self._writer
 
         async with self._lock:
-            if self._closing:
+            # 等锁期间 stop 可能已经做完,此时 _closing 已复位,要看 writer。
+            if self._closing or self._writer is None:
                 raise RuntimeError(f"会话 '{self.session_id}' 正在关闭，拒绝执行新命令。")
             if self._inflight_task is not None and not self._inflight_task.done():
                 raise RuntimeError(
                     f"会话 '{self.session_id}' 的上一条命令仍在执行。"
                     "请稍后重试；不会向同一 Vivado 会话并发发送新命令。"
+                    + self._dialog_note()
+                    + self._take_dismissal_note(own=False)
                 )
+
+            await self._join_dialog_watcher()
+            # 上面会让出事件循环,stop 可能在此期间开始。此时不能再向 Vivado 发命令。
+            if self._closing:
+                raise RuntimeError(f"会话 '{self.session_id}' 正在关闭，拒绝执行新命令。")
+            self._late_dialog_note += self._take_dismissal_note(own=False)
+            is_sim = bool(_SIM_COMMAND_RE.search(tcl_command))
+            log_offset, offset_error = self._sim_log_offset() if is_sim else (None, "")
+            self._last_command = tcl_command
 
             self._state = SessionState.BUSY
             task = asyncio.create_task(self._execute_impl(tcl_command))
             self._inflight_task = task
             task.add_done_callback(self._on_inflight_done)
+            self._dialog_watcher = self._start_dialog_watcher(task)
             try:
                 result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
                 self._state = SessionState.READY
-                return result
             except asyncio.TimeoutError:
                 # 读任务继续独占这一帧；完成前下一次 execute 会被上面的守卫拒绝。
                 self._pending_response = True
@@ -799,15 +1050,19 @@ class GuiSession(BaseSession):
                     if self._response_phase == "body"
                     else "读取响应长度头超时"
                 )
+                notes = self._dialog_note() + self._take_result_notes()
+                if is_sim:
+                    notes += await self._sim_log_note(log_offset, offset_error)
                 raise asyncio.TimeoutError(
-                    f"{phase}（{timeout}s）。命令: {tcl_command[:200]}"
+                    f"{phase}（{timeout}s）。命令: {tcl_command[:200]}{notes}"
                 ) from None
             except (ConnectionError, asyncio.IncompleteReadError) as e:
                 # D4: 连接断开，标记为 DEAD，不自动重连
                 self._state = SessionState.DEAD
+                detail = "" if self._closing else await self._exit_diagnostics()
                 raise RuntimeError(
                     f"GUI 会话连接断开（Vivado 可能被关闭或崩溃）: {e}。"
-                    "请重新调用 start_session。"
+                    f"请重新调用 start_session。{detail}"
                 ) from e
             except Exception:
                 if self.is_alive:
@@ -816,12 +1071,261 @@ class GuiSession(BaseSession):
                     self._state = SessionState.DEAD
                 raise
 
+            await self._join_dialog_watcher()
+            notes = self._take_result_notes()
+            if is_sim:
+                notes += await self._sim_log_note(log_offset, offset_error)
+            if not notes:
+                return result
+            return replace(result, output=f"{result.output}{notes}".lstrip("\n"))
+
+    def _start_dialog_watcher(self, task: asyncio.Task[TclResult]) -> asyncio.Task[None] | None:
+        """只有自己 spawn、已知真实 pid 的 Windows 会话才巡检,attach 绝不发按键。"""
+        if (
+            not win32_dialogs.SUPPORTED
+            or self._vivado_pid is None
+            or self.mode == "attach"
+        ):
+            return None
+        return asyncio.create_task(self._watch_dialogs(task, self._vivado_pid))
+
+    async def _watch_dialogs(self, task: asyncio.Task[TclResult], pid: int) -> None:
+        """在途命令期间关闭白名单弹窗。任务结束后确认一次结果就退出。
+
+        超时后命令还在跑,本任务也继续,所以超时之后出现的弹窗照样会关。
+        只读 task 的完成状态,异常只记 warning,不影响命令本身。
+        """
+        first_seen: dict[int, float] = {}
+        # hwnd → (已发 Esc 次数, 上次发送时刻)
+        attempts: dict[int, tuple[int, float]] = {}
+        # 发送失败的窗口(已换人 / 权限不够)。重试没有意义,post_escape 已记 warning。
+        unsendable: set[int] = set()
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_DIALOG_POLL_INTERVAL)
+                if done:
+                    await self._settle_dialogs(pid, attempts)
+                    return
+                windows = await asyncio.to_thread(win32_dialogs.list_dialogs, pid)
+                present = {w.hwnd: w.title for w in windows if w.title in _AUTO_DISMISS_TITLES}
+                self._count_closed_dialogs(attempts, present)
+                now = time.monotonic()
+                first_seen = {h: first_seen.get(h, now) for h in present}
+                for hwnd, seen_at in first_seen.items():
+                    count, last = attempts.get(hwnd, (0, 0.0))
+                    if now - seen_at < _DIALOG_MIN_AGE or hwnd in unsendable:
+                        continue
+                    if count >= _DIALOG_MAX_ATTEMPTS:
+                        if count == _DIALOG_MAX_ATTEMPTS:
+                            attempts[hwnd] = (count + 1, last)
+                            logger.warning(
+                                "会话 '%s' 弹窗 hwnd=%s 发了 %d 次 Esc 仍未关闭,不再重试",
+                                self.session_id, hwnd, count,
+                            )
+                        continue
+                    if count and now - last < _DIALOG_RETRY_INTERVAL:
+                        continue
+                    if win32_dialogs.post_escape(hwnd, pid, present[hwnd]):
+                        attempts[hwnd] = (count + 1, now)
+                    else:
+                        unsendable.add(hwnd)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "会话 '%s' 弹窗巡检异常,本条命令不再自动关闭弹窗: %s",
+                self.session_id, exc, exc_info=True,
+            )
+
+    def _count_closed_dialogs(
+        self, attempts: dict[int, tuple[int, float]], present: Collection[int]
+    ) -> None:
+        """发过 Esc 且窗口已消失的,才算关闭了一个弹窗。"""
+        for hwnd in [h for h in attempts if h not in present]:
+            del attempts[hwnd]
+            self._dismissed_dialogs += 1
+
+    async def _settle_dialogs(
+        self, pid: int, attempts: dict[int, tuple[int, float]]
+    ) -> None:
+        """命令已结束:窗口销毁可能略晚于 Tcl 返回,短暂等一下再结算计数。"""
+        for _ in range(_DIALOG_SETTLE_POLLS):
+            if not attempts:
+                return
+            windows = await asyncio.to_thread(win32_dialogs.list_dialogs, pid)
+            self._count_closed_dialogs(
+                attempts, {w.hwnd for w in windows if w.title in _AUTO_DISMISS_TITLES}
+            )
+            if attempts:
+                await asyncio.sleep(_DIALOG_SETTLE_INTERVAL)
+        if attempts:
+            logger.warning(
+                "会话 '%s' 命令已结束,但弹窗 %s 发过 Esc 后仍未关闭",
+                self.session_id, sorted(attempts),
+            )
+
+    async def _join_dialog_watcher(self) -> None:
+        """等上一个巡检任务收尾,保证同时只有一个巡检、计数不丢。"""
+        watcher = self._dialog_watcher
+        if watcher is None:
+            return
+        done, _ = await asyncio.wait({watcher}, timeout=_DIALOG_JOIN_TIMEOUT)
+        if not done:
+            logger.warning(
+                "会话 '%s' 弹窗巡检 %ss 内未收尾,已取消", self.session_id, _DIALOG_JOIN_TIMEOUT
+            )
+            watcher.cancel()
+            await asyncio.wait({watcher}, timeout=_DIALOG_JOIN_TIMEOUT)
+        self._dialog_watcher = None
+
+    def _dialog_note(self) -> str:
+        """当前弹窗的文字说明:标题、主窗口是否被禁用、处理建议。没有弹窗返回空串。"""
+        pid = self._vivado_pid
+        if pid is None:
+            return ""
+        dialogs = win32_dialogs.list_dialogs(pid)
+        if not dialogs:
+            return ""
+        titles = "、".join(repr(w.title) for w in dialogs)
+        disabled = "已被禁用" if win32_dialogs.main_window_disabled(pid) else "未被禁用"
+        if self.mode == "attach":
+            advice = "这是 attach 会话,MCP 不发按键,请到 Vivado 窗口里手动关闭。"
+        elif all(w.title in _AUTO_DISMISS_TITLES for w in dialogs):
+            advice = "MCP 正在自动关闭。"
+        else:
+            advice = "MCP 不会自动关闭其他弹窗,请到 Vivado 窗口里手动关闭。"
+        return f"\n检测到 Vivado 弹窗: {titles}。主窗口{disabled}。{advice}"
+
+    def _take_dismissal_note(self, own: bool) -> str:
+        """取走已关闭弹窗的计数并生成说明。own=False 表示属于之前超时的命令。"""
+        count = self._dismissed_dialogs
+        self._dismissed_dialogs = 0
+        if not count:
+            return ""
+        where = (
+            "本命令执行期间"
+            if own
+            else f"之前超时的命令({' '.join(self._last_command.split())[:80]})在超时之后"
+        )
+        return (
+            f"\n[弹窗] {where}出现 {count} 个 'Unable to Open File' 弹窗,MCP 已自动关闭。"
+            "这通常由 task 里的 $finish 触发,建议把 $finish 移出 task。"
+        )
+
+    def _take_result_notes(self) -> str:
+        """取走要附到当前命令结果上的弹窗说明:之前命令遗留的 + 本命令的。"""
+        late = self._late_dialog_note
+        self._late_dialog_note = ""
+        return late + self._take_dismissal_note(own=True)
+
+    def _sim_log_offset(self) -> tuple[int | None, str]:
+        """发送命令前记下日志大小,返回 ``(offset, 失败原因)``。attach 没有日志路径。"""
+        path = self._startup_log_path
+        if path is None:
+            return None, ""
+        try:
+            return path.stat().st_size, ""
+        except FileNotFoundError:
+            return 0, ""
+        except OSError as exc:
+            return None, str(exc)
+
+    async def _sim_log_note(self, offset: int | None, offset_error: str) -> str:
+        """生成仿真日志增量段。读日志失败只降级,不影响命令结果。"""
+        path = self._startup_log_path
+        if path is None:
+            return (
+                "\n[DEGRADED] attach 会话不知道 Vivado 日志路径,仿真打印($display)"
+                "不在上面的结果里,请看该 Vivado 的 Tcl Console 或它的 vivado.log。"
+            )
+        reason = offset_error
+        if offset is not None:
+            try:
+                text, total, truncated = await asyncio.to_thread(
+                    _read_log_delta, path, offset, _SIM_LOG_MAX_CHARS
+                )
+            except FileNotFoundError as exc:
+                # 发送前后都没有日志文件 = 没有新增内容;发送前有、之后没了才算失败。
+                if offset == 0:
+                    return ""
+                reason = str(exc)
+            except OSError as exc:
+                reason = str(exc)
+            else:
+                if not total:
+                    return ""
+                extra = f",已截断,只保留尾部 {_SIM_LOG_MAX_CHARS} 字符" if truncated else ""
+                return f"\n--- 仿真日志(新增 {total} 字节{extra},来自 {path}) ---\n{text}"
+        logger.warning("会话 '%s' 读取仿真日志 %s 失败: %s", self.session_id, path, reason)
+        return f"\n[DEGRADED] 读取仿真日志失败: {reason}"
+
+    async def _exit_diagnostics(self) -> str:
+        """连接断开时生成退出诊断。此刻进程可能还没退完,等一下才拿得到退出码。"""
+        if self.mode != "attach" and self._proc is not None and self._proc.returncode is None:
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=_EXIT_WAIT_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "会话 '%s' 连接已断开,但外层进程 %ss 内未退出,退出码未知",
+                    self.session_id, _EXIT_WAIT_TIMEOUT,
+                )
+            except OSError as exc:
+                logger.warning("会话 '%s' 等待进程退出失败: %s", self.session_id, exc)
+        return "\n" + format_death_report(self.death_report())
+
+    @property
+    def exit_code(self) -> int | None:
+        """外层进程的退出码。attach 或尚未退出时为 None。"""
+        if self.mode == "attach" or self._proc is None:
+            return None
+        return self._proc.returncode
+
+    def death_report(self) -> dict:
+        """生成退出诊断。同步、有界,可直接放进 JSON。"""
+        if self._ended_at is None:
+            self._ended_at = time.time()
+        started = self._start_time
+        hs_err_files = self._find_crash_files()
+        hs_err_log = next((f for f in hs_err_files if f.suffix == ".log"), None)
+        return {
+            "session_id": self.session_id,
+            "mode": self.mode,
+            "state": "dead",
+            "is_alive": False,
+            "exit_code": self.exit_code,
+            "vivado_pid": self._vivado_pid,
+            "launcher_pid": self._launcher_pid,
+            "cwd": self._cwd,
+            "last_command": self._last_command[:_LAST_COMMAND_CHARS],
+            "uptime_seconds": round(self._ended_at - started, 1) if started else 0.0,
+            "crash_files": [str(f) for f in hs_err_files],
+            "hs_err_text": _tail_text_file(hs_err_log),
+            "startup_log": str(self._startup_log_path) if self._startup_log_path else None,
+            "log_tail": _tail_text_file(self._startup_log_path),
+            "launcher_log": str(self._launcher_log_path) if self._launcher_log_path else None,
+            "launcher_tail": _tail_text_file(self._launcher_log_path),
+        }
+
+    def _find_crash_files(self) -> list[Path]:
+        """找工作目录下的 ``hs_err_pid*``。pid 已知时只认本进程的。"""
+        if not self._cwd:
+            return []
+        pattern = f"hs_err_pid{self._vivado_pid or '*'}.*"
+        try:
+            return sorted(Path(self._cwd).glob(pattern))[:_CRASH_FILE_LIMIT]
+        except OSError as exc:
+            logger.warning("在 %s 查找 hs_err 文件失败: %s", self._cwd, exc)
+            return []
+
     def _on_inflight_done(self, task: asyncio.Task[TclResult]) -> None:
         """收尾迟到响应，并保证同一连接始终只有一个 reader。"""
         try:
             exc = task.exception()
             if exc is not None:
-                logger.debug("[%s] 在途命令结束时异常: %s", self.session_id, exc)
+                # 超时后迟到的异常没有调用方接,用户只能从这里看到。
+                # 正在 stop 时关连接必然打断读取,不算异常。
+                log = logger.info if self._closing else logger.warning
+                log("[%s] 在途命令结束时异常: %s", self.session_id, exc)
         except asyncio.CancelledError:
             pass
 
@@ -872,6 +1376,44 @@ class GuiSession(BaseSession):
             is_error=(rc != 0),
         )
 
+    def _cleanup_session_files(self, expected_stop: bool) -> None:
+        """只清理本实例的文件,其他实例的 ``.str`` 和目录里的其他文件原样保留。
+
+        attach 的 Vivado 不归 MCP 管,什么都不删。意外退出和启动失败不删证据,
+        只回收完全空的专用目录。pid 未知时不删 ``.str``,因为分不清是谁的。
+        """
+        if self.mode == "attach":
+            return
+        workdir = self._workdir
+        self._workdir = None
+        if not expected_stop:
+            if workdir is not None:
+                try:
+                    os.rmdir(workdir)
+                except OSError as exc:
+                    # 目录非空是预期情况:里面的文件是诊断证据。
+                    log = logger.info if exc.errno == errno.ENOTEMPTY else logger.warning
+                    log("保留工作目录 %s: %s", workdir, exc)
+            return
+
+        base = workdir if workdir is not None else (Path(self._cwd) if self._cwd else None)
+        if base is not None and self._vivado_pid is not None:
+            pid_file = base / f"vivado_pid{self._vivado_pid}.str"
+            try:
+                pid_file.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("清理 %s 失败: %s", pid_file, exc)
+        if workdir is None:
+            return
+        xil_dir = workdir / ".Xil"
+        try:
+            if xil_dir.exists():
+                shutil.rmtree(xil_dir)
+            if not any(workdir.iterdir()):
+                workdir.rmdir()
+        except OSError as exc:
+            logger.warning("清理工作目录 %s 失败: %s", workdir, exc)
+
     async def stop(self, timeout: float = 10.0) -> None:
         """关闭 TCP 连接 + 终止 spawn 的 GUI 进程（attach 模式不终止外部进程）。
 
@@ -882,16 +1424,27 @@ class GuiSession(BaseSession):
         新策略:
         1. 先通过 TCP 发 Tcl ``exit`` 让 Vivado 优雅退出(会自动清 pid 文件)
         2. 若超时,Windows 用 ``taskkill /F /T`` 递归杀进程树,Unix 用 SIGKILL
-        3. 兜底扫工作目录 ``vivado_pid*.str`` 强删
+        3. 正常停止时清理本实例留下的文件;意外退出时一律不删,它们是诊断证据
         """
-        import glob as glob_mod
-        import os
         import subprocess
         import sys
+
+        # 必须在改任何状态之前判定:进 stop 时 Vivado 还活着才算正常停止。
+        was_alive = self.is_alive
+        expected_stop = was_alive and (
+            self._proc is None or self._proc.returncode is None
+        )
 
         self._closing = True
         self._state = SessionState.STOPPING
         logger.info("正在关闭 GUI 会话 '%s'...", self.session_id)
+
+        # 先停弹窗巡检:接下来要结束进程,不能再向它的窗口发按键。
+        watcher = self._dialog_watcher
+        self._dialog_watcher = None
+        if watcher is not None:
+            watcher.cancel()
+            await asyncio.wait({watcher})
 
         # 步骤 1:尝试优雅退出 —— 发 Tcl `exit`,Vivado 自己清 pid/journal
         # attach 模式 OR probe-then-attach 命中外部 GUI 时,都是用户的 Vivado,不主动 exit
@@ -901,7 +1454,8 @@ class GuiSession(BaseSession):
             # 场景直接关连接，避免等待长命令导致 stop 死锁。
             async with self._lock:
                 if (
-                    not self._attach_only
+                    was_alive
+                    and not self._attach_only
                     and not self._attached_external
                     and self._writer is not None
                 ):
@@ -935,9 +1489,11 @@ class GuiSession(BaseSession):
             and not self._attached_external
         ):
             if self._proc.returncode is None:
-                # taskkill 用记录的 self._pid(spawn 时存),即使 self._proc 引用因故
-                # 丢失也能按确切 pid 精杀;正常情况 self._pid == self._proc.pid。
-                kill_pid = self._pid if self._pid is not None else self._proc.pid
+                # taskkill 用记录的 launcher pid(spawn 时存),即使 self._proc 引用因故
+                # 丢失也能按确切 pid 精杀;正常情况它等于 self._proc.pid。
+                kill_pid = (
+                    self._launcher_pid if self._launcher_pid is not None else self._proc.pid
+                )
                 # 先给 Vivado 一点时间自己退(响应 Tcl exit)
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=5.0)
@@ -966,13 +1522,8 @@ class GuiSession(BaseSession):
                         logger.warning("强杀 Vivado 进程异常: %s", e)
             self._proc = None
 
-        # 步骤 4:兜底清理 vivado_pid*.str(Vivado 强杀时不会自己删)
-        for pid_file in glob_mod.glob("vivado_pid*.str"):
-            try:
-                os.remove(pid_file)
-                logger.debug("已清理 %s", pid_file)
-            except OSError as e:
-                logger.debug("清理 %s 失败: %s", pid_file, e)
+        # 步骤 4:清理本实例留下的文件(Vivado 强杀时不会自己删)
+        self._cleanup_session_files(expected_stop)
 
         # 步骤 5:清理临时脚本(正常路径,同时从 atexit 集合移除)
         if self._tmp_script:

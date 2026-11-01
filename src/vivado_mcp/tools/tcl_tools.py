@@ -13,7 +13,7 @@ import re
 
 from mcp.server.mcpserver import Context
 
-from vivado_mcp.server import _NO_SESSION, _require_session, _safe_execute, mcp
+from vivado_mcp.server import _no_session, _require_session, _safe_execute, mcp
 from vivado_mcp.vivado.tcl_utils import tcl_quote
 
 
@@ -93,6 +93,23 @@ async def run_tcl(
       open_wave_config C:/path/wave.wcfg ;# 从干净磁盘文件重载
       ```
 
+    **Vivado 2019.1 实测坑**:
+
+    - **task 里的 `$finish` 会弹 2 个 `Unable to Open File` 窗口**,`run` 卡到窗口关闭
+      才返回。把 `$finish` 放到 initial / always 里。MCP 启动的 GUI 会自动关闭它们并在
+      结果里说明;attach 会话只报告,要到 Vivado 窗口里手动关闭。
+    - **Tcl 版本是 8.5,没有 `lmap`**,用 `foreach` + `lappend`。
+    - **`create_bd_port` 没有 `-freq_hz`**,用 `set_property`:
+
+      ```tcl
+      set p [create_bd_port -dir I -type clk clk]
+      set_property CONFIG.FREQ_HZ 100000000 $p
+      ```
+
+    **仿真打印**:`$display` 不进 Tcl 返回值。MCP 启动的 GUI 里,命令含 `run` /
+    `launch_simulation` / `relaunch_sim` 时结果末尾会附日志新增内容;`source` 脚本里的
+    `run` 不附,到 `list_sessions` 的 `startup_log` 路径查看。
+
     **set_property / radix 写脚本陷阱**(0.3.20 实战沉淀,无 err 静默踩):
 
     - **`-filter "name =~ {...[$var]...}"` 会污染后续 `set_property` 静默失败**。
@@ -151,7 +168,7 @@ async def run_tcl(
     """
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     return await _safe_execute(session, command, float(timeout), "命令执行失败")
 
@@ -217,6 +234,6 @@ async def safe_tcl(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     return await _safe_execute(session, cmd, float(timeout), "safe_tcl 执行失败")

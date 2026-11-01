@@ -18,10 +18,12 @@ AI 极易搞砸"的本地价值：
 
 from __future__ import annotations
 
+import os
+
 from mcp.server.mcpserver import Context
 
 from vivado_mcp.analysis import wcfg_editor
-from vivado_mcp.server import _NO_SESSION, _require_session, mcp
+from vivado_mcp.server import _no_session, _require_session, mcp
 from vivado_mcp.tcl_scripts import RELOAD_WCFG, RESOLVE_WCFG_PATH, SET_ANALOG_PROPS
 from vivado_mcp.vivado.tcl_utils import to_tcl_path
 
@@ -170,9 +172,10 @@ async def set_wave_zoom(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
-    wcfg_path = wcfg
+    # Vivado 的工作目录和 MCP 进程不同。先转绝对路径,两边才是同一个文件。
+    wcfg_path = os.path.abspath(wcfg) if wcfg else None
     if not wcfg_path:
         try:
             r = await session.execute(RESOLVE_WCFG_PATH, timeout=30.0)
@@ -263,7 +266,7 @@ async def set_wave_analog(
 
     session = _require_session(ctx, session_id)
     if not session:
-        return _NO_SESSION.format(sid=session_id)
+        return _no_session(ctx, session_id)
 
     try:
         signals_block = _build_signals_block(signals)

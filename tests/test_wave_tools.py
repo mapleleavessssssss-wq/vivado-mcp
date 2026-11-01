@@ -7,10 +7,12 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from vivado_mcp.vivado.session_manager import SessionManager
 from vivado_mcp.vivado.tcl_utils import TclResult
 
 # ====================================================================== #
@@ -25,6 +27,7 @@ def _make_tcl_result(output: str, return_code: int = 0) -> TclResult:
 def _mock_context():
     ctx = MagicMock()
     ctx.report_progress = AsyncMock()
+    ctx.request_context.lifespan_context.session_manager = SessionManager("/fake/vivado")
     return ctx
 
 
@@ -78,7 +81,7 @@ class TestSetWaveZoom:
                 start_ns=10, end_ns=20, wcfg="D:/w/x.wcfg", ctx=ctx
             )
 
-        mock_set.assert_called_once_with("D:/w/x.wcfg", 10, 20)
+        mock_set.assert_called_once_with(os.path.abspath("D:/w/x.wcfg"), 10, 20)
         # 只调一次 execute(仅 RELOAD，无 RESOLVE)
         assert session.execute.await_count == 1
         assert "[OK]" in result
@@ -150,7 +153,32 @@ class TestSetWaveZoom:
 
         assert "[OK]" in result
         sent_tcl = session.execute.await_args.args[0]
-        assert 'open_wave_config "C:/My Proj/w.wcfg"' in sent_tcl
+        expected = os.path.abspath("C:\\My Proj\\w.wcfg").replace("\\", "/")
+        assert f'open_wave_config "{expected}"' in sent_tcl
+
+    @pytest.mark.asyncio
+    async def test_relative_wcfg_resolves_against_mcp_directory(self, tmp_path, monkeypatch):
+        """Vivado 工作目录和 MCP 进程不同:Python 和 Vivado 必须拿到同一个绝对路径。"""
+        from vivado_mcp.tools import wave_tools
+
+        monkeypatch.chdir(tmp_path)
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result("VMCP_RELOAD_OK:done")
+        )
+        ctx = _mock_context()
+
+        with patch.object(wave_tools, "_require_session", return_value=session), \
+             patch.object(wave_tools.wcfg_editor, "set_zoom_range") as mock_set:
+            result = await wave_tools.set_wave_zoom(
+                start_ns=1, end_ns=2, wcfg="sub/w.wcfg", ctx=ctx
+            )
+
+        assert "[OK]" in result
+        expected = str(tmp_path / "sub" / "w.wcfg")
+        assert mock_set.call_args.args[0] == expected
+        sent_tcl = session.execute.await_args.args[0]
+        assert f'open_wave_config "{expected.replace(chr(92), "/")}"' in sent_tcl
 
     @pytest.mark.asyncio
     async def test_permission_error_on_write_returns_reason(self):
