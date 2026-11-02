@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from vivado_mcp.vivado.session_manager import SessionManager
 from vivado_mcp.vivado.tcl_utils import TclResult
 
 _FIXTURES = Path(__file__).parent / "fixtures"
@@ -30,6 +31,7 @@ def _mock_context(session=None):
     """创建模拟的 MCP Context。"""
     ctx = MagicMock()
     ctx.report_progress = AsyncMock()
+    ctx.request_context.lifespan_context.session_manager = SessionManager("/fake/vivado")
     return ctx
 
 

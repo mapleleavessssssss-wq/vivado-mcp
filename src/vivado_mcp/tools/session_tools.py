@@ -77,15 +77,19 @@ def _check_win_curdir_policy() -> str:
 
 
 
-def _check_ascii_paths(vivado_path: str | None) -> str:
-    """检测 Vivado 路径 / 当前工作目录是否含非 ASCII 字符。
+def _check_ascii_paths(vivado_path: str | None, cwd: str | None = None) -> str:
+    """检测 Vivado 路径 / 工作目录是否含非 ASCII 字符。
 
     Vivado 2019.x 在中文路径下已知会触发 ``TclStackFree: incorrect freePtr``
     内部异常(0.3.13 实战发现)。本检测只 warn,不 block —— 因为不是所有 2019.x
     都必崩,且用户可能在某些场景下能用(源文件中文 OK,只有 .runs/ .sim/ 输出目录
     必须 ASCII)。检测对象:
     - vivado_path (可执行文件路径)
-    - 当前工作目录(create_project / open_project 多半在这里)
+    - 工作目录(create_project / open_project 多半在这里)
+
+    Args:
+        vivado_path: Vivado 可执行文件路径。
+        cwd: Vivado 实际工作目录。Tcl 模式不提供,此时 Vivado 继承 MCP 进程的目录。
 
     Returns:
         警告文本(若需要),否则空串。
@@ -94,12 +98,12 @@ def _check_ascii_paths(vivado_path: str | None) -> str:
     if vivado_path and not vivado_path.isascii():
         non_ascii_paths.append(f"vivado_path: {vivado_path}")
     try:
-        cwd = os.getcwd()
-        if not cwd.isascii():
-            non_ascii_paths.append(f"工作目录: {cwd}")
-    except OSError:
+        actual_cwd = cwd or os.getcwd()
+        if not actual_cwd.isascii():
+            non_ascii_paths.append(f"工作目录: {actual_cwd}")
+    except OSError as exc:
         # 极少见:cwd 失效。检测能力降级,不让 start_session 失败
-        pass
+        logger.warning("读取工作目录失败,中文路径检测跳过这一项: %s", exc)
 
     if not non_ascii_paths:
         return ""
@@ -169,7 +173,9 @@ async def start_session(
             port=int(port),
         )
         status = session.status_dict()
-        ascii_warn = _check_ascii_paths(status.get("vivado_path") or vivado_path)
+        ascii_warn = _check_ascii_paths(
+            status.get("vivado_path") or vivado_path, status.get("cwd")
+        )
         # MCP 自己 spawn 的 Vivado 已去掉该变量,只有 attach 外部进程才可能受影响
         curdir_warn = _check_win_curdir_policy() if status["mode"] == "attach" else ""
         return (
@@ -193,6 +199,8 @@ async def stop_session(
 ) -> str:
     """关闭指定的 Vivado 会话。
 
+    对已退出的会话:清理并清除退出记录,不删工作目录里的文件(它们是诊断证据)。
+
     Args:
         session_id: 要关闭的会话标识符。
     """
@@ -211,7 +219,7 @@ async def stop_session(
 
 @mcp.tool()
 async def list_sessions(ctx: Context = None) -> str:
-    """列出所有活跃的 Vivado 会话及其状态。"""
+    """列出 Vivado 会话及其状态,包括已退出会话的退出诊断(``state="dead"``)。"""
     manager = _get_manager(ctx)
     sessions = await manager.list_sessions()
 

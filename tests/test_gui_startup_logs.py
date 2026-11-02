@@ -36,6 +36,7 @@ def startup_env(monkeypatch, tmp_path):
         # 假 PID 绝不能进入真实 taskkill / kill 路径。
         monkeypatch.setattr(session, "_cleanup_failed_spawn", AsyncMock())
         monkeypatch.setattr(session, "_current_project_hint", AsyncMock(return_value=""))
+        monkeypatch.setattr(session, "_process_banner", AsyncMock(return_value=""))
         sessions.append(session)
         return session
 

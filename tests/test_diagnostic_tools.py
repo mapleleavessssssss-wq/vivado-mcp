@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from vivado_mcp.vivado.session_manager import SessionManager
 from vivado_mcp.vivado.tcl_utils import TclResult
 
 # fixture 数据路径
@@ -50,6 +51,7 @@ def _mock_context(session):
     """创建模拟的 MCP Context，使 _require_session 返回指定 session。"""
     ctx = MagicMock()
     ctx.report_progress = AsyncMock()
+    ctx.request_context.lifespan_context.session_manager = SessionManager("/fake/vivado")
     return ctx
 
 
@@ -1181,6 +1183,26 @@ class TestProgramDeviceValidation:
 
         assert "编程完成" in result
         session.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_relative_path_resolves_against_mcp_directory(self, tmp_path, monkeypatch):
+        """Vivado 工作目录和 MCP 进程不同:传给 Vivado 的必须是预检过的那个绝对路径。"""
+        from vivado_mcp.tools.flow_tools import program_device
+
+        self._make_bit(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        session = AsyncMock()
+        session.execute = AsyncMock(
+            return_value=_make_tcl_result("编程完成: xc7a35t_0")
+        )
+        ctx = _mock_context(session)
+
+        with patch("vivado_mcp.tools.flow_tools._require_session", return_value=session):
+            result = await program_device(bitstream_path="top.bit", ctx=ctx)
+
+        assert "编程完成" in result
+        expected = str(tmp_path / "top.bit").replace("\\", "/")
+        assert f'PROGRAM.FILE "{expected}"' in session.execute.await_args.args[0]
 
 
 # ====================================================================== #

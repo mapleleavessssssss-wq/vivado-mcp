@@ -12,7 +12,7 @@ from vivado_mcp.analysis.cdc_parser import (
     serialize_cdc_report,
 )
 from vivado_mcp.analysis.timing_evidence import read_bounded_text
-from vivado_mcp.server import _NO_SESSION, _require_session, mcp
+from vivado_mcp.server import _no_session, _require_session, mcp
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ async def get_cdc_report(
         else:
             session = _require_session(ctx, session_id)
             if not session:
-                raise ValueError(_NO_SESSION.format(sid=session_id))
+                raise ValueError(_no_session(ctx, session_id))
             response = await session.execute("report_cdc -details -return_string", timeout=120.0)
             if response.is_error:
                 raise RuntimeError(

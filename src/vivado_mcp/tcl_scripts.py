@@ -128,6 +128,14 @@ puts "VMCP_CURPROJ:$__p"
 if {$__p ne ""} { catch { puts "VMCP_CURPROJ_DIR:[get_property DIRECTORY [current_project]]" } }
 """
 
+# 真实 vivado.exe 的 pid 和工作目录。spawn 拿到的是外层 cmd(vivado.bat),
+# 只有 Tcl 里的 [pid] 才是 vivado.exe。走一次性短连接,不碰会话主连接。
+# 输出:VMCP_PROC_PID:<pid> / VMCP_PROC_CWD:<pwd>
+QUERY_VIVADO_PROCESS = """\
+puts "VMCP_PROC_PID:[pid]"
+puts "VMCP_PROC_CWD:[pwd]"
+"""
+
 # --------------------------------------------------------------------------- #
 #  提取 CRITICAL WARNING 详情：逐行扫描 runme.log，只输出 CW 行
 #  格式：VMCP_CW:行号|原始文本

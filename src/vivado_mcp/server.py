@@ -97,7 +97,9 @@ def _get_manager(ctx) -> SessionManager:
     return app_ctx.session_manager
 
 
-_NO_SESSION = "[ERROR] 会话 '{sid}' 不存在。请先调用 start_session。"
+def _no_session(ctx, session_id: str) -> str:
+    """拿不到会话时的错误文本:Vivado 退出过就给退出诊断,否则说明会话不存在。"""
+    return _get_manager(ctx).no_session_message(session_id)
 
 
 def _require_session(ctx, session_id: str) -> VivadoSession | None:
@@ -147,6 +149,9 @@ def resource_session_status(session_id: str) -> str:
         return json.dumps({"error": "服务器未就绪"})
     session = _manager_ref.get(session_id)
     if not session:
+        report = _manager_ref.dead_report(session_id)
+        if report is not None:
+            return json.dumps(report, ensure_ascii=False)
         return json.dumps({"error": f"会话 '{session_id}' 不存在"})
     return json.dumps(session.status_dict(), ensure_ascii=False)
 
